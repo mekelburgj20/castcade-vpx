@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <share.h>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1338,6 +1340,85 @@ static void TestRecorder()
    }
 }
 
+static std::vector<std::string> g_ioSeen;
+static void IoSeen(const char* const what, const uint64_t start, const uint64_t end, const size_t bytes)
+{
+   if (end >= start && bytes > 0)
+      g_ioSeen.push_back(what);
+}
+
+static void TestAsyncLineWriter()
+{
+   const std::wstring wpath = TempPath(L"castcade_wire_test_lines.log");
+   DeleteFileW(wpath.c_str());
+   char path[MAX_PATH];
+   WideCharToMultiByte(CP_ACP, 0, wpath.c_str(), -1, path, MAX_PATH, nullptr, nullptr);
+
+   // Lines arrive in order, the mirror sees each once on the writer thread, and writes are reported
+   SetIoObserver(&IoSeen);
+   std::vector<std::string> mirrored;
+   std::mutex mm;
+   const DWORD caller = GetCurrentThreadId();
+   bool mirrorOnCaller = false;
+   {
+      std::unique_ptr<AsyncLineWriter> w = OpenAsyncLineWriter(path, "testlog", [&](const std::string& s)
+      {
+         std::lock_guard<std::mutex> lock(mm);
+         mirrored.push_back(s);
+         mirrorOnCaller |= GetCurrentThreadId() == caller;
+      });
+      CHECK(w != nullptr);
+      uint64_t worst = 0;
+      for (int i = 0; i < 2000; ++i)
+      {
+         const uint64_t a = NowUsec();
+         w->Line("line " + std::to_string(i));
+         worst = (std::max)(worst, NowUsec() - a);
+      }
+      w->Flush();
+      CHECK(w->LinesWritten() == 2000);
+      printf("TIMING: AsyncLineWriter::Line x2000, worst %llu us on the caller's thread\n", (unsigned long long)worst);
+      w->Line("last");
+   } // the destructor writes what is queued
+   SetIoObserver(nullptr);
+   const std::vector<uint8_t> bytes = ReadFileBytes(wpath);
+   std::string text(bytes.begin(), bytes.end());
+   std::string expect;
+   for (int i = 0; i < 2000; ++i)
+      expect += "line " + std::to_string(i) + "\r\n"; // text mode, as the stream log always was
+   expect += "last\r\n";
+   CHECK(text == expect);
+   CHECK(mirrored.size() == 2001 && mirrored.front() == "line 0" && mirrored.back() == "last");
+   CHECK(!mirrorOnCaller);
+   CHECK(!g_ioSeen.empty() && g_ioSeen.front() == "testlog");
+   DeleteFileW(wpath.c_str());
+
+   // Appending: a second writer adds to the file
+   {
+      std::unique_ptr<AsyncLineWriter> a = OpenAsyncLineWriter(path);
+      a->Line("one");
+   }
+   {
+      std::unique_ptr<AsyncLineWriter> b = OpenAsyncLineWriter(path);
+      b->Line("two");
+   }
+   const std::vector<uint8_t> two = ReadFileBytes(wpath);
+   CHECK(std::string(two.begin(), two.end()) == "one\r\ntwo\r\n");
+   DeleteFileW(wpath.c_str());
+
+   // Mirror only (no file), and the refusals
+   std::vector<std::string> only;
+   {
+      std::unique_ptr<AsyncLineWriter> m = OpenAsyncLineWriter(std::string(), nullptr, [&](const std::string& s) { only.push_back(s); });
+      CHECK(m != nullptr);
+      m->Line("x");
+      m->Line("y");
+   }
+   CHECK(only.size() == 2 && only[0] == "x" && only[1] == "y");
+   CHECK(OpenAsyncLineWriter(std::string()) == nullptr);
+   CHECK(OpenAsyncLineWriter("Z:\\no\\such\\folder\\castcade.log") == nullptr);
+}
+
 int main(int argc, char** argv)
 {
    if (argc > 1)
@@ -1359,6 +1440,7 @@ int main(int argc, char** argv)
    TestTiming();
    TestFraming();
    TestRecorder();
+   TestAsyncLineWriter();
    printf("SUMMARY: %d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;
 }

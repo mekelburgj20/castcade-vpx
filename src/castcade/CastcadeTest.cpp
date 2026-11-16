@@ -43,24 +43,51 @@ std::string GetEnvA(const char* const name)
 class Harness final : public TestHarness
 {
 public:
-   Harness(Player* const player, const bool noPause, const std::string& inputPath)
+   Harness(Player* const player, const bool noPause, const std::string& inputPath, const std::string& stall)
       : m_player(player)
       , m_noPause(noPause)
    {
       m_out = OpenAsyncLineWriter(GetEnvA("CASTCADE_STREAM_LOG"), "streamlog");
       if (!inputPath.empty())
          Load(inputPath);
+      if (!stall.empty())
+      {
+         int ms = 0;
+         double every = 0., first = 0.;
+         const int got = sscanf_s(stall.c_str(), "%d,%lf,%lf", &ms, &every, &first);
+         if (got >= 2 && ms > 0 && ms <= 5000 && every >= 0.5)
+         {
+            m_stallMs = ms;
+            m_stallEveryUsec = (uint64_t)(every * 1e6);
+            m_nextStall = NowUsec() + (uint64_t)((got >= 3 ? first : every) * 1e6);
+            Info(Fmt("test stalls: %d ms every %.1f s, the first %.1f s from now", ms, every, got >= 3 ? first : every));
+         }
+         else
+            Warn("CASTCADE_TEST_STALL is not <ms>,<every s>[,<first s>]: " + stall);
+      }
    }
 
    bool NeverPauses() const override { return m_noPause; }
 
    void OnFrame() override
    {
-      if (m_next >= m_keys.size())
-         return;
       const uint64_t now = NowUsec();
       if (m_start == 0)
          m_start = now;
+      if (m_stallMs > 0 && now >= m_nextStall)
+      {
+         // A stall of the render thread, where a script that waits on a file stalls it (after the physics, before
+         // the frame is sent)
+         m_nextStall = now + m_stallEveryUsec;
+         Line("", Fmt("test stall: %d ms at %llu ms", m_stallMs, (unsigned long long)((now - m_start) / 1000)));
+         const uint64_t until = NowUsec() + (uint64_t)m_stallMs * 1000;
+         while (NowUsec() + 2000 < until)
+            Sleep(1);
+         while (NowUsec() < until)
+            YieldProcessor();
+      }
+      if (m_next >= m_keys.size())
+         return;
       const uint64_t elapsedMs = (now - m_start) / 1000;
       while (m_next < m_keys.size() && m_keys[m_next].ms <= elapsedMs)
       {
@@ -177,6 +204,8 @@ private:
    std::vector<Key> m_keys;
    size_t m_next = 0;
    uint64_t m_start = 0;
+   int m_stallMs = 0;
+   uint64_t m_stallEveryUsec = 0, m_nextStall = 0;
 };
 
 } // namespace
@@ -185,9 +214,10 @@ TestHarness* TestHarness::Create(Player* const player)
 {
    const bool noPause = GetEnvA("CASTCADE_TEST_NOPAUSE") == "1";
    const std::string input = GetEnvA("CASTCADE_TEST_INPUT");
-   if (!noPause && input.empty())
+   const std::string stall = GetEnvA("CASTCADE_TEST_STALL");
+   if (!noPause && input.empty() && stall.empty())
       return nullptr;
-   return new Harness(player, noPause, input);
+   return new Harness(player, noPause, input, stall);
 }
 
 }

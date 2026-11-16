@@ -62,6 +62,11 @@ public:
    // this frame. Play: after the frame's script timers, sends the frame. Both: network I/O and notifications.
    virtual void OnFrame() = 0;
 
+   // Play role, after each physics step of Player::UpdatePhysics; targetUsec is the time (VPX usec()) the loop
+   // simulates up to. When the loop is catching up after a stall of the render thread, the session sends the
+   // intermediate states as frames of their own, so that a watcher can show the ball's path through the stall.
+   virtual void OnPhysicsStep(unsigned long long targetUsec) = 0;
+
 protected:
    // Player befriends Session for this one write: a watcher rebuilds the static pre-render after a keyframe
    static void MarkStaticPrepassDirty(Player* player);

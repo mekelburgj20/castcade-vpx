@@ -11,7 +11,9 @@
 // build and load the same table file, which the session checks before any state is exchanged.
 
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "CastcadeWire.h"
 
@@ -20,6 +22,20 @@ class Ball;
 
 namespace castcade
 {
+
+// The sound names that VPX itself plays, outside the script: each DispReel's click (DispReel::UpdateAnimation).
+// The stream's StopSoundFilter never drops a stop of these.
+void ReelSoundNames(Player* player, std::vector<std::wstring>& out);
+
+// Watch role, the StopSound audit: whether StopSound(name) would stop something that is playing now (the sound's
+// own buffer, or the first copy of it in the copied-buffer list, which is what PinTable::StopSound stops). name is
+// lower-cased; matching is case-insensitive like VPX's.
+bool StopSoundWouldStop(Player* player, const std::wstring& name);
+
+// Play role. The physics clock: the time, on VPX's usec() clock, that the physics state has been simulated up to
+// (Player::m_curPhysicsFrameTime). A frame is stamped with it, not with the moment it is sent: after a stall the two
+// differ by the stall.
+uint64_t PhysicsClockUsec(Player* player);
 
 // Play role. Appends the current physics-driven state of the table to w. ballIds gives the network id of
 // every live ball (the session assigns one in Player::CreateBall and forgets it in Player::DestroyBall);
@@ -51,6 +67,10 @@ public:
    // The local ball standing in for the player's ball with this network id, or nullptr. Valid until the
    // next Apply or Reset. The session uses it to replay script calls made on a ball (colour, image, ...).
    Ball* FindBall(uint32_t ballId) const;
+
+   // The largest distance (VP units) any ball moved between the previous Apply and the last one: how far the
+   // picture jumped in one frame. A ball that appeared or disappeared does not count.
+   float LastMaxBallStep() const;
 
    // Destroys every local ball this applier created (a new keyframe, or the session ending)
    void Reset();

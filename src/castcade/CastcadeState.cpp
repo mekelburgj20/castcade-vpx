@@ -222,6 +222,8 @@ struct StateAccess
       }
    }
 
+   static uint64_t PhysicsClock(const Player* const player) { return player->m_curPhysicsFrameTime; }
+
    static void CountParts(PinTable* const table, uint32_t counts[PC_Count])
    {
       for (int c = 0; c < PC_Count; ++c)
@@ -544,6 +546,52 @@ void CaptureState(Player* player, const std::unordered_map<const Ball*, uint32_t
    StateAccess::Capture(player, ballIds, w);
 }
 
+uint64_t PhysicsClockUsec(Player* const player)
+{
+   return StateAccess::PhysicsClock(player);
+}
+
+void ReelSoundNames(Player* const player, std::vector<std::wstring>& out)
+{
+   out.clear();
+   if (!player || !player->m_ptable)
+      return;
+   for (IEditable* const pe : player->m_ptable->m_vedit)
+   {
+      if (pe->GetItemType() != eItemDispReel)
+         continue;
+      const string& s = static_cast<DispReel*>(pe)->m_d.m_szSound;
+      if (s.empty() || s == "<None>") // DispReel::UpdateAnimation plays nothing for these
+         continue;
+      WCHAR w[MAXTOKEN];
+      MultiByteToWideCharNull(CP_ACP, 0, s.c_str(), -1, w, MAXTOKEN);
+      out.emplace_back(w);
+   }
+}
+
+bool StopSoundWouldStop(Player* const player, const std::wstring& name)
+{
+   if (!player || !player->m_ptable || !g_pvp)
+      return false;
+   char sz[MAXSTRING];
+   WideCharToMultiByteNull(CP_ACP, 0, name.c_str(), -1, sz, MAXSTRING, nullptr, nullptr);
+   // As PinTable::StopSound: the first sound of that name, then the first copy of it
+   for (PinSound* const pps : player->m_ptable->m_vsound)
+      if (!lstrcmpi(pps->m_szName.c_str(), sz))
+      {
+         if (pps->IsWav())
+         {
+            DWORD status = 0;
+            if (pps->m_pDSBuffer && SUCCEEDED(pps->m_pDSBuffer->GetStatus(&status)) && (status & DSBSTATUS_PLAYING))
+               return true;
+         }
+         else if (pps->m_BASSstream && BASS_ChannelIsActive(pps->m_BASSstream) != BASS_ACTIVE_STOPPED)
+            return true;
+         break;
+      }
+   return g_pvp->m_ps.IsCopiedWavPlaying(sz);
+}
+
 std::shared_ptr<const StateSnapshot> ParseState(ByteReader& r)
 {
    if (r.u8() != kFormatVersion)
@@ -619,6 +667,8 @@ struct StateApplier::Impl
 {
    Player* const player;
    std::unordered_map<uint32_t, Ball*> balls; // network id -> local ball, all created here
+   std::unordered_map<uint32_t, Vertex3Ds> shownAt; // network id -> position written by the previous Apply
+   float maxStep = 0.f;
    uint32_t localCounts[PC_Count] = {};
    bool countsKnown = false;
    int gainX = 100, gainY = 100;
@@ -658,6 +708,22 @@ struct StateApplier::Impl
             // CreateBall puts the centre one radius above z; WriteBall sets the exact position right after
             it = balls.emplace(sa.id, player->CreateBall(s.pos.x, s.pos.y, s.pos.z - s.radius, s.vel.x, s.vel.y, s.vel.z, s.radius)).first;
          WriteBall(it->second, s);
+         const auto at = shownAt.find(sa.id);
+         if (at != shownAt.end())
+         {
+            const Vertex3Ds d(s.pos.x - at->second.x, s.pos.y - at->second.y, s.pos.z - at->second.z);
+            maxStep = max(maxStep, sqrtf(d.LengthSquared()));
+            at->second = s.pos;
+         }
+         else
+            shownAt.emplace(sa.id, s.pos);
+      }
+      for (auto it = shownAt.begin(); it != shownAt.end();)
+      {
+         if (FindBallState(a.balls, it->first))
+            ++it;
+         else
+            it = shownAt.erase(it);
       }
 
       for (auto it = balls.begin(); it != balls.end();)
@@ -708,6 +774,7 @@ void StateApplier::Apply(const StateSnapshot& a, const StateSnapshot& b, float t
    else if (t > 1.f)
       t = 1.f;
 
+   m.maxStep = 0.f;
    StateAccess::ApplyParts(m.player, a, b, t);
    StateAccess::ApplyNudge(m.player, Lerp(a.nudge[0], b.nudge[0], t), Lerp(a.nudge[1], b.nudge[1], t), Lerp(a.nudge[2], b.nudge[2], t),
       Lerp(a.nudge[3], b.nudge[3], t), m.gainX, m.gainY);
@@ -720,6 +787,11 @@ Ball* StateApplier::FindBall(uint32_t ballId) const
    return it == m_impl->balls.end() ? nullptr : it->second;
 }
 
+float StateApplier::LastMaxBallStep() const
+{
+   return m_impl->maxStep;
+}
+
 void StateApplier::Reset()
 {
    Impl& m = *m_impl;
@@ -727,6 +799,8 @@ void StateApplier::Reset()
       if (m.IsLive(ball))
          m.player->DestroyBall(ball);
    m.balls.clear();
+   m.shownAt.clear();
+   m.maxStep = 0.f;
 }
 
 }

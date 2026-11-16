@@ -79,6 +79,7 @@ enum KindClass : uint8_t
 constexpr uint64_t RETRY_USEC = 2000000;
 constexpr uint64_t STATS_USEC = 5000000;
 constexpr uint64_t TIMELINE_MAX_USEC = 2000000;
+constexpr int64_t CATCHUP_MIN_LAG_USEC = 20000; // a hold shorter than this resumes by jumping, as it always did
 constexpr uint64_t CONNECT_FAIL_LOG_USEC = 30000000;
 constexpr size_t OFFSET_WINDOW = 300;
 constexpr int MAX_LOGGED = 20;
@@ -341,43 +342,153 @@ bool ParseAddr(const std::string& s, bool& listen, std::string& host, uint16_t& 
    return true;
 }
 
-// Appends to CASTCADE_STREAM_LOG (two instances on one PC share vpinball.log; this file is per instance) and
-// to the VPX log.
+// Appends to CASTCADE_STREAM_LOG (two instances on one PC share vpinball.log; this file is per instance) and to the
+// VPX log. Nothing is written on the caller's thread: a line is stamped and queued, and the writer's own thread
+// appends it (AsyncLineWriter). A synchronous fprintf + fflush here cost the player a frame of 62 ms during the
+// owner's recording, and up to 1.2 s in the scripted tests, whenever the disk or a virus scan held the file. With a
+// log file, the VPX log gets the warnings and errors only (the VPX log is written on the caller's thread by
+// whoever else logs, and its lock is shared); without one, it gets every line, from the writer's thread.
 class StreamLog final
 {
 public:
-   ~StreamLog()
-   {
-      if (m_file)
-         fclose(m_file);
-   }
-
    void Open(const std::string& path, const char* const role)
    {
       m_role = role;
+      const std::string prefix = "Castcade " + m_role + ": ";
+      const auto mirror = [prefix](const bool all)
+      {
+         return [prefix, all](const std::string& line)
+         {
+            // "<date> <time> [<role> pid <n>] [WARNING |ERROR ]<text>"
+            const size_t at = line.find("] ");
+            const std::string text = at == std::string::npos ? line : line.substr(at + 2);
+            if (text.rfind("ERROR ", 0) == 0)
+               PLOGE << prefix << text.substr(6);
+            else if (text.rfind("WARNING ", 0) == 0)
+               PLOGW << prefix << text.substr(8);
+            else if (all)
+               PLOGI << prefix << text;
+         };
+      };
       if (!path.empty())
-         m_file = _fsopen(path.c_str(), "a", _SH_DENYNO);
+         m_out = OpenAsyncLineWriter(path, "streamlog", mirror(false));
+      if (!m_out) // no file asked for, or it cannot be opened: the VPX log gets every line
+         m_out = OpenAsyncLineWriter(std::string(), nullptr, mirror(true));
    }
-   bool IsOpen() const { return m_file != nullptr; }
 
-   void Info(const std::string& s) { Write("", s); PLOGI << "Castcade " << m_role << ": " << s; }
-   void Warn(const std::string& s) { Write("WARNING ", s); PLOGW << "Castcade " << m_role << ": " << s; }
-   void Error(const std::string& s) { Write("ERROR ", s); PLOGE << "Castcade " << m_role << ": " << s; }
+   void Info(const std::string& s) { Write("", s); }
+   void Warn(const std::string& s) { Write("WARNING ", s); }
+   void Error(const std::string& s) { Write("ERROR ", s); }
 
 private:
    void Write(const char* const level, const std::string& s)
    {
-      if (!m_file)
+      if (!m_out)
          return;
       SYSTEMTIME t;
       GetLocalTime(&t);
-      fprintf(m_file, "%04u-%02u-%02u %02u:%02u:%02u.%03u [%s pid %lu] %s%s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
-         m_role.c_str(), GetCurrentProcessId(), level, s.c_str());
-      fflush(m_file);
+      char head[96];
+      snprintf(head, sizeof(head), "%04u-%02u-%02u %02u:%02u:%02u.%03u [%s pid %lu] %s", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+         m_role.c_str(), GetCurrentProcessId(), level);
+      m_out->Line(head + s);
    }
 
-   FILE* m_file = nullptr;
+   std::unique_ptr<AsyncLineWriter> m_out;
    std::string m_role;
+};
+
+// The name a PlaySound / StopSound argument holds, lower-cased (PinTable matches sound names with lstrcmpi), into key.
+// False for a value that is not a string and cannot be made one.
+bool SoundKey(const VARIANT& in, std::wstring& key)
+{
+   const VARIANT* v = &in;
+   for (int n = 0; V_VT(v) == (VT_VARIANT | VT_BYREF) && n < 8; ++n)
+      v = V_VARIANTREF(v);
+   if (V_VT(v) == VT_BSTR || V_VT(v) == (VT_BSTR | VT_BYREF))
+   {
+      const BSTR s = V_VT(v) == VT_BSTR ? V_BSTR(v) : (V_BSTRREF(v) ? *V_BSTRREF(v) : nullptr);
+      key.assign(s ? s : L"", s ? SysStringLen(s) : 0);
+   }
+   else
+   {
+      VARIANT tmp;
+      VariantInit(&tmp);
+      if (FAILED(VariantChangeType(&tmp, const_cast<VARIANT*>(v), 0, VT_BSTR)))
+         return false;
+      key.assign(V_BSTR(&tmp) ? V_BSTR(&tmp) : L"", V_BSTR(&tmp) ? SysStringLen(V_BSTR(&tmp)) : 0);
+      VariantClear(&tmp);
+   }
+   if (!key.empty())
+      CharLowerBuffW(key.data(), (DWORD)key.size());
+   return true;
+}
+
+// Which Global.StopSound calls can change what a watcher hears. On Congo they were two thirds of every call the
+// stream carried: the table stops the rolling sounds of each of its ten possible balls that is not on the table,
+// every frame. The rule follows VPX's sound code (PinTable::PlaySound / StopSound, AudioMusicPlayer):
+//  - On a watcher a sound plays only because a replayed PlaySound started it, or because a DispReel's own animation
+//    clicked its sound (DispReel::UpdateAnimation calls PinTable::PlaySound itself). A keyframe carries no PlaySound,
+//    so a sound started before a watcher joined never plays there.
+//  - StopSound(name) stops the sound's own buffer and the FIRST copy of it in the list of copied buffers, playing or
+//    not. That list only changes inside a PlaySound (of any name: it first drops every copy that has finished), and
+//    only a PlaySound starts a stopped buffer again.
+// So a StopSound(name) is not sent when
+//  (a) no PlaySound(name) has been sent in this session: nothing of that name can be playing on any watcher, or
+//  (b) a StopSound(name) has been sent and no PlaySound of any name since: it would find the same buffers, stopped,
+// except that the sound of a DispReel is always sent, and (b) is not used at all on a table where a DispReel has a
+// sound (a reel's click changes the list of copies at a moment of the watcher's own). Looping sounds, sounds started
+// before a watcher joined and repeated stops after a new PlaySound are all covered by (a) and (b).
+// The watcher applies the same rule to what it replays, which thins recordings made before the player did.
+class StopSoundFilter final
+{
+public:
+   void Init(const std::vector<std::wstring>& reelSounds)
+   {
+      m_engine.clear();
+      for (std::wstring s : reelSounds)
+      {
+         if (!s.empty())
+            CharLowerBuffW(s.data(), (DWORD)s.size());
+         m_engine.insert(s);
+      }
+      m_repeatRule = m_engine.empty();
+      m_played.clear();
+      m_lastStop.clear();
+      m_epoch = 0;
+   }
+
+   bool RepeatRule() const { return m_repeatRule; }
+   size_t ReelSounds() const { return m_engine.size(); }
+
+   void OnPlay(const std::wstring& key)
+   {
+      ++m_epoch;
+      m_played.insert(key);
+   }
+
+   // True when the stop must be sent; it is then counted as sent
+   bool Wanted(const std::wstring& key)
+   {
+      if (m_engine.count(key))
+         return true;
+      if (!m_played.count(key))
+         return false;
+      if (m_repeatRule)
+      {
+         const auto it = m_lastStop.find(key);
+         if (it != m_lastStop.end() && it->second == m_epoch)
+            return false;
+      }
+      m_lastStop[key] = m_epoch;
+      return true;
+   }
+
+private:
+   std::unordered_set<std::wstring> m_engine; // DispReel sounds
+   std::unordered_set<std::wstring> m_played;
+   std::unordered_map<std::wstring, uint64_t> m_lastStop; // name -> m_epoch when its last stop was sent
+   uint64_t m_epoch = 0; // PlaySound calls sent
+   bool m_repeatRule = true;
 };
 
 struct Policy
@@ -479,6 +590,7 @@ public:
    void OnBallCreated(Ball* const ball) override;
    void OnBallDestroyed(Ball* const ball) override;
    void OnFrame() override;
+   void OnPhysicsStep(const unsigned long long targetUsec) override;
 
    void Record(IDispatch* const obj, const DISPID dispid, const WORD flags, const DISPPARAMS* const params);
 
@@ -496,6 +608,8 @@ private:
    void PlayService(Peer& p);
    void BuildKeyframe(ByteWriter& w);
    void BuildFrame(ByteWriter& w, const uint64_t time);
+   void EmitFrame(const uint64_t stamp); // the calls since the last frame and the physics state now, to the watchers and the recording
+   uint64_t PhysicsStamp() const;      // the physics clock on the NowUsec clock: what a frame's time field holds
 
    // Play: the recording (CASTCADE_STREAM_RECORD)
    void OpenRecording(const std::wstring& spec);
@@ -509,6 +623,8 @@ private:
    bool ParseFrame(const Message& m, RxFrame& f);
    void ApplyKeyframe(RxFrame& kf);
    void StepTimeline(const uint64_t now);
+   void LogGap();
+   std::string StepSummary() const;
    void Replay(RxFrame& f);
    IDispatch* Resolve(const uint32_t id, KindClass& cls) const;
    void Refuse(const std::string& why);
@@ -540,6 +656,15 @@ private:
    bool m_neverPauses = false;
    int64_t m_delayUsec = 50000;
    bool m_replaySound = true;
+
+   // Both: Global.StopSound calls that cannot change what a watcher hears are neither sent nor replayed
+   StopSoundFilter m_stopFilter;
+   bool m_stopFilterOn = true; // CASTCADE_STREAM_STOPFILTER=0 turns it off (tests)
+   bool m_stopAudit = false;   // watch, CASTCADE_STREAM_STOPAUDIT=1: replay every stop, and count those the filter would drop that would have stopped a playing sound
+   DISPID m_dispPlaySound = DISPID_UNKNOWN, m_dispStopSound = DISPID_UNKNOWN;
+   std::wstring m_soundKey;
+   uint64_t m_iStopDropped = 0, m_stopDroppedTotal = 0;
+   uint64_t m_iAuditEffective = 0, m_iAuditNoEffect = 0, m_auditEffectiveTotal = 0, m_auditNoEffectTotal = 0;
 
    // Table identity
    uint32_t m_editCount = 0;
@@ -592,6 +717,15 @@ private:
    uint32_t m_recordSeq = 0;
    uint64_t m_recFrames = 0, m_recTicks = 0, m_recTicksMax = 0, m_recBytesAtStats = 0; // per stats interval
 
+   // Play: catch-up frames (OnPhysicsStep). CASTCADE_STREAM_CATCHUP=0 turns them off (tests).
+   bool m_catchupFrames = true;
+   double m_frameIntervalUsec = 7000.;    // the player's recent frame interval (smoothed)
+   uint64_t m_lastFrameAt = 0;            // NowUsec of the last PlayFrame
+   uint64_t m_lastEmitPhysics = 0;        // physics clock (usec()) of the last frame sent
+   bool m_inCatchup = false;              // this UpdatePhysics call is a catch-up that sends frames
+   uint64_t m_iCatchupFrames = 0, m_iCatchups = 0, m_catchupFramesTotal = 0, m_catchupsTotal = 0;
+   uint64_t m_iCatchupTicks = 0;
+
    // Play: per frame and per interval counters
    uint32_t m_frameSeen = 0, m_frameQueued = 0;
    uint64_t m_frameTicks = 0;
@@ -618,6 +752,26 @@ private:
    uint64_t m_iReplayed[KC_COUNT] = {}, m_iFailed = 0, m_iUnresolved = 0, m_iSoundSkipped = 0;
    uint32_t m_frameReplayed = 0, m_iReplayedMax = 0;
    uint64_t m_iReplayedSum = 0;
+
+   // Watch: what happens when the stream had a gap (StepTimeline). CASTCADE_STREAM_SMOOTH=0: the shown time jumps
+   // to the target when frames come back, as before; 1 (default): it catches up over a short eased interval.
+   bool m_smooth = true;
+   bool m_haveShown = false, m_held = false, m_catchup = false;
+   int64_t m_shown = 0;         // the stream time the last frame showed
+   uint64_t m_catchupStart = 0; // NowUsec
+   double m_catchupLag = 0., m_catchupLen = 0.;
+   // The gap being measured: how long the picture held, and the largest ball step until the catch-up is over
+   uint64_t m_heldSince = 0;
+   int64_t m_heldStamp = 0;
+   bool m_epOpen = false;
+   uint64_t m_epUntil = 0;
+   double m_epHeldMs = 0., m_epGapMs = 0., m_epLagMs = 0., m_epCatchupMs = 0., m_epFirstMoveMs = -1.;
+   float m_epMaxStep = 0.f;
+   uint64_t m_iGaps = 0, m_gapsTotal = 0;
+   float m_iMaxStep = 0.f;
+   std::vector<uint32_t> m_stepHist; // ball steps of the frames outside a gap, 0.5 VPU bins
+   uint64_t m_stepFrames = 0;
+   float m_stepMax = 0.f;
 
    // Both
    uint64_t m_statsStart = 0;
@@ -670,6 +824,16 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
          m_delayUsec = (int64_t)std::clamp(atoi(delay.c_str()), 0, 5000) * 1000;
       const std::string sound = GetEnv("CASTCADE_STREAM_SOUND");
       m_replaySound = sound.empty() || atoi(sound.c_str()) != 0;
+      m_stopAudit = GetEnv("CASTCADE_STREAM_STOPAUDIT") == "1";
+      m_smooth = GetEnv("CASTCADE_STREAM_SMOOTH") != "0";
+   }
+   else
+      m_catchupFrames = GetEnv("CASTCADE_STREAM_CATCHUP") != "0";
+   m_stopFilterOn = GetEnv("CASTCADE_STREAM_STOPFILTER") != "0";
+   {
+      std::vector<std::wstring> reels;
+      ReelSoundNames(m_player, reels);
+      m_stopFilter.Init(reels);
    }
 
    const std::string& file = m_player->m_ptable->m_szFileName;
@@ -683,6 +847,12 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
       watch ? "watch" : "play", m_addrText.empty() ? "(none)" : m_addrText.c_str(), m_listen ? "listen on" : "connect to",
       m_listen ? (m_connectHost.empty() ? "0.0.0.0" : m_connectHost.c_str()) : m_connectHost.c_str(), m_port, (int)(m_delayUsec / 1000),
       m_replaySound ? "on" : "off", m_neverPauses ? "yes" : "no", m_tableFile.c_str(), m_editCount, (unsigned long long)m_hash, VP_VERSION_STRING_POINTS_FULL));
+   m_log.Info(Fmt("StopSound filter %s (DispReel sounds %zu, repeated-stop rule %s)%s", m_stopFilterOn ? "on" : "off (CASTCADE_STREAM_STOPFILTER=0)",
+      m_stopFilter.ReelSounds(), m_stopFilter.RepeatRule() ? "on" : "off", m_stopAudit ? "; AUDIT: every stop is replayed, the ones the filter would drop are checked" : ""));
+   m_log.Info(watch ? Fmt("after a gap in the stream: %s", m_smooth ? "catch up over 80-250 ms (CASTCADE_STREAM_SMOOTH=0 jumps instead)" : "jump to the target (CASTCADE_STREAM_SMOOTH=0)")
+                    : Fmt("frames stamped with the physics clock; catch-up frames after a stall %s", m_catchupFrames ? "on" : "off (CASTCADE_STREAM_CATCHUP=0)"));
+   if (m_stopAudit && !m_player->m_PlaySound)
+      m_log.Warn("the StopSound audit needs PlaySound=1 in the watcher's settings: without it no sound plays and every check passes");
 
    if (watch)
       m_applier = std::make_unique<StateApplier>(m_player);
@@ -714,6 +884,19 @@ SessionImpl::~SessionImpl()
    g_session = nullptr;
    if (!m_watch)
       LogSentByName("whole session");
+   m_log.Info(Fmt("StopSound filter, whole session: %llu %s%s", (unsigned long long)m_stopDroppedTotal, m_watch ? "stops skipped" : "stops not sent",
+      m_stopAudit ? Fmt("; audit: %llu stops the filter would drop would have stopped a playing sound, %llu would not", (unsigned long long)m_auditEffectiveTotal,
+                       (unsigned long long)m_auditNoEffectTotal).c_str()
+                  : ""));
+   if (m_watch)
+   {
+      if (m_epOpen)
+         LogGap();
+      m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; ball steps per frame outside them: %s", (unsigned long long)m_gapsTotal,
+         StepSummary().c_str()));
+   }
+   else
+      m_log.Info(Fmt("whole session: %llu catch-ups after a stall sent %llu frames of their own", (unsigned long long)m_catchupsTotal, (unsigned long long)m_catchupFramesTotal));
    if (m_ballPolicy && m_ballPolicy->sample)
       m_ballPolicy->sample->Release();
 
@@ -790,6 +973,15 @@ void SessionImpl::BuildObjectMap()
          m_objects[disp] = ObjInfo { i, EditablePolicy(pe, disp), KC_EDITABLE, 0, ps->m_wzName };
    }
    m_hash = h;
+
+   {
+      IDispatch* const g = table->m_psgt->GetDispatch();
+      LPOLESTR play = const_cast<LPOLESTR>(L"PlaySound"), stop = const_cast<LPOLESTR>(L"StopSound");
+      if (FAILED(g->GetIDsOfNames(IID_NULL, &play, 1, LOCALE_USER_DEFAULT, &m_dispPlaySound)))
+         m_dispPlaySound = DISPID_UNKNOWN;
+      if (FAILED(g->GetIDsOfNames(IID_NULL, &stop, 1, LOCALE_USER_DEFAULT, &m_dispStopSound)))
+         m_dispStopSound = DISPID_UNKNOWN;
+   }
 
    if (m_watch)
    {
@@ -1083,6 +1275,20 @@ void SessionImpl::RecordImpl(IDispatch* const obj, const DISPID dispid, const WO
    const uint8_t kind = put ? ((flags & DISPATCH_PROPERTYPUT) ? CALL_PUT : CALL_PUTREF) : CALL_METHOD;
    const uint8_t cflags = (rule & RULE_SOUND) ? CALLFLAG_SOUND : 0;
 
+   // A stop that cannot change what a watcher hears is not sent (StopSoundFilter); every PlaySound is
+   if (!put && o.cls == KC_GLOBAL && m_stopFilterOn && argc >= 1 && (dispid == m_dispStopSound || dispid == m_dispPlaySound)
+      && SoundKey(params->rgvarg[argc - 1], m_soundKey))
+   {
+      if (dispid == m_dispPlaySound)
+         m_stopFilter.OnPlay(m_soundKey);
+      else if (!m_stopFilter.Wanted(m_soundKey))
+      {
+         ++m_iStopDropped;
+         ++m_stopDroppedTotal;
+         return;
+      }
+   }
+
    if (put || (rule & RULE_STICKY))
    {
       // Key: object, DISPID and, for a put, the index arguments (all but the value, which is rgvarg[0])
@@ -1168,7 +1374,7 @@ void SessionImpl::BuildKeyframe(ByteWriter& w)
    m_state.clear();
    CaptureState(m_player, m_ballIds, m_state);
    w.clear();
-   w.u64(NowUsec());
+   w.u64(PhysicsStamp());
    w.u32(m_frameSeq);
    w.blob(m_state.data(), m_state.size());
    std::vector<const Stored*> list;
@@ -1380,13 +1586,32 @@ void SessionImpl::PlayFrame(const uint64_t now)
    if (m_recorder && !m_recordStarted)
       StartRecording();
 
+   // The player's frame interval, smoothed: the catch-up thresholds scale with it. A stalled frame counts as 2.5
+   // intervals at most, so one stall moves it by 7.5% while a slower frame rate still takes over within 30 frames.
+   if (m_lastFrameAt)
+      m_frameIntervalUsec = 0.95 * m_frameIntervalUsec + 0.05 * (std::min)((double)(now - m_lastFrameAt), 2.5 * m_frameIntervalUsec);
+   m_lastFrameAt = now;
+   m_inCatchup = false;
+
+   EmitFrame(PhysicsStamp());
+}
+
+uint64_t SessionImpl::PhysicsStamp() const
+{
+   // usec() and NowUsec() both count QueryPerformanceCounter, from different origins
+   const int64_t behind = (int64_t)usec() - (int64_t)PhysicsClockUsec(m_player);
+   return (uint64_t)((int64_t)NowUsec() - behind);
+}
+
+void SessionImpl::EmitFrame(const uint64_t stamp)
+{
    const bool toWatchers = std::any_of(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.helloOk; });
    if (toWatchers || m_recorder)
    {
       const uint64_t t0 = __rdtsc();
       if (toWatchers)
          ++m_frameSeq;
-      BuildFrame(m_payload, NowUsec());
+      BuildFrame(m_payload, stamp);
       uint64_t recTicks = toWatchers ? 0 : __rdtsc() - t0; // built for the recording alone: its cost
       if (toWatchers)
       {
@@ -1415,6 +1640,38 @@ void SessionImpl::PlayFrame(const uint64_t now)
    }
    m_frameCalls.clear();
    m_frameCallCount = 0;
+   m_lastEmitPhysics = PhysicsClockUsec(m_player);
+}
+
+// After a stall of the render thread (a script that waited on a file, the GPU driver, ...) the next UpdatePhysics
+// simulates the whole stall in one go, and a frame sent after it would carry the end state only: a watcher could
+// only jump to it, or draw a straight line through whatever the ball hit meanwhile. So while UpdatePhysics is
+// catching up by more than 2.5 frame intervals (and at least 25 ms), every frame interval of simulated time is sent
+// as a frame of its own: the state then and the script calls made up to then, stamped with the physics clock. It
+// costs a CaptureState and a send per interval of the catch-up (about 0.1 ms each; 90 of them for a 650 ms stall at
+// 144 fps), only during a catch-up; normal frames are unchanged.
+void SessionImpl::OnPhysicsStep(const unsigned long long targetUsec)
+{
+   if (m_watch || !m_catchupFrames || m_lastFrameAt == 0 || (!m_recorder && m_peers.empty()))
+      return;
+   const uint64_t phys = PhysicsClockUsec(m_player);
+   const double interval = std::clamp(m_frameIntervalUsec, 3000., 17000.);
+   if (!m_inCatchup)
+   {
+      // Decided at the step that starts the catch-up: how far this UpdatePhysics has left to go
+      if ((double)((int64_t)targetUsec - (int64_t)phys) < (std::max)(25000., 2.5 * interval))
+         return;
+      m_inCatchup = true;
+      ++m_iCatchups;
+      ++m_catchupsTotal;
+   }
+   if ((double)(phys - m_lastEmitPhysics) < interval || (int64_t)targetUsec - (int64_t)phys < (int64_t)(interval * 0.5))
+      return; // not yet a frame interval since the last frame; or the frame that follows the catch-up is due
+   const uint64_t t0 = __rdtsc();
+   EmitFrame(PhysicsStamp());
+   m_iCatchupTicks += __rdtsc() - t0;
+   ++m_iCatchupFrames;
+   ++m_catchupFramesTotal;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1569,6 +1826,36 @@ void SessionImpl::Replay(RxFrame& f)
          ++m_iSoundSkipped;
          continue;
       }
+      // The player's StopSoundFilter, applied again: it thins streams recorded before the player applied it, and
+      // drops nothing from a stream the player already filtered (same rule, same calls, same order)
+      if (c.obj == ID_GLOBAL && c.kind == CALL_METHOD && m_stopFilterOn && c.argc >= 1 && (c.dispid == m_dispStopSound || c.dispid == m_dispPlaySound)
+         && SoundKey(f.args[c.argStart + c.argc - 1], m_soundKey))
+      {
+         if (c.dispid == m_dispPlaySound)
+            m_stopFilter.OnPlay(m_soundKey);
+         else if (!m_stopFilter.Wanted(m_soundKey))
+         {
+            if (!m_stopAudit)
+            {
+               ++m_iStopDropped;
+               ++m_stopDroppedTotal;
+               continue;
+            }
+            // Audit: replayed anyway, after checking whether it would have stopped anything that plays here now
+            if (StopSoundWouldStop(m_player, m_soundKey))
+            {
+               ++m_iAuditEffective;
+               ++m_auditEffectiveTotal;
+               if (m_auditEffectiveTotal <= MAX_LOGGED)
+                  m_log.Warn("StopSound audit: the filter would have dropped a stop of '" + Narrow(m_soundKey.c_str()) + "' while that sound was playing here");
+            }
+            else
+            {
+               ++m_iAuditNoEffect;
+               ++m_auditNoEffectTotal;
+            }
+         }
+      }
       KindClass cls;
       IDispatch* const target = Resolve(c.obj, cls);
       if (!target)
@@ -1629,6 +1916,7 @@ void SessionImpl::ApplyKeyframe(RxFrame& kf)
 {
    m_applier->Reset();
    m_timeline.clear();
+   m_haveShown = m_held = m_catchup = m_epOpen = false;
    m_applier->Apply(*kf.state, *kf.state, 1.f);
    const uint64_t failedBefore = m_iFailed + m_iUnresolved;
    const uint32_t replayedBefore = m_frameReplayed;
@@ -1757,20 +2045,91 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
    m_keyframeApplied = false; // the next connection starts with a keyframe; the last picture stays meanwhile
 }
 
+// When the player stalls, its frames stop for the length of the stall and then come all at once (a catch-up sends
+// the states it simulated meanwhile, CastcadeStream OnPhysicsStep). The watcher shows a fixed delay behind the
+// newest frame, so it holds the last picture for the stall minus the delay whatever it does (a guess forward would be
+// wrong at the first thing the ball hits). What smoothing changes is the moment frames come back: without it the
+// shown time jumps to the target and the ball leaps over everything it did during the hold; with it the shown time
+// carries on from where it held and catches up with the target over 80 to 250 ms (0.3 of the lag), eased at both
+// ends, so the missed motion is played quickly instead of skipped. With no hold of more than CATCHUP_MIN_LAG_USEC the
+// shown time is the target, exactly as without smoothing; calls are replayed once each and in order either way.
 void SessionImpl::StepTimeline(const uint64_t now)
 {
    if (m_timeline.empty())
       return;
-   int64_t render = (int64_t)now - m_offset - m_delayUsec;
+   const int64_t target = (int64_t)now - m_offset - m_delayUsec;
+   int64_t render = target;
 
    // A stalled watcher (or a stale clock offset) lets the timeline grow: jump to the newest minus the delay
    const int64_t newest = (int64_t)m_timeline.back()->time;
+   bool jumped = false;
    if (newest - (int64_t)m_timeline.front()->time > (int64_t)TIMELINE_MAX_USEC && newest - m_delayUsec > render)
    {
       render = newest - m_delayUsec;
+      jumped = true;
+      m_catchup = false;
       if (m_iJumps++ < 3)
          m_log.Info(Fmt("timeline over 2 s (%zu frames): jumping to the newest frame minus the delay", m_timeline.size()));
    }
+
+   if (m_smooth && !jumped && m_haveShown)
+   {
+      if (!m_catchup && m_held && newest > m_shown && target - m_shown > CATCHUP_MIN_LAG_USEC)
+      {
+         m_catchup = true;
+         m_catchupStart = now;
+         m_catchupLag = (double)(target - m_shown);
+         m_catchupLen = std::clamp(0.3 * m_catchupLag, 80000., 250000.);
+      }
+      if (m_catchup)
+      {
+         const double u = (double)(now - m_catchupStart) / m_catchupLen;
+         if (u >= 1.)
+            m_catchup = false;
+         else
+            render = target - (int64_t)(m_catchupLag * (1. - u * u * (3. - 2. * u)));
+      }
+   }
+
+   // Nothing newer than the newest frame to show: hold it (also what happened before, with render past it)
+   const bool held = render > newest;
+   if (held)
+   {
+      render = newest;
+      m_catchup = false; // a new hold during a catch-up: it starts again from here when frames come back
+   }
+   if (held && !m_held)
+   {
+      m_heldSince = now;
+      m_heldStamp = newest;
+   }
+   else if (!held && m_held && m_haveShown)
+   {
+      const double heldMs = (double)(now - m_heldSince) / 1000.;
+      if (heldMs >= 20.)
+      {
+         if (m_epOpen)
+            LogGap();
+         int64_t next = newest;
+         for (const auto& f : m_timeline)
+            if ((int64_t)f->time > m_heldStamp)
+            {
+               next = (int64_t)f->time;
+               break;
+            }
+         m_epOpen = true;
+         m_epHeldMs = heldMs;
+         m_epGapMs = (double)(next - m_heldStamp) / 1000.;
+         m_epLagMs = (double)(target - m_heldStamp) / 1000.;
+         m_epCatchupMs = m_catchup ? m_catchupLen / 1000. : 0.;
+         m_epUntil = now + (uint64_t)(m_epCatchupMs * 1000.) + 100000;
+         m_epMaxStep = 0.f;
+         m_epFirstMoveMs = -1.;
+      }
+   }
+   m_held = held;
+   m_shown = render;
+   m_haveShown = true;
 
    // a: the newest frame at or before the render time; b: the one after it
    size_t ia = SIZE_MAX;
@@ -1799,12 +2158,61 @@ void SessionImpl::StepTimeline(const uint64_t now)
       if (!b && !m_peers.empty() && m_peers.front().helloOk)
          ++m_iStarved;
    }
+   // How far the picture moved in this frame: the gap being measured, or the reference of normal play
+   const float step = m_applier->LastMaxBallStep();
+   m_iMaxStep = (std::max)(m_iMaxStep, step);
+   if (m_epOpen)
+   {
+      m_epMaxStep = (std::max)(m_epMaxStep, step);
+      if (m_epFirstMoveMs < 0. && step >= 1.f) // the first frame after the hold in which a ball visibly moves
+         m_epFirstMoveMs = (double)(now - m_heldSince) / 1000.;
+      if (now >= m_epUntil)
+         LogGap();
+   }
+   else if (!held)
+   {
+      if (m_stepHist.empty())
+         m_stepHist.assign(8001, 0);
+      ++m_stepHist[std::min<size_t>((size_t)(step * 2.f), m_stepHist.size() - 1)];
+      ++m_stepFrames;
+      m_stepMax = (std::max)(m_stepMax, step);
+   }
    // Calls after the state, in arrival order: a ball put finds its ball, lights change in step with the balls
    for (size_t i = 0; i <= ia; ++i)
       if (!m_timeline[i]->replayed)
          Replay(*m_timeline[i]);
    for (size_t i = 0; i < ia; ++i)
       m_timeline.pop_front();
+}
+
+void SessionImpl::LogGap()
+{
+   m_epOpen = false;
+   ++m_iGaps;
+   ++m_gapsTotal;
+   const std::string how = m_epCatchupMs > 0. ? Fmt("caught up in %.0f ms", m_epCatchupMs) : m_smooth ? std::string("no catch-up (lag under 20 ms)") : std::string("jumped (smoothing off)");
+   const std::string move = m_epFirstMoveMs >= 0. ? Fmt("a ball moved again %.0f ms after the hold began", m_epFirstMoveMs) : std::string("no ball moved");
+   m_log.Info(Fmt("stream gap: %.0f ms between frame stamps, picture held %.0f ms, %.0f ms behind when frames came back, %s; %s; largest ball step %.1f VPU in one frame",
+      m_epGapMs, m_epHeldMs, m_epLagMs, how.c_str(), move.c_str(), m_epMaxStep));
+}
+
+std::string SessionImpl::StepSummary() const
+{
+   if (m_stepFrames == 0)
+      return "no ball moved";
+   const auto pct = [this](const double p)
+   {
+      const uint64_t want = (uint64_t)(p * (double)m_stepFrames);
+      uint64_t sum = 0;
+      for (size_t i = 0; i < m_stepHist.size(); ++i)
+      {
+         sum += m_stepHist[i];
+         if (sum > want)
+            return (double)i * 0.5;
+      }
+      return (double)(m_stepHist.size() - 1) * 0.5;
+   };
+   return Fmt("frames %llu, median %.1f, p99 %.1f, p99.9 %.1f, max %.1f VPU", (unsigned long long)m_stepFrames, pct(0.5), pct(0.99), pct(0.999), m_stepMax);
 }
 
 void SessionImpl::WatchFrame(const uint64_t now)
@@ -1909,13 +2317,16 @@ void SessionImpl::LogStats(const uint64_t now)
       const size_t watchers = (size_t)std::count_if(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.helloOk; });
       m_log.Info(Fmt("stats %.1fs: watchers %zu, frames %llu, sent %llu (%.1f/s), out %.0f B/s, in %.0f B/s; script calls/frame avg %.1f max %u, by kind "
                      "editable %llu table %llu global %llu ball %llu; sent calls/frame avg %.2f max %u, by kind editable %llu table %llu global %llu ball %llu; "
-                     "dedupe-dropped %llu, policy-ignored %llu, unencodable %llu, unknown-object %llu; OnScriptCall us/frame avg %.1f max %.1f; stored %zu",
+                     "dedupe-dropped %llu, policy-ignored %llu, unencodable %llu, unknown-object %llu, StopSound not sent %llu; OnScriptCall us/frame avg %.1f max %.1f; stored %zu; "
+                     "catch-ups %llu sending %llu frames (%.0f us in all)",
          secs, watchers, (unsigned long long)m_iFrames, (unsigned long long)m_iFramesSent, (double)m_iFramesSent / secs, (double)m_iBytesOut / secs,
          (double)m_iBytesIn / secs, (double)m_iSeen / frames, m_iSeenMax, (unsigned long long)m_seenByClass[KC_EDITABLE],
          (unsigned long long)m_seenByClass[KC_TABLE], (unsigned long long)m_seenByClass[KC_GLOBAL], (unsigned long long)m_seenByClass[KC_BALL],
          (double)m_iQueued / frames, m_iQueuedMax, (unsigned long long)m_queuedByClass[KC_EDITABLE], (unsigned long long)m_queuedByClass[KC_TABLE],
          (unsigned long long)m_queuedByClass[KC_GLOBAL], (unsigned long long)m_queuedByClass[KC_BALL], (unsigned long long)m_iDedupe,
-         (unsigned long long)m_iIgnored, (unsigned long long)m_iUnencodable, (unsigned long long)m_iUnknown, usAvg, usMax, m_stored.size()));
+         (unsigned long long)m_iIgnored, (unsigned long long)m_iUnencodable, (unsigned long long)m_iUnknown, (unsigned long long)m_iStopDropped, usAvg, usMax,
+         m_stored.size(), (unsigned long long)m_iCatchups, (unsigned long long)m_iCatchupFrames, (double)m_iCatchupTicks / tscPerUsec));
+      m_iCatchups = m_iCatchupFrames = m_iCatchupTicks = 0;
       if (m_recorder)
       {
          const uint64_t bytes = m_recorder->FileBytes();
@@ -1929,7 +2340,7 @@ void SessionImpl::LogStats(const uint64_t now)
       m_iSeen = m_iQueued = m_iTicks = 0;
       m_iSeenMax = m_iQueuedMax = 0;
       m_iTicksMax = 0;
-      m_iDedupe = m_iIgnored = m_iUnencodable = m_iUnknown = m_iFramesSent = 0;
+      m_iDedupe = m_iIgnored = m_iUnencodable = m_iUnknown = m_iFramesSent = m_iStopDropped = 0;
       for (int i = 0; i < KC_COUNT; ++i)
          m_seenByClass[i] = m_queuedByClass[i] = 0;
       if (now - m_lastNamesLog >= 30000000)
@@ -1944,17 +2355,20 @@ void SessionImpl::LogStats(const uint64_t now)
       const double span = m_timeline.size() > 1 ? (double)(m_timeline.back()->time - m_timeline.front()->time) / 1000. : 0.;
       m_log.Info(Fmt("stats %.1fs: %s, frames %llu, received %llu (%.1f/s), in %.0f B/s, out %.0f B/s; timeline %zu frames (%.0f ms), starved %llu, buffering %llu, "
                      "jumps %llu; replayed calls %llu (editable %llu table %llu global %llu ball %llu), per frame avg %.2f max %u, failed %llu, unresolved %llu, "
-                     "sound skipped %llu; frames before keyframe %llu; clock offset %lld us, delay %lld ms",
+                     "sound skipped %llu, stops skipped %llu%s; frames before keyframe %llu; clock offset %lld us, delay %lld ms; gaps %llu, largest ball step %.1f VPU",
          secs, m_refused ? "refused" : (connected ? "connected" : "not connected"), (unsigned long long)m_iFrames, (unsigned long long)m_iRecv,
          (double)m_iRecv / secs, (double)m_iBytesIn / secs, (double)m_iBytesOut / secs, m_timeline.size(), span, (unsigned long long)m_iStarved,
          (unsigned long long)m_iBuffering, (unsigned long long)m_iJumps,
          (unsigned long long)(m_iReplayed[KC_EDITABLE] + m_iReplayed[KC_TABLE] + m_iReplayed[KC_GLOBAL] + m_iReplayed[KC_BALL]),
          (unsigned long long)m_iReplayed[KC_EDITABLE], (unsigned long long)m_iReplayed[KC_TABLE], (unsigned long long)m_iReplayed[KC_GLOBAL],
          (unsigned long long)m_iReplayed[KC_BALL], (double)m_iReplayedSum / frames, m_iReplayedMax, (unsigned long long)m_iFailed,
-         (unsigned long long)m_iUnresolved, (unsigned long long)m_iSoundSkipped, (unsigned long long)m_iBeforeKeyframe, (long long)m_offset,
-         (long long)(m_delayUsec / 1000)));
+         (unsigned long long)m_iUnresolved, (unsigned long long)m_iSoundSkipped, (unsigned long long)m_iStopDropped,
+         m_stopAudit ? Fmt(" (audit: %llu would have stopped a playing sound, %llu would not)", (unsigned long long)m_iAuditEffective, (unsigned long long)m_iAuditNoEffect).c_str() : "",
+         (unsigned long long)m_iBeforeKeyframe, (long long)m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_iGaps, m_iMaxStep));
+      m_iGaps = 0;
+      m_iMaxStep = 0.f;
       m_iRecv = m_iBeforeKeyframe = m_iStarved = m_iBuffering = m_iJumps = 0;
-      m_iFailed = m_iUnresolved = m_iSoundSkipped = 0;
+      m_iFailed = m_iUnresolved = m_iSoundSkipped = m_iStopDropped = m_iAuditEffective = m_iAuditNoEffect = 0;
       m_iReplayedSum = 0;
       m_iReplayedMax = 0;
       for (int i = 0; i < KC_COUNT; ++i)

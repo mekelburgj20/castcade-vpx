@@ -354,7 +354,8 @@ public:
 
 // Opens path for appending, shared for reading and writing (two VPX instances may append to one file). ioName, if
 // not null, names the writer's writes to the I/O observer below. mirror, if given, is called on the writer thread
-// with each line after it was written. Returns nullptr when the file cannot be opened.
+// with each line after it was written. An empty path with a mirror gives a writer that only mirrors. Returns nullptr
+// when the file cannot be opened (or for an empty path without a mirror).
 std::unique_ptr<AsyncLineWriter> OpenAsyncLineWriter(const std::string& path, const char* ioName = nullptr, std::function<void(const std::string&)> mirror = {});
 
 // Every file write the recorder and the async line writers make is reported here when an observer is set (the

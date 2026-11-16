@@ -9,6 +9,9 @@
 //                               One event per line, '#' starts a comment:  <ms> <down|up> <key>
 //                               <ms> counts from the first frame (wall clock); <key> is start, credit, plunger,
 //                               lflip, rflip (the player's own bindings) or a decimal DirectInput scan code.
+//   CASTCADE_TEST_STALL=<ms>,<every s>[,<first s>]  stall the render thread for <ms> every <every s> seconds, in
+//                               the frame after the physics (where a script waiting on a file stalls it): gives the
+//                               stream's catch-up frames and the watcher's smoothing gaps to work on
 // Its log lines ("test input ...") go to CASTCADE_STREAM_LOG when that is set, and to the VPX log.
 // Never created on a watcher.
 

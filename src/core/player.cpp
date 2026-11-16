@@ -3200,6 +3200,10 @@ void Player::UpdatePhysics()
 
       m_curPhysicsFrameTime = m_nextPhysicsFrameTime; // new cycle, on physics frame boundary
       m_nextPhysicsFrameTime += PHYSICS_STEPTIME;     // advance physics position
+
+      // Castcade play role: a catch-up after a stall sends its intermediate states (a watcher ignores this)
+      if (m_castcade)
+         m_castcade->OnPhysicsStep(initial_time_usec);
    } // end while (m_curPhysicsFrameTime < initial_time_usec)
 
    g_frameProfiler.ExitProfileSection();

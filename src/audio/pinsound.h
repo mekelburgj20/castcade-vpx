@@ -198,6 +198,22 @@ public:
 		}
 	}
 
+	// Castcade stream, the StopSound audit: whether StopCopiedWav(szName) would stop a copy that is playing
+	bool IsCopiedWavPlaying(const char* const szName) const
+	{
+		for (size_t i = 0; i < m_copiedwav.size(); i++)
+		{
+			const PinDirectSoundWavCopy * const ppsc = m_copiedwav[i];
+			if (!lstrcmpi(ppsc->m_ppsOriginal->m_szName.c_str(), szName))
+			{
+				DWORD status = 0;
+				ppsc->m_pDSBuffer->GetStatus(&status);
+				return (status & DSBSTATUS_PLAYING) != 0;
+			}
+		}
+		return false;
+	}
+
 	void StopCopiedWavs()
 	{
 		for (size_t i = 0; i < m_copiedwav.size(); i++)

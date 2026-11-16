@@ -1321,7 +1321,8 @@ public:
       m_cv.notify_all();
       if (m_thread.joinable())
          m_thread.join();
-      fclose(m_file);
+      if (m_file)
+         fclose(m_file);
    }
 
    void Line(std::string line) override
@@ -1363,17 +1364,20 @@ private:
          lock.unlock();
          if (!batch.empty())
          {
-            text.clear();
-            for (const std::string& s : batch)
+            if (m_file)
             {
-               text += s;
-               text += '\n';
+               text.clear();
+               for (const std::string& s : batch)
+               {
+                  text += s;
+                  text += '\n';
+               }
+               const uint64_t t0 = NowUsec();
+               fwrite(text.data(), 1, text.size(), m_file);
+               fflush(m_file);
+               if (m_ioName)
+                  ReportIo(m_ioName, t0, NowUsec(), text.size());
             }
-            const uint64_t t0 = NowUsec();
-            fwrite(text.data(), 1, text.size(), m_file);
-            fflush(m_file);
-            if (m_ioName)
-               ReportIo(m_ioName, t0, NowUsec(), text.size());
             if (m_mirror)
                for (const std::string& s : batch)
                   m_mirror(s);
@@ -1402,10 +1406,14 @@ private:
 
 std::unique_ptr<AsyncLineWriter> OpenAsyncLineWriter(const std::string& path, const char* const ioName, std::function<void(const std::string&)> mirror)
 {
-   if (path.empty())
-      return nullptr;
-   FILE* const f = _fsopen(path.c_str(), "a", _SH_DENYNO);
-   if (!f)
+   FILE* f = nullptr;
+   if (!path.empty())
+   {
+      f = _fsopen(path.c_str(), "a", _SH_DENYNO);
+      if (!f)
+         return nullptr;
+   }
+   else if (!mirror)
       return nullptr;
    return std::make_unique<FileLineWriter>(f, ioName, std::move(mirror));
 }
