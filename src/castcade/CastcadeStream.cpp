@@ -177,6 +177,102 @@ std::string GetEnv(const char* const name)
    return std::string(buf, n);
 }
 
+// For paths: any characters, any length
+std::wstring GetEnvW(const wchar_t* const name)
+{
+   std::wstring buf(MAX_PATH, L'\0');
+   DWORD n = GetEnvironmentVariableW(name, buf.data(), (DWORD)buf.size());
+   if (n >= buf.size())
+   {
+      buf.resize(n);
+      n = GetEnvironmentVariableW(name, buf.data(), (DWORD)buf.size());
+   }
+   if (n == 0 || n >= buf.size())
+      return std::wstring();
+   buf.resize(n);
+   return buf;
+}
+
+// The table's file name is in the ANSI code page
+std::wstring WideFromAnsi(const std::string& s)
+{
+   if (s.empty())
+      return std::wstring();
+   const int n = MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), nullptr, 0);
+   std::wstring w((size_t)(n > 0 ? n : 0), L'\0');
+   if (n > 0)
+      MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), w.data(), n);
+   return w;
+}
+
+// Creates a folder and every missing folder above it
+bool MakeFolders(const std::wstring& dir, std::string& err)
+{
+   for (size_t i = 1; i <= dir.size(); ++i)
+      if (i == dir.size() || dir[i] == L'\\' || dir[i] == L'/')
+      {
+         const std::wstring part = dir.substr(0, i);
+         if (part.back() != L':') // "C:" is no folder to create
+            CreateDirectoryW(part.c_str(), nullptr); // existing ones fail harmlessly; the result is checked below
+      }
+   const DWORD attr = GetFileAttributesW(dir.c_str());
+   if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+   {
+      err = Fmt("cannot create the folder '%s' (Windows error %lu)", Narrow(dir.c_str()).c_str(), (unsigned long)GetLastError());
+      return false;
+   }
+   return true;
+}
+
+// CASTCADE_STREAM_RECORD: a file, or a folder (one that exists, a path ending in a separator, or a last part
+// with no extension) in which the file is named after the table and the local time:
+// <table file name without .vpx>.<yyyyMMdd-HHmmss>.castrec
+bool RecordingPath(const std::wstring& spec, const std::string& tableFile, std::wstring& path, std::string& err)
+{
+   const DWORD need = GetFullPathNameW(spec.c_str(), 0, nullptr, nullptr);
+   std::wstring full((size_t)need, L'\0');
+   const DWORD got = need ? GetFullPathNameW(spec.c_str(), need, full.data(), nullptr) : 0;
+   if (got == 0 || got >= need)
+   {
+      err = "'" + Narrow(spec.c_str()) + "' is not a usable path";
+      return false;
+   }
+   full.resize(got);
+   const DWORD attr = GetFileAttributesW(full.c_str());
+   const size_t sep = full.find_last_of(L"\\/");
+   const std::wstring leaf = sep == std::wstring::npos ? full : full.substr(sep + 1);
+   const bool folder = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) || leaf.empty() || leaf.find(L'.') == std::wstring::npos;
+   std::wstring dir = folder ? full : full.substr(0, sep == std::wstring::npos ? 0 : sep);
+   while (dir.size() > 3 && (dir.back() == L'\\' || dir.back() == L'/'))
+      dir.pop_back();
+   if (!dir.empty() && !MakeFolders(dir, err))
+      return false;
+   if (!folder)
+   {
+      path = full;
+      return true;
+   }
+
+   std::wstring stem = WideFromAnsi(tableFile);
+   const size_t dot = stem.find_last_of(L'.');
+   if (dot != std::wstring::npos && dot > 0)
+      stem.resize(dot);
+   for (wchar_t& c : stem)
+      if (c < 32 || wcschr(L"<>:\"/\\|?*", c))
+         c = L'_';
+   if (stem.empty())
+      stem = L"table";
+   SYSTEMTIME t;
+   GetLocalTime(&t);
+   wchar_t stamp[32];
+   swprintf_s(stamp, L"%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+   const std::wstring base = dir + (dir.back() == L'\\' || dir.back() == L'/' ? L"" : L"\\") + stem + L"." + stamp;
+   path = base + L".castrec";
+   for (int k = 2; k < 100 && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++k)
+      path = base + L"-" + std::to_wstring(k) + L".castrec";
+   return true;
+}
+
 bool ParsePort(const std::string& s, uint16_t& port)
 {
    if (s.empty() || s.size() > 5)
@@ -401,6 +497,12 @@ private:
    void BuildKeyframe(ByteWriter& w);
    void BuildFrame(ByteWriter& w, const uint64_t time);
 
+   // Play: the recording (CASTCADE_STREAM_RECORD)
+   void OpenRecording(const std::wstring& spec);
+   void StartRecording();
+   void RecordMessage(const uint8_t type, const uint8_t* const data, const size_t size);
+   void CloseRecording();
+
    // Watch
    void WatchFrame(const uint64_t now);
    void WatchService(Peer& p, const uint64_t now);
@@ -413,6 +515,7 @@ private:
    void AddOffsetSample(const int64_t sample);
 
    // Both
+   void BuildHello(ByteWriter& w) const;
    void SendHello(Peer& p);
    bool ParseHello(const Message& m, Hello& h) const;
    bool CheckHello(const Hello& h, std::string& why) const;
@@ -499,6 +602,13 @@ private:
    const uint64_t m_tsc0;
    const uint64_t m_qpc0;
 
+   // Play: the recording. Its frames are numbered on their own (a watcher's numbering stays as without it).
+   std::unique_ptr<StreamRecorder> m_recorder;
+   std::string m_recordPath; // UTF-8, for logs
+   bool m_recordStarted = false; // HELLO and KEYFRAME written
+   uint32_t m_recordSeq = 0;
+   uint64_t m_recFrames = 0, m_recTicks = 0, m_recTicksMax = 0, m_recBytesAtStats = 0; // per stats interval
+
    // Play: per frame and per interval counters
    uint32_t m_frameSeen = 0, m_frameQueued = 0;
    uint64_t m_frameTicks = 0;
@@ -543,13 +653,20 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
 {
    m_log.Open(GetEnv("CASTCADE_STREAM_LOG"), watch ? "watch" : "play");
 
+   const std::wstring recordSpec = GetEnvW(L"CASTCADE_STREAM_RECORD");
+   const bool record = !watch && !recordSpec.empty();
    m_addrText = GetEnv("CASTCADE_STREAM_ADDR");
-   if (m_addrText.empty() && !watch)
+   // A player that records and has no address opens no socket at all: no listener on every interface by
+   // default, so no Windows Firewall prompt
+   if (m_addrText.empty() && !watch && !record)
       m_addrText = std::to_string(DEFAULT_PORT);
    if (m_addrText.empty())
    {
-      m_log.Error("CASTCADE_STREAM=watch needs CASTCADE_STREAM_ADDR (<port> to listen, <host>:<port> to connect); staying idle");
-      Note("Castcade: no CASTCADE_STREAM_ADDR set, nothing to watch", NOTE_LASTING_MS);
+      if (watch)
+      {
+         m_log.Error("CASTCADE_STREAM=watch needs CASTCADE_STREAM_ADDR (<port> to listen, <host>:<port> to connect); staying idle");
+         Note("Castcade: no CASTCADE_STREAM_ADDR set, nothing to watch", NOTE_LASTING_MS);
+      }
    }
    else if (!ParseAddr(m_addrText, m_listen, m_connectHost, m_port))
    {
@@ -593,6 +710,15 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
    if (m_neverPauses)
       m_player->m_pause = false;
 
+   if (record)
+   {
+      if (m_addrText.empty())
+         m_log.Info("recording only: CASTCADE_STREAM_ADDR is not set, so no socket is opened");
+      OpenRecording(recordSpec);
+   }
+   else if (watch && !recordSpec.empty())
+      m_log.Warn("CASTCADE_STREAM_RECORD is ignored on a watcher: the player records");
+
    if (m_configOk)
       StartNetwork();
 
@@ -609,6 +735,13 @@ SessionImpl::~SessionImpl()
       LogSentByName("whole session");
    if (m_ballPolicy && m_ballPolicy->sample)
       m_ballPolicy->sample->Release();
+
+   if (m_recorder)
+   {
+      if (m_recordStarted)
+         m_recorder->Write(MSG_BYE, nullptr, 0); // a watcher of the recording is told the player closed the table
+      CloseRecording();
+   }
 
    for (Peer& p : m_peers)
    {
@@ -1074,9 +1207,9 @@ void SessionImpl::BuildKeyframe(ByteWriter& w)
    }
 }
 
-void SessionImpl::SendHello(Peer& p)
+void SessionImpl::BuildHello(ByteWriter& w) const
 {
-   ByteWriter w;
+   w.clear();
    w.raw("CCST", 4);
    w.u16(PROTOCOL_VERSION);
    w.u8(m_watch ? ROLE_WATCH : ROLE_PLAY);
@@ -1084,6 +1217,12 @@ void SessionImpl::SendHello(Peer& p)
    w.u64(m_hash);
    w.str(m_tableFile);
    w.str(VP_VERSION_STRING_POINTS_FULL);
+}
+
+void SessionImpl::SendHello(Peer& p)
+{
+   ByteWriter w;
+   BuildHello(w);
    p.tcp->Send(MSG_HELLO, w.data(), w.size());
 }
 
@@ -1261,23 +1400,118 @@ void SessionImpl::PlayFrame(const uint64_t now)
       PlayService(p);
    m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.closing; }), m_peers.end());
 
-   if (std::any_of(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.helloOk; }))
+   // The recording gets what a watcher connected now would: a HELLO and a keyframe, then this frame and the next
+   if (m_recorder && !m_recordStarted)
+      StartRecording();
+
+   const bool toWatchers = std::any_of(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.helloOk; });
+   if (toWatchers || m_recorder)
    {
-      ++m_frameSeq;
+      const uint64_t t0 = __rdtsc();
+      if (toWatchers)
+         ++m_frameSeq;
       BuildFrame(m_payload, NowUsec());
-      for (Peer& p : m_peers)
-         if (p.helloOk && !p.tcp->Send(MSG_FRAME, m_payload.data(), m_payload.size()))
-         {
-            AccountBytes(p);
-            m_log.Warn(Fmt("watcher %s dropped: the connection closed or it fell more than 8 MiB behind", p.addr.c_str()));
-            Note("Castcade: watcher left");
-            p.closing = true;
-         }
-      m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.closing; }), m_peers.end());
-      ++m_iFramesSent;
+      uint64_t recTicks = toWatchers ? 0 : __rdtsc() - t0; // built for the recording alone: its cost
+      if (toWatchers)
+      {
+         for (Peer& p : m_peers)
+            if (p.helloOk && !p.tcp->Send(MSG_FRAME, m_payload.data(), m_payload.size()))
+            {
+               AccountBytes(p);
+               m_log.Warn(Fmt("watcher %s dropped: the connection closed or it fell more than 8 MiB behind", p.addr.c_str()));
+               Note("Castcade: watcher left");
+               p.closing = true;
+            }
+         m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.closing; }), m_peers.end());
+         ++m_iFramesSent;
+      }
+      if (m_recorder)
+      {
+         // The same payload under the recording's own frame number (after the watchers have been sent theirs)
+         const uint64_t t1 = __rdtsc();
+         m_payload.patch_u32(8, ++m_recordSeq);
+         RecordMessage(MSG_FRAME, m_payload.data(), m_payload.size());
+         recTicks += __rdtsc() - t1;
+         ++m_recFrames;
+         m_recTicks += recTicks;
+         m_recTicksMax = (std::max)(m_recTicksMax, recTicks);
+      }
    }
    m_frameCalls.clear();
    m_frameCallCount = 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Play role: the recording
+
+void SessionImpl::OpenRecording(const std::wstring& spec)
+{
+   std::wstring path;
+   std::string err;
+   if (RecordingPath(spec, m_tableFile, path, err))
+   {
+      RecordingInfo info;
+      info.protocol = PROTOCOL_VERSION;
+      info.partCount = m_editCount;
+      info.hash = m_hash;
+      info.table = Narrow(WideFromAnsi(m_tableFile).c_str());
+      info.build = VP_VERSION_STRING_POINTS_FULL;
+      m_recorder = CreateRecorder(path, info, err);
+      m_recordPath = Narrow(path.c_str());
+      if (m_recorder)
+      {
+         const size_t slash = path.find_last_of(L"\\/");
+         m_log.Info("recording to " + m_recordPath);
+         Note("Castcade: recording to " + Narrow(path.substr(slash == std::wstring::npos ? 0 : slash + 1).c_str()));
+         return;
+      }
+      err = "'" + m_recordPath + "': " + err;
+   }
+   m_log.Error("cannot record (CASTCADE_STREAM_RECORD): " + err + "; playing on without a recording");
+   Note("Castcade: cannot record: " + err, NOTE_LASTING_MS);
+}
+
+void SessionImpl::StartRecording()
+{
+   m_recordStarted = true;
+   ByteWriter hello;
+   BuildHello(hello);
+   RecordMessage(MSG_HELLO, hello.data(), hello.size());
+   if (!m_recorder)
+      return;
+   BuildKeyframe(m_payload);
+   m_payload.patch_u32(8, m_recordSeq);
+   const size_t states = m_state.size();
+   RecordMessage(MSG_KEYFRAME, m_payload.data(), m_payload.size());
+   m_log.Info(Fmt("recording: keyframe %zu bytes, state %zu bytes, %zu calls", m_payload.size(), states, m_stored.size()));
+}
+
+void SessionImpl::RecordMessage(const uint8_t type, const uint8_t* const data, const size_t size)
+{
+   if (m_recorder->Write(type, data, size))
+      return;
+   m_recorder->Close();
+   const std::string why = m_recorder->Error();
+   m_recorder.reset();
+   m_log.Error(Fmt("recording stopped after %u frames: %s (%s)", m_recordSeq, why.c_str(), m_recordPath.c_str()));
+   Note("Castcade: recording stopped: " + why, NOTE_LASTING_MS);
+}
+
+void SessionImpl::CloseRecording()
+{
+   const uint64_t frames = m_recordSeq, bytes = m_recorder->FileBytes(), usec = m_recorder->DurationUsec(), chunks = m_recorder->Chunks();
+   m_recorder->Close();
+   const std::string err = m_recorder->Error();
+   m_recorder.reset();
+   if (chunks == 0)
+   {
+      m_log.Info("recording: no frame was rendered, nothing recorded (" + m_recordPath + " removed)");
+      return;
+   }
+   const double minutes = (double)usec / 60e6;
+   m_log.Info(Fmt("recording closed: %s: %llu frames, %llu messages, %.1f s, %.2f MB, %.2f MB per minute%s%s", m_recordPath.c_str(), (unsigned long long)frames,
+      (unsigned long long)chunks, (double)usec / 1e6, (double)bytes / 1e6, minutes > 0. ? (double)bytes / 1e6 / minutes : 0., err.empty() ? "" : "; ",
+      err.c_str()));
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1706,6 +1940,16 @@ void SessionImpl::LogStats(const uint64_t now)
          (double)m_iQueued / frames, m_iQueuedMax, (unsigned long long)m_queuedByClass[KC_EDITABLE], (unsigned long long)m_queuedByClass[KC_TABLE],
          (unsigned long long)m_queuedByClass[KC_GLOBAL], (unsigned long long)m_queuedByClass[KC_BALL], (unsigned long long)m_iDedupe,
          (unsigned long long)m_iIgnored, (unsigned long long)m_iUnencodable, (unsigned long long)m_iUnknown, usAvg, usMax, m_stored.size()));
+      if (m_recorder)
+      {
+         const uint64_t bytes = m_recorder->FileBytes();
+         const double recFrames = m_recFrames ? (double)m_recFrames : 1.;
+         m_log.Info(Fmt("recording %.1fs: frames %llu (%llu in all), file %.2f MB, %.1f KB/s; cost on the render thread us/frame avg %.1f max %.1f",
+            secs, (unsigned long long)m_recFrames, (unsigned long long)m_recordSeq, (double)bytes / 1e6, (double)(bytes - m_recBytesAtStats) / 1e3 / secs,
+            (double)m_recTicks / recFrames / tscPerUsec, (double)m_recTicksMax / tscPerUsec));
+         m_recBytesAtStats = bytes;
+      }
+      m_recFrames = m_recTicks = m_recTicksMax = 0;
       m_iSeen = m_iQueued = m_iTicks = 0;
       m_iSeenMax = m_iQueuedMax = 0;
       m_iTicksMax = 0;

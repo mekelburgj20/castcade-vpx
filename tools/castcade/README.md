@@ -33,3 +33,24 @@ windows by PID, always passes `-Ini` (the owner's ini is never touched), keeps V
 restores the HKCU type-library key, editor key and `%APPDATA%\VPinballX\BAMViewSettings.xml` in a
 `finally` block, refuses to start if an earlier run's PID is alive, and checks the port on loopback only.
 Screenshots use PrintWindow, which does not take focus.
+
+# tools/castcade/replay-test.ps1
+
+Record and replay test for `CASTCADE_STREAM_RECORD` and `launchers/castcade-replay.ps1`, in the same style
+as `pair.ps1` (desktop windows from a generated `-Ini`, VR off, sound off, keys fired inside VPX through
+`CASTCADE_TEST_INPUT`, PrintWindow captures, `WM_CLOSE`, loopback only; ports 47920-47939). Run with `pwsh`.
+
+    pwsh -NoProfile -File replay-test.ps1 -Mode record -Table "<table.vpx>" -InputFile <keys.txt> [-WithWatcher] [-Seconds 60] [-Port 47921]
+    pwsh -NoProfile -File replay-test.ps1 -Mode replay -Table "<table.vpx>" -Recording <file.castrec> [-Connection perfect|good|fair|poor] [-Loop -Passes 2] [-ShotsFrom <record run>]
+
+`-Mode record`: a player records into `<run>\rec\`; with `-WithWatcher` it also listens on
+`127.0.0.1:<Port>` and a live watcher A connects, without it the player has no address and its sockets are
+logged 10 s in. Player (and A) captures every `-ShotEvery` s and just before the close; `shots.json` holds each
+player capture's time on the recording's clock. `-Mode replay`: a watcher B connects to the replay tool, run
+under Windows PowerShell 5.1 as a user would run it; with `-ShotsFrom` B is captured at the recording times of
+the player's captures (plus the delay), then after the end (`final-watchB.png`, and `final-late-watchB.png`
+once the "player closed the table" note is gone). Output under
+`C:\code\repos\castcade-vpx-deps\run\rr\<yyyyMMdd-HHmmss>-<mode>\`: `run.log`, per-instance `castcade.log`,
+`shots\`, `replay.log`, `watchB-totals.json` (the watcher's stats lines summed: received, starved, buffering,
+jumps, failed, unresolved). It does not restore the type-library registration or `BAMViewSettings.xml`: do
+that once after the last run.

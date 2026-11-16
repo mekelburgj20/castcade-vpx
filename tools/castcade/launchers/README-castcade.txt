@@ -21,8 +21,8 @@ package instead: it is a complete folder with its own shaders and scripts.
 Both players need this build and the identical .vpx file (same file, not just the same game). A watcher
 whose table differs refuses the stream and says so on screen.
 
-Three ways to run it
---------------------
+Ways to run it
+--------------
 1. Solo test, one PC:  drag a .vpx onto "Castcade Solo Test.bat".
    A player starts in a desktop window (VR off) and a watcher starts with your normal settings (in the
    headset, if that is how you play). Click the player window, put the headset on, play with the keyboard.
@@ -31,6 +31,26 @@ Three ways to run it
    start the table. The other PC runs "Castcade Watch.bat", types your address, starts the same table.
 
 3. Two PCs, you watch: run "Castcade Watch.bat", type the player's address, start the same table.
+
+4. Record a game:      drag a .vpx onto "Castcade Record.bat" and play as usual (your normal settings, so
+   in the headset if that is how you play). When you close the table the game is saved in the
+   castcade-recordings folder next to the exe. Nothing goes over the network: no firewall prompt.
+
+5. Watch a recording:  drag the SAME .vpx onto "Castcade Watch Recording.bat". It takes the newest
+   recording of that table (it asks when there are several) and asks which connection to simulate (Enter =
+   perfect). A watcher starts with your normal settings and shows the recorded game as if the player were
+   playing it live, on your table, from your viewpoint. When you are done, close the table and then VPX:
+   the replay window closes with it.
+   The connections other than "perfect" are SYNTHETIC: made-up delay, jitter and stalls that show what a
+   worse line looks like. They are not measurements of anyone's line.
+   To play a recording over and over, run castcade-replay.ps1 yourself with -Loop (how: the top of that
+   file). Between two passes the watcher's table is not reset, so a light the recorded game had left on
+   can stay on until the replayed game switches it.
+
+   While the Castcade app is running, it takes a game recorded or watched with 4 or 5 for a normal game
+   start: it may show a notice about the table, and it remembers VPinballX_GL64_castcade.exe as the VPX
+   it starts your tables with. Close Castcade first to avoid that, until a Castcade update knows about
+   these sessions.
 
 Connection: one side waits on TCP port 47800 and the other connects to it. Either side can be the one that
 waits (both launchers ask). The side that waits must answer "Allow" to the Windows Firewall prompt for
@@ -43,6 +63,9 @@ What you should see
 Player:  "Castcade: streaming on port 47800", then "watcher connected".
 Watcher: "Castcade: connecting to ...", then "watching <table>". The watcher's flipper keys do nothing;
          exit, VR recentre and table position keys work.
+Record:  "Castcade: recording to <table>.<date-time>.castrec".
+Replay:  the window says where in the recording it is every 5 seconds and when the recording has ended;
+         the watcher then shows "the player closed the table" and keeps the last picture.
 
 What is not in this iteration
 -----------------------------
@@ -55,7 +78,8 @@ What is not in this iteration
 If something is wrong
 ---------------------
 - Logs: castcade-play.log and castcade-watch.log next to the exe. One line every 5 seconds says how many
-  frames arrived, how many script calls were replayed and how many failed.
+  frames arrived, how many script calls were replayed and how many failed. Recording and replay write
+  castcade-record.log, castcade-watch-recording.log and castcade-replay.log.
 - Ball stutters on the watcher: raise CASTCADE_STREAM_DELAY_MS in "Castcade Watch.bat" (100 by default;
   try 150 or 200 over a poor connection). "starved" in the watcher's log counts frames that had nothing new.
 - Double sound on the watcher: set CASTCADE_STREAM_SOUND=0 in "Castcade Watch.bat".

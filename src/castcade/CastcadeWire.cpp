@@ -9,7 +9,12 @@
 #include "miniz/miniz.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 
 namespace castcade
 {
@@ -638,6 +643,52 @@ std::string AddrToString(const sockaddr_in& a)
    return std::string(ip) + ":" + std::to_string(ntohs(a.sin_port));
 }
 
+} // namespace
+
+bool FrameMessage(std::vector<uint8_t>& out, const uint8_t type, const uint8_t* const payload, const size_t size)
+{
+   if (size > MAX_MESSAGE - 16)
+      return false;
+
+   bool deflated = false;
+   const size_t headerAt = out.size();
+   out.resize(headerAt + 4 + 2);
+
+   if (size >= DEFLATE_MIN)
+   {
+      // The result must beat the raw payload including the 4 byte raw length that precedes it
+      const size_t limit = size - 4;
+      const size_t at = out.size();
+      out.resize(at + 4 + limit);
+      const mz_uint flags = tdefl_create_comp_flags_from_zip_params(DEFLATE_LEVEL, -MZ_DEFAULT_WINDOW_BITS, MZ_DEFAULT_STRATEGY);
+      const size_t n = tdefl_compress_mem_to_mem(out.data() + at + 4, limit, payload, size, (int)flags);
+      if (n != 0 && n < limit)
+      {
+         const uint32_t rawLen = (uint32_t)size;
+         memcpy(out.data() + at, &rawLen, 4);
+         out.resize(at + 4 + n);
+         deflated = true;
+      }
+      else
+         out.resize(at);
+   }
+   if (!deflated && size > 0)
+   {
+      const size_t at = out.size();
+      out.resize(at + size);
+      memcpy(out.data() + at, payload, size);
+   }
+
+   const uint32_t len = (uint32_t)(out.size() - headerAt - 4);
+   memcpy(out.data() + headerAt, &len, 4);
+   out[headerAt + 4] = type;
+   out[headerAt + 5] = deflated ? 1 : 0;
+   return true;
+}
+
+namespace
+{
+
 class SocketPeer final : public TcpPeer
 {
 public:
@@ -654,42 +705,8 @@ public:
    {
       if (m_sock == INVALID_SOCKET)
          return false;
-      if (size > MAX_MESSAGE - 16)
+      if (!FrameMessage(m_out, type, payload, size))
          return false; // cannot be framed within the limit; the connection stays up
-
-      bool deflated = false;
-      const size_t headerAt = m_out.size();
-      m_out.resize(headerAt + 4 + 2);
-
-      if (size >= DEFLATE_MIN)
-      {
-         // The result must beat the raw payload including the 4 byte raw length that precedes it
-         const size_t limit = size - 4;
-         const size_t at = m_out.size();
-         m_out.resize(at + 4 + limit);
-         const mz_uint flags = tdefl_create_comp_flags_from_zip_params(DEFLATE_LEVEL, -MZ_DEFAULT_WINDOW_BITS, MZ_DEFAULT_STRATEGY);
-         const size_t n = tdefl_compress_mem_to_mem(m_out.data() + at + 4, limit, payload, size, (int)flags);
-         if (n != 0 && n < limit)
-         {
-            const uint32_t rawLen = (uint32_t)size;
-            memcpy(m_out.data() + at, &rawLen, 4);
-            m_out.resize(at + 4 + n);
-            deflated = true;
-         }
-         else
-            m_out.resize(at);
-      }
-      if (!deflated && size > 0)
-      {
-         const size_t at = m_out.size();
-         m_out.resize(at + size);
-         memcpy(m_out.data() + at, payload, size);
-      }
-
-      const uint32_t len = (uint32_t)(m_out.size() - headerAt - 4);
-      memcpy(m_out.data() + headerAt, &len, 4);
-      m_out[headerAt + 4] = type;
-      m_out[headerAt + 5] = deflated ? 1 : 0;
 
       if (m_connecting)
       {
@@ -1061,6 +1078,213 @@ std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port
       }
    }
    return std::make_unique<SocketPeer>(s, true, host + ":" + std::to_string(port));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Recording
+
+namespace
+{
+
+constexpr size_t RECORDING_MAX_STRING = 4096;
+constexpr DWORD RECORDING_FLUSH_MS = 1000;
+
+std::string Win32Error(const char* const what, const DWORD code)
+{
+   char buf[160];
+   snprintf(buf, sizeof(buf), "%s failed (Windows error %lu)", what, (unsigned long)code);
+   return buf;
+}
+
+class FileRecorder final : public StreamRecorder
+{
+public:
+   FileRecorder(const HANDLE file, std::wstring path, RecordingInfo info)
+      : m_file(file)
+      , m_path(std::move(path))
+      , m_info(std::move(info))
+   {
+      m_thread = std::thread([this] { Run(); });
+   }
+
+   ~FileRecorder() override { Close(); }
+
+   bool Write(const uint8_t type, const uint8_t* const payload, const size_t size) override
+   {
+      if (m_closed || m_failed.load())
+         return false;
+      const uint64_t now = NowUsec();
+      m_chunk.clear();
+      if (m_chunks == 0)
+      {
+         m_t0 = now;
+         FILETIME ft;
+         GetSystemTimeAsFileTime(&ft);
+         AppendHeader(m_chunk, ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+      }
+      const size_t at = m_chunk.size();
+      m_chunk.resize(at + 12);
+      if (!FrameMessage(m_chunk, type, payload, size))
+      {
+         Fail("a message too large to record (" + std::to_string(size) + " bytes)");
+         return false;
+      }
+      const uint64_t t = now - m_t0;
+      const uint32_t n = (uint32_t)(m_chunk.size() - at - 12);
+      memcpy(m_chunk.data() + at, &t, 8);
+      memcpy(m_chunk.data() + at + 8, &n, 4);
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         if (m_pending.size() + m_chunk.size() > RECORDING_MAX_QUEUED)
+         {
+            m_pending.clear();
+            m_pending.shrink_to_fit();
+            m_error = "the disk did not keep up: more than " + std::to_string(RECORDING_MAX_QUEUED >> 20) + " MiB waiting to be written";
+            m_failed = true;
+            return false;
+         }
+         m_pending.insert(m_pending.end(), m_chunk.begin(), m_chunk.end());
+      }
+      ++m_chunks;
+      m_bytes += m_chunk.size();
+      m_last = t;
+      return true;
+   }
+
+   void Close() override
+   {
+      if (m_closed)
+         return;
+      m_closed = true;
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_stop = true;
+      }
+      m_cv.notify_all();
+      if (m_thread.joinable())
+         m_thread.join();
+      if (m_chunks == 0 && !m_failed)
+      {
+         CloseHandle(m_file);
+         DeleteFileW(m_path.c_str());
+         return;
+      }
+      if (!m_failed)
+      {
+         // Duration and chunk count, at their fixed offsets
+         uint8_t tail[12];
+         memcpy(tail, &m_last, 8);
+         const uint32_t count = (uint32_t)std::min<uint64_t>(m_chunks, 0xFFFFFFFFu);
+         memcpy(tail + 8, &count, 4);
+         LARGE_INTEGER pos;
+         pos.QuadPart = 24;
+         DWORD wrote = 0;
+         if (!SetFilePointerEx(m_file, pos, nullptr, FILE_BEGIN) || !WriteFile(m_file, tail, sizeof(tail), &wrote, nullptr) || wrote != sizeof(tail))
+            m_error = Win32Error("completing the header", GetLastError());
+      }
+      CloseHandle(m_file);
+   }
+
+   std::string Error() const override
+   {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      return m_error;
+   }
+   uint64_t Chunks() const override { return m_chunks; }
+   uint64_t FileBytes() const override { return m_bytes; }
+   uint64_t DurationUsec() const override { return m_last; }
+
+private:
+   void AppendHeader(std::vector<uint8_t>& out, const uint64_t fileTime) const
+   {
+      ByteWriter w;
+      w.raw("CCSTREC\x1A", 8);
+      w.u16(RECORDING_FORMAT);
+      w.u16(0); // header size, set below
+      w.u16(m_info.protocol);
+      w.u16(0);
+      w.u64(fileTime);
+      w.u64(0); // duration, set by Close
+      w.u32(0); // chunk count, set by Close
+      w.u32(m_info.partCount);
+      w.u64(m_info.hash);
+      for (const std::string* const s : { &m_info.table, &m_info.build })
+      {
+         const uint16_t n = (uint16_t)std::min<size_t>(s->size(), RECORDING_MAX_STRING);
+         w.u16(n);
+         w.raw(s->data(), n);
+      }
+      const uint16_t size = (uint16_t)w.size();
+      memcpy(w.vec().data() + 10, &size, 2);
+      out.insert(out.end(), w.data(), w.data() + w.size());
+   }
+
+   void Fail(const std::string& why)
+   {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_error.empty())
+         m_error = why;
+      m_failed = true;
+   }
+
+   // The writer thread: every second, or when closing, takes what is queued and writes it
+   void Run()
+   {
+      std::vector<uint8_t> batch;
+      std::unique_lock<std::mutex> lock(m_mutex);
+      for (;;)
+      {
+         m_cv.wait_for(lock, std::chrono::milliseconds(RECORDING_FLUSH_MS), [this] { return m_stop; });
+         batch.swap(m_pending);
+         const bool stop = m_stop;
+         lock.unlock();
+         size_t done = 0;
+         while (done < batch.size() && !m_failed)
+         {
+            DWORD wrote = 0;
+            const DWORD n = (DWORD)std::min<size_t>(batch.size() - done, 1u << 24);
+            if (!WriteFile(m_file, batch.data() + done, n, &wrote, nullptr) || wrote == 0)
+               Fail(Win32Error("writing the recording", GetLastError()));
+            done += wrote;
+         }
+         batch.clear();
+         lock.lock();
+         if (stop)
+            break;
+      }
+   }
+
+   const HANDLE m_file;
+   const std::wstring m_path;
+   const RecordingInfo m_info;
+   std::thread m_thread;
+   mutable std::mutex m_mutex;
+   std::condition_variable m_cv;
+   std::vector<uint8_t> m_pending; // guarded by m_mutex
+   bool m_stop = false;            // guarded by m_mutex
+   std::string m_error;            // guarded by m_mutex
+   std::atomic<bool> m_failed { false };
+   bool m_closed = false;
+   // Caller's thread only
+   std::vector<uint8_t> m_chunk;
+   uint64_t m_t0 = 0;
+   uint64_t m_last = 0;
+   uint64_t m_chunks = 0;
+   uint64_t m_bytes = 0;
+};
+
+} // namespace
+
+std::unique_ptr<StreamRecorder> CreateRecorder(const std::wstring& path, const RecordingInfo& info, std::string& err)
+{
+   // FILE_SHARE_READ: a recording in progress can be copied or inspected
+   const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+   if (file == INVALID_HANDLE_VALUE)
+   {
+      err = Win32Error("creating the file", GetLastError());
+      return nullptr;
+   }
+   return std::make_unique<FileRecorder>(file, path, info);
 }
 
 }

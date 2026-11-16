@@ -5,9 +5,13 @@
 
 #include "../CastcadeWire.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <share.h>
 #include <thread>
+#include <vector>
 
 using namespace castcade;
 
@@ -704,10 +708,13 @@ static double Seconds()
    return (double)NowUsec() / 1e6;
 }
 
+// The first of ten loopback ports the test may listen on; `wire_test <port>` moves them
+static uint16_t g_portBase = 47911;
+
 static bool MakePair(Pair& p, uint16_t& portOut)
 {
    std::string err;
-   for (uint16_t port = 47911; port < 47921; ++port)
+   for (uint16_t port = g_portBase; port < g_portBase + 10; ++port)
    {
       p.listener = ListenTcp(port, err, "127.0.0.1"); // loopback only: no Windows Firewall prompt
       if (p.listener)
@@ -1064,14 +1071,294 @@ static void TestTiming()
       (unsigned long long)(t1 - t0), (double)(t1 - t0) / 1000.0, (unsigned long long)deflUs, (double)deflUs / 1000.0);
 }
 
-int main()
+// ---------------------------------------------------------------------------------------------------------
+// FrameMessage and the recording file
+
+static std::vector<uint8_t> ReadFileBytes(const std::wstring& path)
 {
+   std::vector<uint8_t> b;
+   FILE* f = nullptr;
+   if (!(f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO))) // the recorder holds it open for writing
+      return b;
+   uint8_t buf[65536];
+   size_t n;
+   while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+      b.insert(b.end(), buf, buf + n);
+   fclose(f);
+   return b;
+}
+
+static std::wstring TempPath(const wchar_t* const name)
+{
+   wchar_t dir[MAX_PATH];
+   GetTempPathW(MAX_PATH, dir);
+   return std::wstring(dir) + name;
+}
+
+static void TestFraming()
+{
+   // What FrameMessage produces is byte for byte what a TcpPeer puts on the wire
+   CHECK(WireStartup());
+   std::string err;
+   std::unique_ptr<TcpListener> listener;
+   uint16_t port = 0;
+   for (uint16_t p = g_portBase; p < g_portBase + 10 && !listener; ++p)
+      if ((listener = ListenTcp(p, err, "127.0.0.1")))
+         port = p;
+   CHECK(listener != nullptr);
+   if (!listener)
+      return;
+   sockaddr_in a = {};
+   a.sin_family = AF_INET;
+   a.sin_port = htons(port);
+   inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+   SOCKET raw = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   CHECK(connect(raw, (sockaddr*)&a, sizeof(a)) == 0);
+   std::unique_ptr<TcpPeer> peer;
+   const double t0 = Seconds();
+   while (!peer && Seconds() - t0 < 2.0)
+      peer = listener->Accept();
+   CHECK(peer != nullptr);
+   if (peer)
+   {
+      std::vector<uint8_t> compressible(5000), random(5000), shortOne(100, 9);
+      for (size_t i = 0; i < compressible.size(); ++i)
+         compressible[i] = (uint8_t)((i / 10) % 5);
+      for (auto& b : random)
+         b = Rnd();
+      const struct { uint8_t type; const std::vector<uint8_t>* p; } cases[] = { { MSG_BYE, nullptr }, { MSG_HELLO, &shortOne }, { MSG_KEYFRAME, &compressible },
+         { MSG_FRAME, &random } };
+      std::vector<uint8_t> expect;
+      for (const auto& c : cases)
+      {
+         const size_t at = expect.size();
+         CHECK(FrameMessage(expect, c.type, c.p ? c.p->data() : nullptr, c.p ? c.p->size() : 0));
+         CHECK(peer->Send(c.type, c.p ? c.p->data() : nullptr, c.p ? c.p->size() : 0));
+         if (c.p == &compressible)
+            CHECK(expect[at + 5] == 1 && expect.size() - at < c.p->size() / 4); // deflated
+         if (c.p == &random || c.p == &shortOne)
+            CHECK(expect[at + 5] == 0);
+      }
+      std::vector<uint8_t> got;
+      const double t1 = Seconds();
+      while (got.size() < expect.size() && Seconds() - t1 < 3.0)
+      {
+         std::vector<Message> sink;
+         peer->Poll(sink);
+         char buf[8192];
+         u_long avail = 0;
+         ioctlsocket(raw, FIONREAD, &avail);
+         if (avail)
+         {
+            const int n = recv(raw, buf, sizeof(buf), 0);
+            if (n > 0)
+               got.insert(got.end(), buf, buf + n);
+         }
+      }
+      CHECK(got == expect);
+      CHECK(peer->BytesSent() == expect.size());
+      printf("framing: %zu bytes from FrameMessage, %zu from the socket, identical %d\n", expect.size(), got.size(), (int)(got == expect));
+   }
+   closesocket(raw);
+   peer.reset();
+   listener.reset();
+   WireShutdown();
+
+   // A payload that cannot be framed leaves the output untouched
+   std::vector<uint8_t> out(3, 1);
+   static const uint8_t one = 0;
+   CHECK(!FrameMessage(out, MSG_FRAME, &one, 64u * 1024u * 1024u));
+   CHECK(out.size() == 3);
+}
+
+static void TestRecorder()
+{
+   const std::wstring path = TempPath(L"castcade-wire-test.castrec");
+   DeleteFileW(path.c_str());
+   RecordingInfo info;
+   info.protocol = 1;
+   info.partCount = 553;
+   info.hash = 0x0123456789ABCDEFull;
+   info.table = "Attack from Mars LE (Midway 1995) v600.vpx";
+   info.build = "10.8.0.0 test";
+
+   // The messages and when they were written
+   std::vector<uint8_t> big(20000);
+   for (size_t i = 0; i < big.size(); ++i)
+      big[i] = (uint8_t)((i * 7 / 13) & 0x1F);
+   std::vector<std::pair<uint8_t, std::vector<uint8_t>>> sent;
+   sent.emplace_back(MSG_HELLO, std::vector<uint8_t>(40, 3));
+   sent.emplace_back(MSG_KEYFRAME, big);
+   for (int i = 0; i < 30; ++i)
+   {
+      std::vector<uint8_t> f(200 + i * 37);
+      for (auto& b : f)
+         b = (uint8_t)(Rnd() & 0x0F);
+      sent.emplace_back(MSG_FRAME, f);
+   }
+   sent.emplace_back(MSG_BYE, std::vector<uint8_t>());
+
+   FILETIME before;
+   GetSystemTimeAsFileTime(&before);
+   std::string err;
+   std::unique_ptr<StreamRecorder> rec = CreateRecorder(path, info, err);
+   CHECK(rec != nullptr);
+   if (!rec)
+      return;
+   const uint64_t w0 = NowUsec();
+   uint64_t wroteAt[64] = {};
+   for (size_t i = 0; i < sent.size(); ++i)
+   {
+      wroteAt[i] = NowUsec() - w0;
+      CHECK(rec->Write(sent[i].first, sent[i].second.data(), sent[i].second.size()));
+      if (i == 10)
+      {
+         // past the writer thread's one second flush: the file holds the header and the first chunks by now
+         std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+         const std::vector<uint8_t> partial = ReadFileBytes(path);
+         CHECK(partial.size() > RECORDING_HEADER_FIXED && memcmp(partial.data(), "CCSTREC\x1A", 8) == 0);
+         printf("recorder: %zu bytes on disk after the first flush\n", partial.size());
+      }
+      else
+         std::this_thread::sleep_for(std::chrono::milliseconds(3));
+   }
+   CHECK(rec->Chunks() == sent.size());
+   const uint64_t queued = rec->FileBytes();
+   rec->Close();
+   rec->Close(); // twice is harmless
+   CHECK(rec->Error().empty());
+   CHECK(!rec->Write(MSG_FRAME, nullptr, 0)); // closed
+
+   const std::vector<uint8_t> f = ReadFileBytes(path);
+   CHECK(f.size() == queued);
+   ByteReader r(f.data(), f.size());
+   char magic[8];
+   r.raw(magic, 8);
+   CHECK(memcmp(magic, "CCSTREC\x1A", 8) == 0);
+   CHECK(r.u16() == RECORDING_FORMAT);
+   const uint16_t headerSize = r.u16();
+   CHECK(r.u16() == 1);
+   CHECK(r.u16() == 0);
+   const uint64_t start = r.u64();
+   const uint64_t beforeFt = ((uint64_t)before.dwHighDateTime << 32) | before.dwLowDateTime;
+   CHECK(start >= beforeFt && start - beforeFt < 50000000ull); // within 5 s
+   const uint64_t duration = r.u64();
+   CHECK(r.u32() == sent.size());
+   CHECK(r.u32() == 553);
+   CHECK(r.u64() == 0x0123456789ABCDEFull);
+   auto str16 = [&r]
+   {
+      const uint16_t n = r.u16();
+      std::string s(n, '\0');
+      r.raw(s.data(), n);
+      return s;
+   };
+   CHECK(str16() == info.table);
+   CHECK(str16() == info.build);
+   CHECK(r.ok() && f.size() - r.remaining() == headerSize);
+
+   size_t k = 0;
+   uint64_t lastT = 0;
+   bool chunksOk = true;
+   while (r.remaining() > 0 && r.ok())
+   {
+      const uint64_t t = r.u64();
+      const uint32_t n = r.u32();
+      const uint8_t* const body = r.span(n);
+      if (!r.ok() || k >= sent.size())
+      {
+         chunksOk = false;
+         break;
+      }
+      std::vector<uint8_t> expect;
+      FrameMessage(expect, sent[k].first, sent[k].second.data(), sent[k].second.size());
+      uint32_t len;
+      memcpy(&len, body, 4);
+      chunksOk = chunksOk && n == expect.size() && memcmp(body, expect.data(), n) == 0 && len == n - 4 && body[4] == sent[k].first;
+      chunksOk = chunksOk && (k == 0 ? t == 0 : t >= lastT) && t <= wroteAt[k] + 2000 && t + 2000 >= wroteAt[k] - wroteAt[0];
+      lastT = t;
+      ++k;
+   }
+   CHECK(chunksOk);
+   CHECK(k == sent.size());
+   CHECK(duration == lastT);
+   printf("recorder: %zu bytes, header %u bytes, %zu chunks, duration %.3f s\n", f.size(), headerSize, k, duration / 1e6);
+   DeleteFileW(path.c_str());
+
+   // A recorder that never got a message leaves no file behind
+   {
+      auto empty = CreateRecorder(path, info, err);
+      CHECK(empty != nullptr);
+      CHECK(GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
+      empty.reset();
+      CHECK(GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES);
+   }
+
+   // A folder that does not exist: refused with a reason
+   {
+      std::string why;
+      auto bad = CreateRecorder(TempPath(L"no-such-folder-castcade\\x.castrec"), info, why);
+      CHECK(bad == nullptr && !why.empty());
+      printf("recorder in a missing folder: %s\n", why.c_str());
+   }
+
+   // A recorder destroyed without Close completes its file (the header says duration and count)
+   {
+      auto r2 = CreateRecorder(path, info, err);
+      CHECK(r2 && r2->Write(MSG_HELLO, nullptr, 0) && r2->Write(MSG_BYE, nullptr, 0));
+      r2.reset();
+      const std::vector<uint8_t> g = ReadFileBytes(path);
+      uint32_t count = 0;
+      if (g.size() >= 36)
+         memcpy(&count, g.data() + 32, 4);
+      CHECK(count == 2);
+      DeleteFileW(path.c_str());
+   }
+
+   // Cost of Write on the caller's thread: typical frame payloads, a few hundred bytes, some deflated
+   {
+      auto r3 = CreateRecorder(path, info, err);
+      std::vector<uint8_t> frame(400), frame2(1500);
+      for (size_t i = 0; i < frame2.size(); ++i)
+         frame2[i] = (uint8_t)((i / 3) & 7);
+      const int N = 20000;
+      uint64_t worst = 0;
+      const uint64_t a = NowUsec();
+      for (int i = 0; i < N; ++i)
+      {
+         const uint64_t b = NowUsec();
+         r3->Write(MSG_FRAME, (i & 1) ? frame.data() : frame2.data(), (i & 1) ? frame.size() : frame2.size());
+         worst = (std::max)(worst, NowUsec() - b);
+      }
+      const uint64_t spent = NowUsec() - a;
+      r3->Close();
+      CHECK(r3->Error().empty() && r3->Chunks() == (uint64_t)N);
+      printf("TIMING: recorder Write of a 400 B / 1.5 KB frame x%d = %.2f us each on average, worst %llu us\n", N, (double)spent / N, (unsigned long long)worst);
+      DeleteFileW(path.c_str());
+   }
+}
+
+int main(int argc, char** argv)
+{
+   if (argc > 1)
+   {
+      const int base = atoi(argv[1]);
+      if (base < 1024 || base > 65000)
+      {
+         printf("usage: wire_test [first loopback port, default 47911]\n");
+         return 2;
+      }
+      g_portBase = (uint16_t)base;
+   }
+   printf("loopback ports %u..%u\n", g_portBase, g_portBase + 9);
    TestBuffers();
    TestVariantScalars();
    TestArrays();
    TestMalformed();
    TestTransport();
    TestTiming();
+   TestFraming();
+   TestRecorder();
    printf("SUMMARY: %d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;
 }
