@@ -254,8 +254,10 @@ public:
    virtual uint16_t Port() const = 0;
 };
 
-// Listens on every IPv4 interface. Returns nullptr and sets err on failure (port in use, ...).
-std::unique_ptr<TcpListener> ListenTcp(uint16_t port, std::string& err);
+// Listens on every IPv4 interface, or only on bindAddress (an IPv4 literal such as "127.0.0.1": a listener
+// that is only reachable from this PC does not raise the Windows Firewall prompt, which tests rely on).
+// Returns nullptr and sets err on failure (port in use, ...).
+std::unique_ptr<TcpListener> ListenTcp(uint16_t port, std::string& err, const char* bindAddress = nullptr);
 
 // Starts a connection to host:port (an IPv4 literal or a name; the name lookup itself may block for a
 // moment). The returned peer is Alive() and not yet Connected(); Poll() completes or fails it. Returns

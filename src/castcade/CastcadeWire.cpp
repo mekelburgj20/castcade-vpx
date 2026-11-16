@@ -972,8 +972,18 @@ uint64_t NowUsec()
    return secs * 1000000ull + rem * 1000000ull / (uint64_t)freq;
 }
 
-std::unique_ptr<TcpListener> ListenTcp(const uint16_t port, std::string& err)
+std::unique_ptr<TcpListener> ListenTcp(const uint16_t port, std::string& err, const char* const bindAddress)
 {
+   sockaddr_in a = {};
+   a.sin_family = AF_INET;
+   a.sin_addr.s_addr = htonl(INADDR_ANY);
+   a.sin_port = htons(port);
+   if (bindAddress && bindAddress[0] && inet_pton(AF_INET, bindAddress, &a.sin_addr) != 1)
+   {
+      err = std::string("not an IPv4 address to listen on: ") + bindAddress;
+      return nullptr;
+   }
+
    const SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
    if (s == INVALID_SOCKET)
    {
@@ -983,10 +993,6 @@ std::unique_ptr<TcpListener> ListenTcp(const uint16_t port, std::string& err)
    BOOL on = TRUE;
    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&on, sizeof(on));
 
-   sockaddr_in a = {};
-   a.sin_family = AF_INET;
-   a.sin_addr.s_addr = htonl(INADDR_ANY);
-   a.sin_port = htons(port);
    if (bind(s, (const sockaddr*)&a, sizeof(a)) != 0)
    {
       err = WsaError("bind", WSAGetLastError());

@@ -709,7 +709,7 @@ static bool MakePair(Pair& p, uint16_t& portOut)
    std::string err;
    for (uint16_t port = 47911; port < 47921; ++port)
    {
-      p.listener = ListenTcp(port, err);
+      p.listener = ListenTcp(port, err, "127.0.0.1"); // loopback only: no Windows Firewall prompt
       if (p.listener)
       {
          portOut = port;
@@ -761,10 +761,18 @@ static void TestTransport()
    // second listener on the same port fails cleanly
    {
       std::string err;
-      auto second = ListenTcp(port, err);
+      auto second = ListenTcp(port, err, "127.0.0.1");
       CHECK(!second);
       CHECK(!err.empty());
       printf("second listen: %s\n", err.c_str());
+   }
+
+   // an address that is not an IPv4 literal is refused before any socket exists
+   {
+      std::string err;
+      auto bad = ListenTcp(47930, err, "not-an-address");
+      CHECK(!bad);
+      CHECK(!err.empty());
    }
 
    // 10,000 small messages each way
