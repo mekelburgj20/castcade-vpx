@@ -7,6 +7,8 @@
 #include "pininput.h"
 #include "LiveUI.h"
 
+namespace castcade { class Session; } // Castcade state stream (src/castcade/CastcadeStream.h)
+
 #define DEFAULT_PLAYER_WIDTH 1024
 #define DEFAULT_PLAYER_FS_WIDTH 1920
 #define DEFAULT_PLAYER_FS_REFRESHRATE 60
@@ -360,6 +362,9 @@ struct TimerOnOff
 
 class Player : public CWnd
 {
+   friend class castcade::Session; // marks the static pre-render dirty after a watcher's keyframe
+   friend struct castcade::StateAccess; // reads the nudge inputs, sets the screen offset on a watcher
+
 public:
    Player(PinTable *const editor_table, PinTable *const live_table, const int playMode);
    virtual ~Player();
@@ -679,6 +684,8 @@ public:
    LiveUI *m_liveUI = nullptr;
 
 #pragma endregion
+
+   castcade::Session *m_castcade = nullptr; // Castcade state stream session, null unless CASTCADE_STREAM asks for one
 
 
    PinTable * const m_pEditorTable; // The untouched version of the table, as it is in the editor (The Player needs it to interact with the UI)

@@ -26,6 +26,7 @@
 #include "winsdk/legacy_touch.h"
 #endif
 #include "tinyxml2/tinyxml2.h"
+#include "castcade/CastcadeStream.h"
 
 #if __cplusplus >= 202002L && !defined(__clang__)
 #define stable_sort std::ranges::stable_sort
@@ -319,6 +320,10 @@ Player::~Player()
 {
    assert(g_pplayer == nullptr);
    m_closing = CS_CLOSED;
+   // Castcade: normally ended in OnClose; this covers a player deleted after a failed start
+   castcade::Session *const castcadeSession = m_castcade;
+   m_castcade = nullptr;
+   delete castcadeSession;
    m_ptable->StopPlaying();
    delete m_staticPrepassRT;
    delete m_ballImage;
@@ -703,6 +708,12 @@ void Player::OnClose()
    m_closing = CS_CLOSED;
    PLOGI << "Closing player... [Player's VBS interpreter is #" << m_ptable->m_pcv->m_pScript << "]";
 
+   // Castcade: end the session (stop recording, say goodbye, remove a watcher's balls) while the script engine and
+   // the balls still exist. Cleared first: the session's own ball removal comes back through DestroyBall.
+   castcade::Session *const castcadeSession = m_castcade;
+   m_castcade = nullptr;
+   delete castcadeSession;
+
     g_frameProfiler.LogWorstFrame();
 
     // In Windows 10 1803, there may be a significant lag waiting for WM_DESTROY (msg sent by the delete call below) if script is not closed first.
@@ -972,6 +983,11 @@ void Player::RecomputePauseState()
    }
 
    m_pause = newPause;
+
+   // Castcade watch role: a watcher's window is rarely focused (in VR, almost never); it keeps time and animation running
+   // (also a player under test, CASTCADE_TEST_NOPAUSE)
+   if (m_castcade && m_castcade->NeverPauses())
+      m_pause = false;
 }
 
 void Player::RecomputePseudoPauseState()
@@ -1688,6 +1704,12 @@ HRESULT Player::Init()
    m_pEditorTable->m_progressDialog.SetName("Starting Game Scripts..."s);
    PLOGI << "Starting script"; // For profiling
 
+   // Castcade state stream: created before the script starts, so that the script's global code is recorded (play
+   // role). A watcher never starts the script (the engine stays compiled but SCRIPTSTATE_INITIALIZED: no code runs,
+   // no event is sunk): it replays the player's calls instead.
+   m_castcade = castcade::Session::Create(this);
+   if (!m_castcade || !m_castcade->IsWatcher())
+   {
    m_ptable->m_pcv->Start(); // Hook up to events and start cranking script
 
    // Fire Init event for table object and all 'hitable' parts, also fire Animate event of parts having it since initial setup is considered as the initial animation event
@@ -1703,7 +1725,8 @@ HRESULT Player::Init()
             ph->GetEventProxyBase()->FireVoidEvent(DISPID_AnimateEvents_Animate);
       }
    }
-   m_ptable->FireKeyEvent(DISPID_GameEvents_OptionEvent, 0 /* custom option init event */); 
+   m_ptable->FireKeyEvent(DISPID_GameEvents_OptionEvent, 0 /* custom option init event */);
+   } // Castcade watch role
 
    // Pre-render all non-changing elements such as static walls, rails, backdrops, etc. and also static playfield reflections
    // This is done after starting the script and firing the Init event to allow script to adjust static parts on startup
@@ -2050,12 +2073,20 @@ Ball *Player::CreateBall(const float x, const float y, const float z, const floa
    if (!m_pactiveballDebug)
       m_pactiveballDebug = pball;
 
+   // Castcade play role: the session gives the ball its network id
+   if (m_castcade)
+      m_castcade->OnBallCreated(pball);
+
    return pball;
 }
 
 void Player::DestroyBall(Ball *pball)
 {
    if (!pball) return;
+
+   // Castcade play role: the ball leaves the stream
+   if (m_castcade)
+      m_castcade->OnBallDestroyed(pball);
 
    const bool activeball = (m_pactiveball == pball);
    if (activeball)
@@ -2978,6 +3009,11 @@ void Player::UpdatePhysics()
       m_pininput.ProcessKeys(/*sim_msec,*/ cur_time_msec);
 
       mixer_update();
+
+      // Castcade watch role: no script timers, input devices, nudge or physics (the stream supplies what they would
+      // produce). Time still advances, so light fades and other animations run, and balls keep their trail.
+      if (!m_castcade || !m_castcade->IsWatcher())
+      {
       ushock_update(/*sim_msec*/cur_time_msec);
       plumb_update(/*sim_msec*/cur_time_msec, GetNudgeX(), GetNudgeY());
 
@@ -3128,6 +3164,7 @@ void Player::UpdatePhysics()
 
       //primary physics loop
       PhysicsSimulateCycle(physics_diff_time); // main simulator call
+      } // Castcade watch role
 
       //ball trail, keep old pos of balls
       for (size_t i = 0; i < m_vball.size(); i++)
@@ -4192,6 +4229,10 @@ void Player::PrepareFrame()
          }
    }
 
+   // Castcade watch role: show the streamed state and replay the player's script calls for this frame
+   if (m_castcade && m_castcade->IsWatcher())
+      m_castcade->OnFrame();
+
    // Fire all '-1' (the ones which are synced to the refresh rate) and '-2' (the ones used to sync with the controller) timers after physics and animation update but before rendering, to avoid the script being one frame late
    for (HitTimer *const pht : m_vht)
       if (pht->m_interval < 0)
@@ -4200,6 +4241,10 @@ void Player::PrepareFrame()
          pht->m_pfe->FireGroupEvent(DISPID_TimerEvents_Timer);
          g_frameProfiler.ExitScriptSection(pht->m_name);
       }
+
+   // Castcade play role: the frame's script work is complete, send its state and script calls
+   if (m_castcade && !m_castcade->IsWatcher())
+      m_castcade->OnFrame();
 
    // Kill the profiler so that it does not affect performance => FIXME move to player
    if (m_infoMode != IF_PROFILING)
