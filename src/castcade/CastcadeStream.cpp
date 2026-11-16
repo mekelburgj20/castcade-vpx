@@ -2010,9 +2010,10 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          // of before the stall under a stamp of after it, and the stall's motion is crammed into the next frame
          // interval. Such a frame is moved back to where its physics time puts it. Frames of a current player, and
          // every frame without a stall, are stamped within a few ms of their physics time and are never moved.
+         // Part of smoothing: CASTCADE_STREAM_SMOOTH=0 shows an older stream exactly as the watcher always did.
          f->arrived = now;
          const uint32_t phys = SnapshotPhysicsMsec(*f->state);
-         if (m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
+         if (m_smooth && m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
          {
             const uint64_t byPhysics = m_lastRxTime + (uint64_t)(phys - m_lastRxPhys) * 1000;
             if (f->time > byPhysics + 40000)
