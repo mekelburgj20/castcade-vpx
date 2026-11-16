@@ -57,8 +57,9 @@ function Copy-Launchers([string]$to) {
 Copy-Item $exe (Join-Path $dropin 'VPinballX_GL64_castcade.exe')
 Copy-Launchers $dropin
 
-# The build output is a complete runnable folder (what CI uploads): DLLs, assets, shaders, scripts
-Copy-Item (Join-Path $release '*') $full -Recurse -Exclude 'VPinballX_GL64.exe', '*.pdb', '*.ilk', '*.exp', '*.lib', 'vpinball.log'
+# The build output is a complete runnable folder (what CI uploads): DLLs, assets, shaders, scripts.
+# Left out: build by-products, and what test runs from this folder leave behind (logs, the user folder).
+Copy-Item (Join-Path $release '*') $full -Recurse -Exclude 'VPinballX_GL64.exe', '*.pdb', '*.ilk', '*.exp', '*.lib', '*.log', 'user'
 Copy-Item $exe (Join-Path $full 'VPinballX_GL64_castcade.exe')
 Copy-Launchers $full
 
