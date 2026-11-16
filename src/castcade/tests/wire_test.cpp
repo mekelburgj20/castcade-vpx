@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include "../CastcadeUnwind.h"
 #include "../CastcadeWire.h"
 
 #include <algorithm>
@@ -1340,6 +1341,114 @@ static void TestRecorder()
    }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// The frame probe's guarded reads and stack unwinding (CastcadeUnwind)
+
+// A frame far bigger than any copy the probe makes: its unwind codes move Rsp by 512 KB. Never called.
+__declspec(noinline) static int BigFrame(const int x)
+{
+   volatile char buf[512 * 1024];
+   buf[x] = (char)x;
+   return buf[x / 2];
+}
+
+__declspec(noinline) static int CaptureAndUnwind(const int depth, int* const frames, bool* const faulted, uint64_t* const pcs)
+{
+   if (depth > 0)
+      return CaptureAndUnwind(depth - 1, frames, faulted, pcs) + 1; // not a tail call: each level keeps its frame
+   CONTEXT ctx;
+   RtlCaptureContext(&ctx);
+   const uint64_t high = (uint64_t)((NT_TIB*)NtCurrentTeb())->StackBase;
+   const size_t n = (size_t)(std::min<uint64_t>)(high - ctx.Rsp, 256 * 1024);
+   std::vector<uint8_t> copy(n + 65536, 0);
+   CHECK(CopyForeignMemory(copy.data(), (const void*)ctx.Rsp, n));
+   *frames = UnwindStackCopy(ctx, copy.data(), n, pcs, 48, faulted);
+   return 0;
+}
+
+static void TestUnwind()
+{
+#if defined(_M_X64)
+   // Guarded reads of memory that is not there
+   char tiny[16];
+   CHECK(!CopyForeignMemory(tiny, (const void*)0x10, sizeof(tiny)));
+   CHECK(!CopyForeignString(tiny, (const char*)0x10, sizeof(tiny)));
+   CHECK(CopyForeignString(tiny, "abc", sizeof(tiny)) && strcmp(tiny, "abc") == 0);
+
+   // A real stack: the walk finds the recursion
+   uint64_t pcs[48] = {};
+   int frames = 0;
+   bool faulted = true;
+   CaptureAndUnwind(5, &frames, &faulted, pcs);
+   DWORD64 base = 0;
+   const PRUNTIME_FUNCTION self = RtlLookupFunctionEntry((DWORD64)&CaptureAndUnwind, &base, nullptr);
+   int inSelf = 0;
+   for (int i = 0; i < frames; ++i)
+   {
+      DWORD64 b = 0;
+      const PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(pcs[i], &b, nullptr);
+      if (self && fe && b == base && fe->BeginAddress == self->BeginAddress)
+         ++inSelf;
+   }
+   CHECK(!faulted && frames >= 8 && inSelf >= 6);
+   printf("unwind: a real stack gave %d frames, %d of them in the recursion\n", frames, inSelf);
+
+   // A frame bigger than the copy: the unwinder reads past it into reserved, uncommitted memory and faults; the walk
+   // ends with what it had
+   uint8_t* const region = (uint8_t*)VirtualAlloc(nullptr, 1 << 20, MEM_RESERVE, PAGE_NOACCESS);
+   CHECK(region && VirtualAlloc(region, 4096, MEM_COMMIT, PAGE_READWRITE));
+   const PRUNTIME_FUNCTION big = RtlLookupFunctionEntry((DWORD64)&BigFrame, &base, nullptr);
+   CHECK(big != nullptr);
+   if (region && big)
+   {
+      memset(region, 0, 4096);
+      CONTEXT c = {};
+      c.Rip = base + big->BeginAddress + (big->EndAddress - big->BeginAddress) / 2;
+      c.Rsp = 0x70000000ull; // where the "real" stack was: the copy stands in for it
+      c.Rbp = c.Rsp + 64;
+      faulted = false;
+      frames = UnwindStackCopy(c, region, 4096, pcs, 48, &faulted);
+      CHECK(faulted && frames >= 1 && pcs[0] == c.Rip);
+      printf("unwind: a 512 KB frame against a 4 KB copy: %d frame(s), fault caught: %d\n", frames, (int)faulted);
+   }
+
+   // Contexts of garbage, against a copy of garbage: Rip anywhere in this module (wrong unwind codes) or anywhere at all
+   uint64_t seed = 0x9E3779B97F4A7C15ull, faults = 0;
+   const auto next = [&seed]()
+   {
+      seed ^= seed << 13;
+      seed ^= seed >> 7;
+      seed ^= seed << 17;
+      return seed;
+   };
+   MEMORY_BASIC_INFORMATION mbi = {};
+   VirtualQuery((const void*)&TestUnwind, &mbi, sizeof(mbi));
+   const uint64_t modLo = (uint64_t)mbi.AllocationBase;
+   std::vector<uint8_t> junk(65536 + 65536);
+   for (int i = 0; i < 4000; ++i)
+   {
+      for (size_t k = 0; k < 65536; k += 8)
+      {
+         const uint64_t v = next();
+         memcpy(junk.data() + k, &v, 8);
+      }
+      CONTEXT c = {};
+      c.Rip = (i & 1) ? modLo + next() % (2u << 20) : next();
+      c.Rsp = 0x70000000ull + (next() & 0xFFF0);
+      c.Rbp = (i & 2) ? c.Rsp + (next() & 0xFFFF) : next();
+      c.Rbx = next();
+      c.Rsi = c.Rsp + (next() & 0xFFFF);
+      faulted = false;
+      frames = UnwindStackCopy(c, junk.data(), 65536, pcs, 48, &faulted);
+      CHECK(frames >= 1 && frames <= 48);
+      faults += faulted ? 1 : 0;
+   }
+   printf("unwind: 4000 garbage contexts walked without leaving the call; %llu of them ended by a caught fault\n", (unsigned long long)faults);
+   if (region)
+      VirtualFree(region, 0, MEM_RELEASE);
+#endif
+}
+
 static std::vector<std::string> g_ioSeen;
 static void IoSeen(const char* const what, const uint64_t start, const uint64_t end, const size_t bytes)
 {
@@ -1441,6 +1550,7 @@ int main(int argc, char** argv)
    TestFraming();
    TestRecorder();
    TestAsyncLineWriter();
+   TestUnwind();
    printf("SUMMARY: %d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;
 }

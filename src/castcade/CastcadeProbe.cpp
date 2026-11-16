@@ -2,6 +2,7 @@
 
 #include "stdafx.h"
 #include "CastcadeProbe.h"
+#include "CastcadeUnwind.h"
 #include "CastcadeWire.h"
 #include "vpversion.h"
 
@@ -195,7 +196,8 @@ private:
       CloseHandle(snap);
    }
 
-   // The module is pinned (its reference count raised) while its export table is read, so it cannot be unloaded
+   // The module is pinned (its reference count raised) while its export table is read, so it cannot be unloaded, and
+   // every read of it is a guarded copy (CopyForeignMemory): a damaged or unusual image costs its names, nothing else
    static void ReadExports(Module& m)
    {
       m.exportsRead = true;
@@ -206,26 +208,36 @@ private:
             FreeLibrary(pin);
          return;
       }
-      const uint64_t base = m.base;
-      const IMAGE_DOS_HEADER* const dos = (const IMAGE_DOS_HEADER*)base;
-      const IMAGE_NT_HEADERS* const nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-      if (dos->e_magic == IMAGE_DOS_SIGNATURE && nt->Signature == IMAGE_NT_SIGNATURE)
+      const uint64_t base = m.base, size = m.end - m.base;
+      const auto in = [size](const uint64_t rva, const uint64_t bytes) { return rva < size && bytes <= size - rva; };
+      IMAGE_DOS_HEADER dos;
+      IMAGE_NT_HEADERS nt;
+      IMAGE_EXPORT_DIRECTORY ed;
+      if (CopyForeignMemory(&dos, (const void*)base, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE && in((uint64_t)dos.e_lfanew, sizeof(nt))
+         && CopyForeignMemory(&nt, (const void*)(base + dos.e_lfanew), sizeof(nt)) && nt.Signature == IMAGE_NT_SIGNATURE)
       {
-         const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-         if (dir.VirtualAddress != 0 && dir.Size != 0)
+         const IMAGE_DATA_DIRECTORY dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+         if (dir.VirtualAddress != 0 && dir.Size != 0 && in(dir.VirtualAddress, sizeof(ed)) && CopyForeignMemory(&ed, (const void*)(base + dir.VirtualAddress), sizeof(ed)))
          {
-            const IMAGE_EXPORT_DIRECTORY* const ed = (const IMAGE_EXPORT_DIRECTORY*)(base + dir.VirtualAddress);
-            const DWORD* const funcs = (const DWORD*)(base + ed->AddressOfFunctions);
-            const DWORD* const names = (const DWORD*)(base + ed->AddressOfNames);
-            const WORD* const ords = (const WORD*)(base + ed->AddressOfNameOrdinals);
-            for (DWORD i = 0; i < ed->NumberOfNames && i < 20000; ++i)
+            const DWORD count = (std::min)(ed.NumberOfNames, (DWORD)20000);
+            std::vector<DWORD> funcs(ed.NumberOfFunctions), names(count);
+            std::vector<WORD> ords(count);
+            if (ed.NumberOfFunctions <= 65536 && in(ed.AddressOfFunctions, funcs.size() * 4) && in(ed.AddressOfNames, names.size() * 4) && in(ed.AddressOfNameOrdinals, ords.size() * 2)
+               && CopyForeignMemory(funcs.data(), (const void*)(base + ed.AddressOfFunctions), funcs.size() * 4)
+               && CopyForeignMemory(names.data(), (const void*)(base + ed.AddressOfNames), names.size() * 4)
+               && CopyForeignMemory(ords.data(), (const void*)(base + ed.AddressOfNameOrdinals), ords.size() * 2))
             {
-               if (ords[i] >= ed->NumberOfFunctions)
-                  continue;
-               const DWORD rva = funcs[ords[i]];
-               if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size)
-                  continue; // forwarded
-               m.exports.emplace_back(rva, std::string((const char*)(base + names[i])));
+               char name[256];
+               for (DWORD i = 0; i < count; ++i)
+               {
+                  if (ords[i] >= funcs.size())
+                     continue;
+                  const DWORD rva = funcs[ords[i]];
+                  if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size)
+                     continue; // forwarded
+                  if (in(names[i], 1) && CopyForeignString(name, (const char*)(base + names[i]), sizeof(name)))
+                     m.exports.emplace_back(rva, std::string(name));
+               }
             }
          }
       }
@@ -292,7 +304,7 @@ public:
          m_worker.join();
       SYSTEMTIME t;
       GetLocalTime(&t);
-      m_out->Line(Fmt("%s probe end: %s", Stamp(t).c_str(), Totals().c_str()));
+      m_out->Line(Fmt("%s probe end: %s; stack walks ended by a fault %llu", Stamp(t).c_str(), Totals().c_str(), (unsigned long long)m_unwindFaults));
       m_out.reset();
       if (m_thread)
          CloseHandle(m_thread);
@@ -430,14 +442,19 @@ private:
       if (rsp >= stackLow && rsp < m_stackHigh)
       {
          n = std::min<size_t>((size_t)(m_stackHigh - rsp), kStackCopy);
-         memcpy(m_stackBuf.data(), (const void*)rsp, n); // no allocation and no lock while the render thread is suspended
+         // No allocation and no lock while the render thread is suspended; a fault costs this sample only
+         if (!CopyForeignMemory(m_stackBuf.data(), (const void*)rsp, n))
+            n = 0;
       }
       ResumeThread(m_thread);
       memset(m_stackBuf.data() + n, 0, kStackSlack);
 
       Sample s;
       s.frame = frame;
-      s.depth = Unwind(ctx, rsp, n, s.pc);
+      bool faulted = false;
+      s.depth = UnwindStackCopy(ctx, m_stackBuf.data(), n, s.pc, kMaxDepth, &faulted); // a fault ends the walk, nothing more
+      if (faulted)
+         ++m_unwindFaults;
       if (s.depth > 0)
       {
          if (m_samples.size() >= kMaxSamples)
@@ -446,63 +463,6 @@ private:
       }
 #endif
    }
-
-#if defined(_M_X64)
-   // Unwinds the copy of the stack: every register value that points into the original stack is moved into the copy
-   int Unwind(CONTEXT ctx, const uint64_t rsp, const size_t n, uint64_t* const pc) const
-   {
-      const uint64_t lo = rsp, hi = rsp + n;
-      const uint64_t blo = (uint64_t)m_stackBuf.data(), bhi = blo + n;
-      const auto tr = [&](DWORD64& r)
-      {
-         if (r >= lo && r < hi)
-            r = r - lo + blo;
-      };
-      const auto trAll = [&]()
-      {
-         tr(ctx.Rsp);
-         tr(ctx.Rbp);
-         tr(ctx.Rbx);
-         tr(ctx.Rsi);
-         tr(ctx.Rdi);
-         tr(ctx.R12);
-         tr(ctx.R13);
-         tr(ctx.R14);
-         tr(ctx.R15);
-      };
-      if (n == 0)
-      {
-         pc[0] = ctx.Rip;
-         return 1;
-      }
-      trAll();
-      int depth = 0;
-      while (depth < kMaxDepth)
-      {
-         pc[depth++] = ctx.Rip;
-         if (ctx.Rsp < blo || ctx.Rsp + 8 > bhi)
-            break;
-         const DWORD64 prevRsp = ctx.Rsp;
-         DWORD64 imageBase = 0;
-         PRUNTIME_FUNCTION const fe = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
-         if (!fe)
-         {
-            ctx.Rip = *(const DWORD64*)ctx.Rsp; // a leaf function: the return address is on top
-            ctx.Rsp += 8;
-         }
-         else
-         {
-            PVOID handlerData = nullptr;
-            DWORD64 establisher = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fe, &ctx, &handlerData, &establisher, nullptr);
-         }
-         trAll();
-         if (ctx.Rip == 0 || ctx.Rsp <= prevRsp || ctx.Rsp > bhi)
-            break;
-      }
-      return depth;
-   }
-#endif
 
    // Runs of frames in one module are shown once, as the topmost frame of the run with the run's length
    std::string Stack(const Sample& s)
@@ -631,6 +591,7 @@ private:
    uint64_t m_stackHigh = 0;
    std::vector<uint8_t> m_stackBuf;
    std::deque<Sample> m_samples;
+   uint64_t m_unwindFaults = 0; // walks a fault ended (their samples keep the frames found before it)
    Symbolizer m_sym;
    uint64_t m_summaryAt = 0;
 };

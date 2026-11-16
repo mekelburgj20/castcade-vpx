@@ -9,6 +9,7 @@ set(MINIZ ${CMAKE_CURRENT_SOURCE_DIR}/../../../third-party/include/miniz/miniz.c
 set_source_files_properties(${MINIZ} PROPERTIES LANGUAGE CXX)
 
 add_executable(wire_test
+   ../CastcadeUnwind.cpp
    ../CastcadeWire.cpp
    wire_test.cpp
    ${MINIZ})
