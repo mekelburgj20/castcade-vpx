@@ -32,6 +32,9 @@ void ReelSoundNames(Player* player, std::vector<std::wstring>& out);
 // lower-cased; matching is case-insensitive like VPX's.
 bool StopSoundWouldStop(Player* player, const std::wstring& name);
 
+// Watch role: how many sound buffers play now (sounds' own buffers and copied ones)
+int CountPlayingSounds(Player* player);
+
 // Play role. The physics clock: the time, on VPX's usec() clock, that the physics state has been simulated up to
 // (Player::m_curPhysicsFrameTime). A frame is stamped with it, not with the moment it is sent: after a stall the two
 // differ by the stall.

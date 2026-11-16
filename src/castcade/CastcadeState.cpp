@@ -597,6 +597,25 @@ bool StopSoundWouldStop(Player* const player, const std::wstring& name)
    return g_pvp->m_ps.IsCopiedWavPlaying(sz);
 }
 
+int CountPlayingSounds(Player* const player)
+{
+   if (!player || !player->m_ptable || !g_pvp)
+      return 0;
+   int n = 0;
+   for (PinSound* const pps : player->m_ptable->m_vsound)
+   {
+      if (pps->IsWav())
+      {
+         DWORD status = 0;
+         if (pps->m_pDSBuffer && SUCCEEDED(pps->m_pDSBuffer->GetStatus(&status)) && (status & DSBSTATUS_PLAYING))
+            ++n;
+      }
+      else if (pps->m_BASSstream && BASS_ChannelIsActive(pps->m_BASSstream) != BASS_ACTIVE_STOPPED)
+         ++n;
+   }
+   return n + g_pvp->m_ps.CountPlayingCopies();
+}
+
 std::shared_ptr<const StateSnapshot> ParseState(ByteReader& r)
 {
    if (r.u8() != kFormatVersion)

@@ -214,6 +214,20 @@ public:
 		return false;
 	}
 
+	// Castcade stream: how many copied buffers play now (a watcher stops them all when its connection ends)
+	int CountPlayingCopies() const
+	{
+		int n = 0;
+		for (size_t i = 0; i < m_copiedwav.size(); i++)
+		{
+			DWORD status = 0;
+			m_copiedwav[i]->m_pDSBuffer->GetStatus(&status);
+			if (status & DSBSTATUS_PLAYING)
+				n++;
+		}
+		return n;
+	}
+
 	void StopCopiedWavs()
 	{
 		for (size_t i = 0; i < m_copiedwav.size(); i++)

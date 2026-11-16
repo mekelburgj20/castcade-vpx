@@ -65,6 +65,21 @@ public:
          else
             Warn("CASTCADE_TEST_STALL is not <ms>,<every s>[,<first s>]: " + stall);
       }
+      const std::string pause = GetEnvA("CASTCADE_TEST_PAUSE");
+      if (!pause.empty())
+      {
+         double at = 0., len = 0., every = 0.;
+         const int got = sscanf_s(pause.c_str(), "%lf,%lf,%lf", &at, &len, &every);
+         if (got >= 2 && at > 0. && len > 0. && (got < 3 || every > len))
+         {
+            m_pauseAtUsec = (uint64_t)(at * 1e6);
+            m_pauseLenUsec = (uint64_t)(len * 1e6);
+            m_pauseEveryUsec = got >= 3 ? (uint64_t)(every * 1e6) : 0;
+            Info(Fmt("test pauses: %.1f s long, the first %.1f s after the first frame%s", len, at, got >= 3 ? Fmt(", then every %.1f s", every).c_str() : ""));
+         }
+         else
+            Warn("CASTCADE_TEST_PAUSE is not <at s>,<for s>[,<every s>]: " + pause);
+      }
    }
 
    bool NeverPauses() const override { return m_noPause; }
@@ -74,6 +89,31 @@ public:
       const uint64_t now = NowUsec();
       if (m_start == 0)
          m_start = now;
+      // Test pause: what losing the focus and getting it back does (Player::WndProc, WM_ACTIVATE): paused, physics
+      // stopped, frames still drawn; on resume m_noTimeCorrect moves the physics clock forward over the pause
+      if (m_pauseLenUsec)
+      {
+         if (!m_paused && now - m_start >= m_pauseAtUsec)
+         {
+            m_paused = true;
+            m_pausedAt = now;
+            m_player->m_gameWindowActive = false;
+            m_player->m_pause = true;
+            Line("", Fmt("test pause: paused at %llu ms (CASTCADE_TEST_PAUSE)", (unsigned long long)((now - m_start) / 1000)));
+         }
+         else if (m_paused && now - m_pausedAt >= m_pauseLenUsec)
+         {
+            m_paused = false;
+            m_player->m_gameWindowActive = true;
+            m_player->m_noTimeCorrect = true;
+            m_player->m_pause = false;
+            Line("", Fmt("test pause: resumed at %llu ms", (unsigned long long)((now - m_start) / 1000)));
+            if (m_pauseEveryUsec)
+               m_pauseAtUsec += m_pauseEveryUsec;
+            else
+               m_pauseLenUsec = 0;
+         }
+      }
       if (m_stallMs > 0 && now >= m_nextStall)
       {
          // A stall of the render thread, where a script that waits on a file stalls it (after the physics, before
@@ -206,6 +246,8 @@ private:
    uint64_t m_start = 0;
    int m_stallMs = 0;
    uint64_t m_stallEveryUsec = 0, m_nextStall = 0;
+   uint64_t m_pauseAtUsec = 0, m_pauseLenUsec = 0, m_pauseEveryUsec = 0, m_pausedAt = 0;
+   bool m_paused = false;
 };
 
 } // namespace
@@ -215,7 +257,7 @@ TestHarness* TestHarness::Create(Player* const player)
    const bool noPause = GetEnvA("CASTCADE_TEST_NOPAUSE") == "1";
    const std::string input = GetEnvA("CASTCADE_TEST_INPUT");
    const std::string stall = GetEnvA("CASTCADE_TEST_STALL");
-   if (!noPause && input.empty() && stall.empty())
+   if (!noPause && input.empty() && stall.empty() && GetEnvA("CASTCADE_TEST_PAUSE").empty())
       return nullptr;
    return new Harness(player, noPause, input, stall);
 }

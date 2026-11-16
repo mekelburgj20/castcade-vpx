@@ -44,6 +44,8 @@ constexpr uint16_t PROTOCOL_VERSION = 1;
 constexpr uint8_t ROLE_PLAY = 1;
 constexpr uint8_t ROLE_WATCH = 2;
 constexpr uint16_t DEFAULT_PORT = 47800;
+// HELLO feature bits (the byte after the build string)
+constexpr uint8_t HELLO_PHYSICS_STAMPS = 1; // the player stamps each frame with its physics clock: never re-stamp its frames
 
 // Object ids on the wire. Editables are their index in the live table's m_vedit.
 constexpr uint32_t ID_TABLE = 0x7FFFFFF0u;
@@ -348,6 +350,10 @@ bool ParseAddr(const std::string& s, bool& listen, std::string& host, uint16_t& 
 // owner's recording, and up to 1.2 s in the scripted tests, whenever the disk or a virus scan held the file. With a
 // log file, the VPX log gets the warnings and errors only (the VPX log is written on the caller's thread by
 // whoever else logs, and its lock is shared); without one, it gets every line, from the writer's thread.
+// The mirror writes through VPX's file-only logger (PLOG_NO_DBG_OUT_INSTANCE_ID, as the script's own error log
+// does): the default logger's DebugAppender asks the main thread for the active table (SendMessage), and the main
+// thread waits for this writer at the session's end (Player::OnClose runs inside the WM_CLOSE handler), so a line
+// mirrored there at exit hung both threads. Nothing the writer thread calls waits on the main thread.
 class StreamLog final
 {
 public:
@@ -363,11 +369,11 @@ public:
             const size_t at = line.find("] ");
             const std::string text = at == std::string::npos ? line : line.substr(at + 2);
             if (text.rfind("ERROR ", 0) == 0)
-               PLOGE << prefix << text.substr(6);
+               PLOGE_(PLOG_NO_DBG_OUT_INSTANCE_ID) << prefix << text.substr(6);
             else if (text.rfind("WARNING ", 0) == 0)
-               PLOGW << prefix << text.substr(8);
+               PLOGW_(PLOG_NO_DBG_OUT_INSTANCE_ID) << prefix << text.substr(8);
             else if (all)
-               PLOGI << prefix << text;
+               PLOGI_(PLOG_NO_DBG_OUT_INSTANCE_ID) << prefix << text;
          };
       };
       if (!path.empty())
@@ -459,6 +465,11 @@ public:
 
    bool RepeatRule() const { return m_repeatRule; }
    size_t ReelSounds() const { return m_engine.size(); }
+
+   // A watcher completed its HELLO: what was sent before it joined proves nothing about what it heard, so rule (b)
+   // starts again (rule (a) stays right: the watcher starts from silence and only this session's PlaySounds start a
+   // sound there)
+   void ForgetSent() { m_lastStop.clear(); }
 
    void OnPlay(const std::wstring& key)
    {
@@ -575,6 +586,7 @@ struct Hello
    uint64_t hash = 0;
    std::string table;
    std::string build;
+   uint8_t features = 0; // HELLO_*; 0 from a build before the byte existed
 };
 
 class SessionImpl;
@@ -629,6 +641,7 @@ private:
    void Replay(RxFrame& f);
    IDispatch* Resolve(const uint32_t id, KindClass& cls) const;
    void Refuse(const std::string& why);
+   void StopAllSoundsHere(const char* const why); // watch: PinTable::StopAllSounds, counted before and after
    void AddOffsetSample(const int64_t sample);
 
    // Both
@@ -762,7 +775,10 @@ private:
    uint64_t m_catchupStart = 0; // NowUsec
    double m_catchupLag = 0., m_catchupLen = 0.;
    // The gap being measured: how long the picture held, and the largest ball step until the catch-up is over
-   uint64_t m_heldSince = 0, m_heldArrival = 0, m_epHeldSince = 0;
+   uint64_t m_heldSince = 0, m_epHeldSince = 0;
+   uint64_t m_lastAnyArrival = 0;     // when the last frame was received (any stamp)
+   uint64_t m_holdArrivalGapMax = 0;  // the longest time without a frame received while the picture held
+   bool m_stopWhenDrained = false;    // the connection ended: stop every sound again once its last frames are shown
    int64_t m_heldStamp = 0;
    bool m_epOpen = false;
    uint64_t m_epUntil = 0;
@@ -770,6 +786,10 @@ private:
    float m_epMaxStep = 0.f;
    uint64_t m_iGaps = 0, m_gapsTotal = 0;
    float m_iMaxStep = 0.f;
+   std::vector<double> m_testDrops;   // CASTCADE_TEST_DROP: seconds after the session began to cut the connection at
+   bool m_physicsStamps = false;      // the player's HELLO says its frames carry its physics clock (HELLO_PHYSICS_STAMPS)
+   bool m_lastRxCorrected = false;    // the last frame received was moved back to its physics time
+   uint64_t m_iRebased = 0;           // older stream: frames taken as sent after a moved one (a re-based clock)
    bool m_haveLastRx = false;         // the last frame received: its (possibly corrected) stamp and its physics time
    uint64_t m_lastRxTime = 0;
    uint32_t m_lastRxPhys = 0;
@@ -831,6 +851,16 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
       m_replaySound = sound.empty() || atoi(sound.c_str()) != 0;
       m_stopAudit = GetEnv("CASTCADE_STREAM_STOPAUDIT") == "1";
       m_smooth = GetEnv("CASTCADE_STREAM_SMOOTH") != "0";
+      const std::string drops = GetEnv("CASTCADE_TEST_DROP");
+      for (size_t at = 0; at < drops.size();)
+      {
+         const size_t comma = drops.find(',', at);
+         const double s = atof(drops.substr(at, comma == std::string::npos ? std::string::npos : comma - at).c_str());
+         if (s > 0.)
+            m_testDrops.push_back(s);
+         at = comma == std::string::npos ? drops.size() : comma + 1;
+      }
+      std::sort(m_testDrops.begin(), m_testDrops.end());
    }
    else
       m_catchupFrames = GetEnv("CASTCADE_STREAM_CATCHUP") != "0";
@@ -887,6 +917,11 @@ SessionImpl::~SessionImpl()
 {
    g_recordCalls = false;
    g_session = nullptr;
+   // Test: CASTCADE_TEST_EXITWARN=<n> writes n warnings right before the session ends, so that the log's writer
+   // thread is still mirroring them into the VPX log while this thread waits for it (the exit hang of 050a169)
+   const int exitWarn = std::clamp(atoi(GetEnv("CASTCADE_TEST_EXITWARN").c_str()), 0, 100000);
+   for (int i = 0; i < exitWarn; ++i)
+      m_log.Warn(Fmt("test warning %d of %d, written just before the session ends (CASTCADE_TEST_EXITWARN)", i + 1, exitWarn));
    if (!m_watch)
       LogSentByName("whole session");
    m_log.Info(Fmt("StopSound filter, whole session: %llu %s%s", (unsigned long long)m_stopDroppedTotal, m_watch ? "stops skipped" : "stops not sent",
@@ -898,8 +933,8 @@ SessionImpl::~SessionImpl()
       if (m_epOpen)
          LogGap();
       m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; %llu frames of an older player stamped late were put back at their "
-                     "physics time; ball steps per frame outside the gaps: %s",
-         (unsigned long long)m_gapsTotal, (unsigned long long)m_iRestamped, StepSummary().c_str()));
+                     "physics time (%llu taken as sent after one: a re-based clock); ball steps per frame outside the gaps: %s",
+         (unsigned long long)m_gapsTotal, (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, StepSummary().c_str()));
    }
    else
       m_log.Info(Fmt("whole session: %llu catch-ups after a stall sent %llu frames of their own", (unsigned long long)m_catchupsTotal, (unsigned long long)m_catchupFramesTotal));
@@ -1410,6 +1445,10 @@ void SessionImpl::BuildHello(ByteWriter& w) const
    w.u64(m_hash);
    w.str(m_tableFile);
    w.str(VP_VERSION_STRING_POINTS_FULL);
+   // One byte after the build string. Builds before it read the HELLO's fields in order, check only that they were all
+   // there and the magic, and ignore what follows (ParseHello of 8ec92cf / 57305804); the replay tool checks only
+   // the message type. So the protocol version stays 1 and both directions keep working.
+   w.u8(m_watch ? 0 : HELLO_PHYSICS_STAMPS);
 }
 
 void SessionImpl::SendHello(Peer& p)
@@ -1430,6 +1469,7 @@ bool SessionImpl::ParseHello(const Message& m, Hello& h) const
    h.hash = r.u64();
    h.table = r.str();
    h.build = r.str();
+   h.features = r.ok() && r.remaining() >= 1 ? r.u8() : 0; // absent from builds before the byte existed
    return r.ok() && memcmp(magic, "CCST", 4) == 0;
 }
 
@@ -1490,6 +1530,8 @@ void SessionImpl::PlayService(Peer& p)
             if (h.build != VP_VERSION_STRING_POINTS_FULL)
                m_log.Warn(Fmt("watcher %s runs build %s, this is %s", p.addr.c_str(), h.build.c_str(), VP_VERSION_STRING_POINTS_FULL));
             m_log.Info(Fmt("watcher connected (%s)", p.addr.c_str()));
+            // It starts from silence (it stops every sound at a HELLO): the repeated-stop rule starts again
+            m_stopFilter.ForgetSent();
             Note("Castcade: watcher connected (" + p.addr + ")");
             BuildKeyframe(m_payload);
             const size_t states = m_state.size();
@@ -1949,6 +1991,21 @@ void SessionImpl::Refuse(const std::string& why)
    m_listener.reset();
 }
 
+// PinTable::StopAllSounds: every sound's own buffer (a WAV's DirectSound buffer, or its BASS stream) and, through
+// AudioMusicPlayer::StopCopiedWavs, every copied buffer. The watcher's StopSoundFilter starts again with it.
+void SessionImpl::StopAllSoundsHere(const char* const why)
+{
+   if (!m_watch || !m_player->m_ptable)
+      return;
+   const int before = CountPlayingSounds(m_player);
+   m_player->m_ptable->StopAllSounds();
+   const int after = CountPlayingSounds(m_player);
+   std::vector<std::wstring> reels;
+   ReelSoundNames(m_player, reels);
+   m_stopFilter.Init(reels);
+   m_log.Info(Fmt("%s: every sound stopped (%d were playing, %d play now)", why, before, after));
+}
+
 void SessionImpl::WatchService(Peer& p, const uint64_t now)
 {
    m_msgs.clear();
@@ -1987,8 +2044,15 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
             m_offsetSamples.clear();
             if (h.build != VP_VERSION_STRING_POINTS_FULL)
                m_log.Warn(Fmt("the player runs build %s, this is %s", h.build.c_str(), VP_VERSION_STRING_POINTS_FULL));
-            m_log.Info(Fmt("watching '%s' from %s", h.table.c_str(), p.addr.c_str()));
+            m_physicsStamps = (h.features & HELLO_PHYSICS_STAMPS) != 0;
+            m_haveLastRx = m_lastRxCorrected = false;
+            m_log.Info(Fmt("watching '%s' from %s; its frames are stamped %s", h.table.c_str(), p.addr.c_str(),
+               m_physicsStamps ? "with its physics clock (never corrected)" : "when sent (an older player or recording: late stamps are corrected)"));
             Note("Castcade: watching " + h.table);
+            // A new player, or a new session of the same one, starts from silence: the player's StopSound rules only
+            // have to be right for sounds started on this connection
+            StopAllSoundsHere("a new player's HELLO");
+            m_stopWhenDrained = false;
          }
       }
       else if ((m.type == MSG_KEYFRAME || m.type == MSG_FRAME) && p.helloOk)
@@ -2010,18 +2074,34 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          // of before the stall under a stamp of after it, and the stall's motion is crammed into the next frame
          // interval. Such a frame is moved back to where its physics time puts it. Frames of a current player, and
          // every frame without a stall, are stamped within a few ms of their physics time and are never moved.
+         // A current player says so in its HELLO (HELLO_PHYSICS_STAMPS) and its frames are never looked at: its stamp
+         // legitimately jumps ahead of the snapshot's physics time when it resumes from a pause (Player::m_noTimeCorrect
+         // moves the physics clock and its start together). For an older stream, a frame that needs moving right after
+         // a moved frame while its own physics time advanced by a normal frame interval only (nothing was caught up)
+         // is a re-based clock, not a stall: its stamp is taken as sent and the next frames compare with it.
          // Part of smoothing: CASTCADE_STREAM_SMOOTH=0 shows an older stream exactly as the watcher always did.
          f->arrived = now;
+         if (m_held && m_lastAnyArrival)
+            m_holdArrivalGapMax = (std::max)(m_holdArrivalGapMax, now - m_lastAnyArrival);
+         m_lastAnyArrival = now;
          const uint32_t phys = SnapshotPhysicsMsec(*f->state);
-         if (m_smooth && m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
+         bool corrected = false;
+         if (m_smooth && !m_physicsStamps && m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
          {
             const uint64_t byPhysics = m_lastRxTime + (uint64_t)(phys - m_lastRxPhys) * 1000;
             if (f->time > byPhysics + 40000)
             {
-               f->time = byPhysics;
-               ++m_iRestamped;
+               if (m_lastRxCorrected && phys - m_lastRxPhys <= 40)
+                  ++m_iRebased;
+               else
+               {
+                  f->time = byPhysics;
+                  corrected = true;
+                  ++m_iRestamped;
+               }
             }
          }
+         m_lastRxCorrected = corrected;
          m_lastRxTime = f->time;
          m_lastRxPhys = phys;
          m_haveLastRx = true;
@@ -2066,6 +2146,13 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
    }
    else if (!p.helloOk && !m_refused && !p.closing)
       m_log.Info(Fmt("connection with %s closed before its HELLO", p.addr.c_str()));
+   // Whatever the player stops from now on, this watcher does not hear it: nothing it started may go on playing (a
+   // looping sound would loop until the next stop the player's rules let through)
+   if (p.helloOk)
+   {
+      StopAllSoundsHere(m_bye ? "the player closed the table" : "the connection ended");
+      m_stopWhenDrained = true; // the frames already received are still shown (the delay), and may start sounds
+   }
    p.tcp->Close();
    p.closing = true;
    m_keyframeApplied = false; // the next connection starts with a keyframe; the last picture stays meanwhile
@@ -2135,26 +2222,23 @@ void SessionImpl::StepTimeline(const uint64_t now)
    {
       m_heldSince = now;
       m_heldStamp = newest;
-      m_heldArrival = m_timeline.back()->arrived;
+      m_holdArrivalGapMax = 0;
    }
    else if (!held && m_held && m_haveShown)
    {
       const double heldMs = (double)(now - m_heldSince) / 1000.;
-      if (heldMs >= 20.)
+      // A gap is frames that stopped arriving: the longest time without one while the picture held (WatchService
+      // measures it). A picture held while frames keep coming is a paused player, whose stamps stand still: nothing
+      // to measure there
+      const double arrivalGapMs = (double)m_holdArrivalGapMax / 1000.;
+      if (heldMs >= 20. && arrivalGapMs >= 20.)
       {
          if (m_epOpen)
             LogGap();
-         uint64_t nextArrival = m_timeline.back()->arrived;
-         for (const auto& f : m_timeline)
-            if ((int64_t)f->time > m_heldStamp)
-            {
-               nextArrival = f->arrived;
-               break;
-            }
          m_epOpen = true;
          m_epHeldSince = m_heldSince;
          m_epHeldMs = heldMs;
-         m_epGapMs = (double)(nextArrival - m_heldArrival) / 1000.;
+         m_epGapMs = arrivalGapMs;
          m_epLagMs = (double)(target - m_heldStamp) / 1000.;
          m_epCatchupMs = m_catchup ? m_catchupLen / 1000. : 0.;
          m_epUntil = now + (uint64_t)(m_epCatchupMs * 1000.) + 100000;
@@ -2298,6 +2382,18 @@ void SessionImpl::WatchFrame(const uint64_t now)
             m_log.Warn("cannot connect to " + m_connectText + ": " + err);
          }
       }
+      // Test: CASTCADE_TEST_DROP=<s>[,<s>...] cuts the connection that many seconds after the session began, as a
+      // dropped line would; the watcher reconnects after its usual 2 s retry interval (listening: when the player does)
+      if (!m_testDrops.empty() && now - m_qpc0 >= (uint64_t)(m_testDrops.front() * 1e6))
+      {
+         m_testDrops.erase(m_testDrops.begin());
+         if (!m_peers.empty() && m_peers.front().tcp->Alive())
+         {
+            m_log.Info("test drop: cutting the connection now (CASTCADE_TEST_DROP)");
+            m_peers.front().tcp->Close();
+            m_nextRetry = now + RETRY_USEC;
+         }
+      }
       if (!m_peers.empty())
       {
          WatchService(m_peers.front(), now);
@@ -2308,6 +2404,13 @@ void SessionImpl::WatchFrame(const uint64_t now)
 
    m_frameReplayed = 0;
    StepTimeline(now);
+   // Once the frames received before the connection ended have all been shown, whatever they started stops too
+   if (m_stopWhenDrained && (m_peers.empty() || !m_peers.front().helloOk)
+      && std::none_of(m_timeline.begin(), m_timeline.end(), [](const std::unique_ptr<RxFrame>& f) { return !f->replayed; }))
+   {
+      m_stopWhenDrained = false;
+      StopAllSoundsHere("the frames received before the connection ended have been shown");
+   }
    m_iReplayedSum += m_frameReplayed;
    m_iReplayedMax = (std::max)(m_iReplayedMax, m_frameReplayed);
 }
@@ -2390,7 +2493,8 @@ void SessionImpl::LogStats(const uint64_t now)
       const double span = m_timeline.size() > 1 ? (double)(m_timeline.back()->time - m_timeline.front()->time) / 1000. : 0.;
       m_log.Info(Fmt("stats %.1fs: %s, frames %llu, received %llu (%.1f/s), in %.0f B/s, out %.0f B/s; timeline %zu frames (%.0f ms), starved %llu, buffering %llu, "
                      "jumps %llu; replayed calls %llu (editable %llu table %llu global %llu ball %llu), per frame avg %.2f max %u, failed %llu, unresolved %llu, "
-                     "sound skipped %llu, stops skipped %llu%s; frames before keyframe %llu; clock offset %lld us, delay %lld ms; gaps %llu, largest ball step %.1f VPU",
+                     "sound skipped %llu, stops skipped %llu%s; frames before keyframe %llu; clock offset %lld us, delay %lld ms; gaps %llu, largest ball step %.1f VPU; "
+                     "frames restamped so far %llu, re-based %llu",
          secs, m_refused ? "refused" : (connected ? "connected" : "not connected"), (unsigned long long)m_iFrames, (unsigned long long)m_iRecv,
          (double)m_iRecv / secs, (double)m_iBytesIn / secs, (double)m_iBytesOut / secs, m_timeline.size(), span, (unsigned long long)m_iStarved,
          (unsigned long long)m_iBuffering, (unsigned long long)m_iJumps,
@@ -2399,7 +2503,8 @@ void SessionImpl::LogStats(const uint64_t now)
          (unsigned long long)m_iReplayed[KC_BALL], (double)m_iReplayedSum / frames, m_iReplayedMax, (unsigned long long)m_iFailed,
          (unsigned long long)m_iUnresolved, (unsigned long long)m_iSoundSkipped, (unsigned long long)m_iStopDropped,
          m_stopAudit ? Fmt(" (audit: %llu would have stopped a playing sound, %llu would not)", (unsigned long long)m_iAuditEffective, (unsigned long long)m_iAuditNoEffect).c_str() : "",
-         (unsigned long long)m_iBeforeKeyframe, (long long)m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_iGaps, m_iMaxStep));
+         (unsigned long long)m_iBeforeKeyframe, (long long)m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_iGaps, m_iMaxStep,
+         (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased));
       m_iGaps = 0;
       m_iMaxStep = 0.f;
       m_iRecv = m_iBeforeKeyframe = m_iStarved = m_iBuffering = m_iJumps = 0;

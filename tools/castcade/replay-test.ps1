@@ -24,7 +24,8 @@ param(
     # A name that does not start with VPinballX: the Castcade companion takes any VPinballX* process that loads a table
     # for a game start (it logs a launch, reports it, and remembers that exe). Copy build\Release\VPinballX_GL64.exe to it.
     [string]$Exe = 'C:\code\repos\castcade-vpx-wt-state\build\Release\cctest_GL64.exe',
-    [string]$Replay = 'C:\code\repos\castcade-vpx-wt-state\tools\castcade\launchers\castcade-replay.ps1',
+    [string]$WatchExe,      # the watchers' exe when it is another build (default: -Exe)
+    [string]$Replay ='C:\code\repos\castcade-vpx-wt-state\tools\castcade\launchers\castcade-replay.ps1',
     [int]$Port = 47921,
     [int]$DelayMs = 100,
     [string]$InputFile,
@@ -154,7 +155,7 @@ function Start-Vpx([string]$name, [int]$posX, [hashtable]$envs) {
     New-Item -ItemType Directory -Force $dir | Out-Null
     $ini = Join-Path $Run "$name.ini"
     New-Ini $ini $posX
-    $psi = [Diagnostics.ProcessStartInfo]::new($Exe)
+    $psi = [Diagnostics.ProcessStartInfo]::new($(if ($name -ne 'play' -and $WatchExe) { $WatchExe } else { $Exe }))
     $psi.UseShellExecute = $false
     $psi.WorkingDirectory = $dir
     foreach ($a in @('-Ini', $ini, '/ExtMinimized', '-Play', $Table)) { $psi.ArgumentList.Add($a) }

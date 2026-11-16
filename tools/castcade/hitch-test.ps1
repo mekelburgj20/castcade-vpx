@@ -24,6 +24,7 @@ param(
     [int]$FrameLogMs = 25,
     [switch]$Sound,
     [int]$CacheMode = 0,   # VPX's texture preload cache (CacheMode=1 is VPX's default; it reads and rewrites %APPDATA%\VPinballX\Cache\<table>\used_textures.xml)
+    [switch]$NoStreamLog,  # no CASTCADE_STREAM_LOG: the session mirrors every line into the VPX log (vpinball.log, EnableLog=1)
     [string]$Label = '',
     [string]$OutDir,
     [int]$Width = 1280,
@@ -112,6 +113,7 @@ try {
     $envs = @{ CASTCADE_TEST_NOPAUSE = '1'; CASTCADE_TEST_INPUT = (Resolve-Path -LiteralPath $InputFile).Path; CASTCADE_FRAMELOG = (Join-Path $dir 'frames.log');
                CASTCADE_FRAMELOG_MS = "$FrameLogMs"; CASTCADE_STREAM_LOG = (Join-Path $dir 'castcade.log') }
     if ($Mode -eq 'record') { $envs['CASTCADE_STREAM'] = 'play'; $envs['CASTCADE_STREAM_RECORD'] = (Join-Path $Run 'rec') + '\' }
+    if ($NoStreamLog) { $envs.Remove('CASTCADE_STREAM_LOG') }
     foreach ($k in $ExtraEnv.Keys) { $envs[$k] = "$($ExtraEnv[$k])" }
     $psi = [Diagnostics.ProcessStartInfo]::new($Exe)
     $psi.UseShellExecute = $false

@@ -12,6 +12,10 @@
 //   CASTCADE_TEST_STALL=<ms>,<every s>[,<first s>]  stall the render thread for <ms> every <every s> seconds, in
 //                               the frame after the physics (where a script waiting on a file stalls it): gives the
 //                               stream's catch-up frames and the watcher's smoothing gaps to work on
+//   CASTCADE_TEST_PAUSE=<at s>,<for s>[,<every s>]  pause the player as losing the window's focus does, and resume
+//                               it as getting the focus back does (the physics clock moves over the pause)
+// The watcher's own switch (CASTCADE_TEST_DROP) and the one at a session's end (CASTCADE_TEST_EXITWARN) are in
+// CastcadeStream.cpp.
 // Its log lines ("test input ...") go to CASTCADE_STREAM_LOG when that is set, and to the VPX log.
 // Never created on a watcher.
 

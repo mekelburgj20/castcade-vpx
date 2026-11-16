@@ -56,7 +56,8 @@ jumps, failed, unresolved). It does not restore the type-library registration or
 that once after the last run. `-Sound` turns VPX's table sounds on at volume 0 in every instance (the
 StopSound audit, `CASTCADE_STREAM_STOPAUDIT=1`, needs it on the watcher); `-PlayEnv` / `-WatchEnv` add
 environment variables (`@{ CASTCADE_STREAM_SMOOTH = '0' }`); `-FrameLog <folder>` runs the frame probe in
-every instance.
+every instance; `-WatchExe` runs the watchers from another build than the player (an older watcher against a
+newer player).
 
 # tools/castcade/hitch-test.ps1
 
@@ -75,3 +76,8 @@ Test switches the fork reads (with or without a stream session): `CASTCADE_TEST_
 `CASTCADE_TEST_STALL=<ms>,<every s>[,<first s>]` (stalls the render thread on purpose, after the physics),
 `CASTCADE_FRAMELOG`, `CASTCADE_FRAMELOG_MS`; on a session: `CASTCADE_STREAM_STOPFILTER=0`,
 `CASTCADE_STREAM_CATCHUP=0` (player), `CASTCADE_STREAM_SMOOTH=0`, `CASTCADE_STREAM_STOPAUDIT=1` (watcher).
+`CASTCADE_TEST_PAUSE=<at s>,<for s>[,<every s>]` pauses a player as losing the window's focus does and resumes it
+as getting it back does; `CASTCADE_TEST_DROP=<s>[,<s>...]` cuts a watcher's connection that many seconds after its
+session began (it reconnects as usual); `CASTCADE_TEST_EXITWARN=<n>` writes n warnings as a session ends, while
+its log's thread mirrors them into the VPX log. `hitch-test.ps1 -NoStreamLog` leaves CASTCADE_STREAM_LOG unset, so
+every session line goes to the VPX log.
