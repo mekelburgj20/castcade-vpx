@@ -15,6 +15,8 @@ rem No address: the player records and opens no network connection at all
 set "CASTCADE_STREAM_ADDR="
 set "CASTCADE_STREAM_RECORD=%~dp0castcade-recordings\"
 set "CASTCADE_STREAM_LOG=%~dp0castcade-record.log"
+rem Every frame of 25 ms or more is logged with where the time went (a recording's gaps are such frames)
+set "CASTCADE_FRAMELOG=%~dp0castcade-record-frames.log"
 if "%~1"=="" (
   start "" "%~dp0VPinballX_GL64_castcade.exe"
 ) else (

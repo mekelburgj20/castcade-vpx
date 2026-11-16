@@ -88,6 +88,7 @@ If something is wrong
   A "stream gap" line in the watcher's log is a moment the PLAYER's PC stopped drawing (the player saw it
   stop too); the delay hides gaps shorter than itself. To find what stalls the player's PC, set
   CASTCADE_FRAMELOG=<a file> for the player: every frame of 25 ms or more is logged with where the time went.
+  "Castcade Record.bat" does this already: castcade-record-frames.log next to the exe.
 - Double sound on the watcher: set CASTCADE_STREAM_SOUND=0 in "Castcade Watch.bat".
 - "this is not the same table file as the player's": copy the player's exact .vpx to the watcher.
 
