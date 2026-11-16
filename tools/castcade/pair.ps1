@@ -16,6 +16,8 @@ param(
     [ValidateSet('none', 'game')][string]$Drive = 'none',
     [int]$WatchDelaySeconds = 0,
     [switch]$WatchFirst,
+    # The watcher listens and the player connects (for a watcher who can accept connections when the player cannot)
+    [switch]$WatchListens,
     [int]$Port = 47800,
     [int]$DelayMs = 50,
     [int]$ShotEvery = 5,
@@ -216,11 +218,11 @@ function Start-Instance($inst) {
     $log = Join-Path $inst.Dir 'castcade.log'
     if ($inst.Name -eq 'play') {
         $psi.Environment['CASTCADE_STREAM'] = 'play'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = "listen:127.0.0.1:$Port"
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($WatchListens) { "connect:127.0.0.1:$Port" } else { "listen:127.0.0.1:$Port" }
         if ($Drive -eq 'game') { $psi.Environment['CASTCADE_TEST_INPUT'] = $InputFile }
     } else {
         $psi.Environment['CASTCADE_STREAM'] = 'watch'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = "connect:127.0.0.1:$Port"
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($WatchListens) { "listen:127.0.0.1:$Port" } else { "connect:127.0.0.1:$Port" }
         $psi.Environment['CASTCADE_STREAM_DELAY_MS'] = "$DelayMs"
     }
     $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1'
