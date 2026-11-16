@@ -2,9 +2,10 @@
 
 #pragma once
 
-// Castcade state stream: byte buffers, the VARIANT codec, message framing and the TCP transport.
-// Nothing in this file or in CastcadeWire.cpp knows about VPX: it builds and is tested on its own
-// (src/castcade/tests). All sockets are non-blocking and every call is made from one thread.
+// Castcade state stream: byte buffers, the VARIANT codec, message framing, the TCP transport and the
+// recording file. Nothing in this file or in CastcadeWire.cpp knows about VPX: it builds and is tested on its
+// own (src/castcade/tests). All sockets are non-blocking and every call is made from one thread (a recorder
+// writes its file from a thread of its own).
 
 #include <cstdint>
 #include <cstring>
@@ -205,6 +206,10 @@ struct Message
    std::vector<uint8_t> payload; // always inflated
 };
 
+// Frames one message exactly as TcpPeer::Send puts it on the wire (deflated as Send deflates it) and appends it
+// to out. Returns false, with out unchanged, for a payload too large to frame within the 64 MiB limit.
+bool FrameMessage(std::vector<uint8_t>& out, uint8_t type, const uint8_t* payload, size_t size);
+
 // ---------------------------------------------------------------------------------------------------------
 // Transport.
 
@@ -263,5 +268,70 @@ std::unique_ptr<TcpListener> ListenTcp(uint16_t port, std::string& err, const ch
 // moment). The returned peer is Alive() and not yet Connected(); Poll() completes or fails it. Returns
 // nullptr and sets err if the address cannot be resolved or the socket cannot be created.
 std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, uint16_t port, std::string& err);
+
+// ---------------------------------------------------------------------------------------------------------
+// Recording: the bytes a watcher connected from the first frame would have received, each message stamped
+// with the time it was sent, in a file. A replay tool that sends the chunks at their recorded pace looks to a
+// watcher exactly like a live player (tools/castcade/launchers/castcade-replay.ps1).
+//
+// File layout, little endian:
+//   offset  0  8 bytes   magic: "CCSTREC" and 0x1A
+//           8  u16       file format version (RECORDING_FORMAT)
+//          10  u16       header size: the first chunk starts at this offset
+//          12  u16       stream protocol version (as in the HELLO)
+//          14  u16       reserved, 0
+//          16  u64       start: wall clock time of the first chunk, FILETIME (UTC, 100 ns units since 1601)
+//          24  u64       duration: the last chunk's time in microseconds; 0 until the recorder closes
+//          32  u32       chunk count; 0 until the recorder closes
+//          36  u32       table part count  \ as in the HELLO, so that a tool can match a recording to a
+//          40  u64       table hash        / table file without reading the stream
+//          48  u16 n, n bytes   the table's file name, no folder (UTF-8)
+//              u16 n, n bytes   the recording VPX's build string
+//   chunks, from the header size on, until the end of the file:
+//              u64       microseconds since the first chunk
+//              u32 n     byte count
+//              n bytes   one message, exactly as framed on the wire (FrameMessage)
+// A recorder that did not close (VPX crashed) leaves duration and count at 0 and may leave a partial last
+// chunk: a reader scans the chunks and stops at the first incomplete one.
+
+constexpr uint16_t RECORDING_FORMAT = 1;
+constexpr size_t RECORDING_HEADER_FIXED = 48;               // the header up to the table name
+constexpr size_t RECORDING_MAX_QUEUED = 256u * 1024u * 1024u; // waiting for the disk: beyond this the recording fails
+
+struct RecordingInfo
+{
+   uint16_t protocol = 0;
+   uint32_t partCount = 0;
+   uint64_t hash = 0;
+   std::string table; // UTF-8 (at most 4096 bytes are kept)
+   std::string build;
+};
+
+// Writes one recording. Write and Close are called from one thread (the render thread). They only copy into
+// memory: the file is written by the recorder's own thread about once a second and at Close, so a slow or
+// stuck disk never stalls the caller.
+class StreamRecorder
+{
+public:
+   virtual ~StreamRecorder() = default; // closes
+
+   // Frames the message, stamps it with the current time and queues it; the first message is time 0 and
+   // writes the header. Returns false once the recording has failed (a write error, or more than
+   // RECORDING_MAX_QUEUED bytes waiting for a disk that does not keep up); Error() says why. Nothing is
+   // written after a failure.
+   virtual bool Write(uint8_t type, const uint8_t* payload, size_t size) = 0;
+
+   // Writes what is queued, completes the header (duration, chunk count) and closes the file. Waits for the
+   // writer thread. A recorder that never got a message deletes its empty file. Safe to call twice.
+   virtual void Close() = 0;
+
+   virtual std::string Error() const = 0;     // empty unless the recording failed
+   virtual uint64_t Chunks() const = 0;       // messages queued so far
+   virtual uint64_t FileBytes() const = 0;    // header and chunks queued so far
+   virtual uint64_t DurationUsec() const = 0; // the last message's time
+};
+
+// Creates (or replaces) the file at path; its folder must exist. Returns nullptr and sets err on failure.
+std::unique_ptr<StreamRecorder> CreateRecorder(const std::wstring& path, const RecordingInfo& info, std::string& err);
 
 }
