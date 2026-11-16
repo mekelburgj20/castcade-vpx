@@ -9,7 +9,8 @@ param(
     [string]$Table,
     [string]$Connection, # perfect, good, fair or poor: skips the question
     [int]$Pick = 0,      # 1 = the newest recording, 2 = the one before, ...: skips the choice
-    [int]$Port = 0       # first port to try (default 47801, or CASTCADE_REPLAY_PORT when set)
+    [int]$Port = 0,      # first port to try (default 47801, or CASTCADE_REPLAY_PORT when set)
+    [ValidateSet(0, 1)][int]$Smooth = 1 # 1: after a gap in the stream the watcher catches up quickly; 0: it jumps (as before), to compare
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -94,7 +95,9 @@ $psi.EnvironmentVariables['CASTCADE_STREAM_ADDR'] = "connect:127.0.0.1:$free"
 # As "Castcade Watch.bat": 100 ms behind the newest frame, the table's own sounds on (no player on this PC makes them)
 $psi.EnvironmentVariables['CASTCADE_STREAM_DELAY_MS'] = '100'
 $psi.EnvironmentVariables['CASTCADE_STREAM_SOUND'] = '1'
+$psi.EnvironmentVariables['CASTCADE_STREAM_SMOOTH'] = "$Smooth"
 $psi.EnvironmentVariables['CASTCADE_STREAM_LOG'] = (Join-Path $here 'castcade-watch-recording.log')
+Write-Host $(if ($Smooth) { '  After a gap in the recording the watcher catches up quickly (smoothing on).' } else { '  Smoothing OFF: after a gap in the recording the watcher jumps, as before.' })
 try { $watcher = [Diagnostics.Process]::Start($psi) } catch { Write-Host "  The watcher could not be started: $($_.Exception.InnerException.Message)"; exit 1 }
 Write-Host "  The watcher connects once the table has loaded. To end the replay, close the table and then VPX."
 

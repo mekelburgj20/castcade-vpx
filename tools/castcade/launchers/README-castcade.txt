@@ -46,6 +46,9 @@ Ways to run it
    To play a recording over and over, run castcade-replay.ps1 yourself with -Loop (how: the top of that
    file). Between two passes the watcher's table is not reset, so a light the recorded game had left on
    can stay on until the replayed game switches it.
+   "Castcade Watch Recording (no smoothing).bat" does the same with the watcher's smoothing off, to compare:
+   when the player's PC stalled for a moment (the recording has a gap), the smoothed watcher holds the
+   picture and then plays what it missed quickly; without smoothing it jumps to where the game is.
 
    While the Castcade app is running, it takes a game recorded or watched with 4 or 5 for a normal game
    start: it may show a notice about the table, and it remembers VPinballX_GL64_castcade.exe as the VPX
@@ -82,6 +85,9 @@ If something is wrong
   castcade-record.log, castcade-watch-recording.log and castcade-replay.log.
 - Ball stutters on the watcher: raise CASTCADE_STREAM_DELAY_MS in "Castcade Watch.bat" (100 by default;
   try 150 or 200 over a poor connection). "starved" in the watcher's log counts frames that had nothing new.
+  A "stream gap" line in the watcher's log is a moment the PLAYER's PC stopped drawing (the player saw it
+  stop too); the delay hides gaps shorter than itself. To find what stalls the player's PC, set
+  CASTCADE_FRAMELOG=<a file> for the player: every frame of 25 ms or more is logged with where the time went.
 - Double sound on the watcher: set CASTCADE_STREAM_SOUND=0 in "Castcade Watch.bat".
 - "this is not the same table file as the player's": copy the player's exact .vpx to the watcher.
 

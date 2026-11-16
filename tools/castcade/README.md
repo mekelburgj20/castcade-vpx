@@ -53,4 +53,25 @@ once the "player closed the table" note is gone). Output under
 `C:\code\repos\castcade-vpx-deps\run\rr\<yyyyMMdd-HHmmss>-<mode>\`: `run.log`, per-instance `castcade.log`,
 `shots\`, `replay.log`, `watchB-totals.json` (the watcher's stats lines summed: received, starved, buffering,
 jumps, failed, unresolved). It does not restore the type-library registration or `BAMViewSettings.xml`: do
-that once after the last run.
+that once after the last run. `-Sound` turns VPX's table sounds on at volume 0 in every instance (the
+StopSound audit, `CASTCADE_STREAM_STOPAUDIT=1`, needs it on the watcher); `-PlayEnv` / `-WatchEnv` add
+environment variables (`@{ CASTCADE_STREAM_SMOOTH = '0' }`); `-FrameLog <folder>` runs the frame probe in
+every instance.
+
+# tools/castcade/hitch-test.ps1
+
+One VPX plays a scripted game with the frame probe on (`CASTCADE_FRAMELOG`, every frame of 25 ms or more
+with VPX's profiler sections and the render thread's sampled call stacks), the stream off (`-Mode off`: no
+session, each hook one null test) or recording (`-Mode record`). Same window, ini and input rules as above;
+no socket is opened.
+
+    pwsh -NoProfile -File hitch-test.ps1 -Table "<table.vpx>" -InputFile <keys.txt> [-Mode off|record] [-Seconds 200] [-Sound] [-ExtraEnv @{...}]
+
+Output under `C:\code\repos\castcade-vpx-deps\run\hitch\<yyyyMMdd-HHmmss>-<label>\`: `run.log`,
+`play\frames.log`, `play\castcade.log`, `rec\` and `summary.json` (counts of frames of 25, 50, 100, 200 and
+500 ms or more, and the dominant section of each frame of 50 ms or more).
+
+Test switches the fork reads (with or without a stream session): `CASTCADE_TEST_INPUT`, `CASTCADE_TEST_NOPAUSE`,
+`CASTCADE_TEST_STALL=<ms>,<every s>[,<first s>]` (stalls the render thread on purpose, after the physics),
+`CASTCADE_FRAMELOG`, `CASTCADE_FRAMELOG_MS`; on a session: `CASTCADE_STREAM_STOPFILTER=0`,
+`CASTCADE_STREAM_CATCHUP=0` (player), `CASTCADE_STREAM_SMOOTH=0`, `CASTCADE_STREAM_STOPAUDIT=1` (watcher).

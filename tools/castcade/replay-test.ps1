@@ -42,7 +42,14 @@ param(
     [int]$Width = 960,
     [int]$Height = 540,
     [int]$WindowTimeout = 150,
-    [string]$Template = 'C:\code\repos\castcade-vpx-deps\run\smoke.template.ini'
+    [string]$Template = 'C:\code\repos\castcade-vpx-deps\run\smoke.template.ini',
+    # VPX's table sounds on (PlaySound=1) at volume 0 in every instance: the sound code runs and nothing VPX plays is
+    # heard (the StopSound audit needs it on the watcher); VPinMAME's ROM sound follows VPinMAME's own settings
+    [switch]$Sound,
+    # Extra environment for the player (record) and the watchers (A, B), e.g. @{ CASTCADE_STREAM_SMOOTH = '0' }
+    [hashtable]$PlayEnv = @{},
+    [hashtable]$WatchEnv = @{},
+    [string]$FrameLog       # a folder: every instance also runs the frame probe (CASTCADE_FRAMELOG=<folder>\<name>-frames.log)
 )
 $ErrorActionPreference = 'Stop'
 if (-not $OutDir) { $OutDir = Join-Path 'C:\code\repos\castcade-vpx-deps\run\rr' ((Get-Date -Format 'yyyyMMdd-HHmmss') + "-$Mode") }
@@ -120,7 +127,8 @@ $LogFile = Join-Path $Run 'run.log'
 $Keys = [ordered]@{ StartGameKey = 2; AddCreditKey = 6; PlungerKey = 28; LFlipKey = 42; RFlipKey = 54; ExitGameKey = 16 }
 function New-Ini([string]$dest, [int]$posX) {
     $set = [ordered]@{
-        'Player'   = [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = '60'; PlaySound = '0'; PlayMusic = '0'; CacheMode = '0' }
+        'Player'   = $(if ($Sound) { [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = '60'; PlaySound = '1'; PlayMusic = '0'; SoundVolume = '0'; MusicVolume = '0'; CacheMode = '0' } }
+                       else { [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = '60'; PlaySound = '0'; PlayMusic = '0'; CacheMode = '0' } })
         'PlayerVR' = [ordered]@{ AskToTurnOn = '2' }
         'Editor'   = [ordered]@{ EnableLog = '1' }
     }
@@ -151,6 +159,9 @@ function Start-Vpx([string]$name, [int]$posX, [hashtable]$envs) {
     $psi.WorkingDirectory = $dir
     foreach ($a in @('-Ini', $ini, '/ExtMinimized', '-Play', $Table)) { $psi.ArgumentList.Add($a) }
     foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CASTCADE_*' })) { [void]$psi.Environment.Remove($k) }
+    $extra = if ($name -eq 'play') { $PlayEnv } else { $WatchEnv }
+    foreach ($k in $extra.Keys) { $envs[$k] = "$($extra[$k])" }
+    if ($FrameLog) { New-Item -ItemType Directory -Force $FrameLog | Out-Null; $envs['CASTCADE_FRAMELOG'] = Join-Path $FrameLog "$name-frames.log" }
     foreach ($k in $envs.Keys) { $psi.Environment[$k] = $envs[$k] }
     $psi.Environment['CASTCADE_STREAM_LOG'] = Join-Path $dir 'castcade.log'
     $p = [Diagnostics.Process]::Start($psi)

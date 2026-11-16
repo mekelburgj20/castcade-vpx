@@ -27,6 +27,9 @@ set "CASTCADE_STREAM_DELAY_MS=100"
 rem 1 = replay the table's own sound effects here (flippers, bumpers, rolling). 0 = silent table, for when the
 rem player's sound already reaches you another way.
 set "CASTCADE_STREAM_SOUND=1"
+rem 1 = when the player's frames stop for a moment (the player's PC stalled), catch up quickly when they come back.
+rem 0 = jump to where the game is instead (as before), to compare.
+set "CASTCADE_STREAM_SMOOTH=1"
 set "CASTCADE_STREAM_LOG=%~dp0castcade-watch.log"
 if "%~1"=="" (
   start "" "%~dp0VPinballX_GL64_castcade.exe"

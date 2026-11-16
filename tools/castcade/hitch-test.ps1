@@ -23,6 +23,7 @@ param(
     [int]$Seconds = 200,
     [int]$FrameLogMs = 25,
     [switch]$Sound,
+    [int]$CacheMode = 0,   # VPX's texture preload cache (CacheMode=1 is VPX's default; it reads and rewrites %APPDATA%\VPinballX\Cache\<table>\used_textures.xml)
     [string]$Label = '',
     [string]$OutDir,
     [int]$Width = 1280,
@@ -82,7 +83,7 @@ $LogFile = Join-Path $Run 'run.log'
 # ---------------------------------------------------------------- ini (as pair.ps1 / replay-test.ps1)
 $Keys = [ordered]@{ StartGameKey = 2; AddCreditKey = 6; PlungerKey = 28; LFlipKey = 42; RFlipKey = 54; ExitGameKey = 16 }
 function New-Ini([string]$dest, [int]$posX) {
-    $player = [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = '60'; PlaySound = '0'; PlayMusic = '0'; CacheMode = '0' }
+    $player = [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = '60'; PlaySound = '0'; PlayMusic = '0'; CacheMode = "$CacheMode" }
     if ($Sound) { $player.PlaySound = '1'; $player.SoundVolume = '0'; $player.MusicVolume = '0' }
     $set = [ordered]@{ 'Player' = $player; 'PlayerVR' = [ordered]@{ AskToTurnOn = '2' }; 'Editor' = [ordered]@{ EnableLog = '1' } }
     foreach ($k in $Keys.Keys) { $set['Player'][$k] = "$($Keys[$k])" }
