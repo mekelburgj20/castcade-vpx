@@ -545,6 +545,7 @@ struct RxFrame
    }
 
    uint64_t time = 0;
+   uint64_t arrived = 0; // NowUsec when it was received
    uint32_t seq = 0;
    size_t bytes = 0;
    size_t stateBytes = 0;
@@ -761,7 +762,7 @@ private:
    uint64_t m_catchupStart = 0; // NowUsec
    double m_catchupLag = 0., m_catchupLen = 0.;
    // The gap being measured: how long the picture held, and the largest ball step until the catch-up is over
-   uint64_t m_heldSince = 0;
+   uint64_t m_heldSince = 0, m_heldArrival = 0, m_epHeldSince = 0;
    int64_t m_heldStamp = 0;
    bool m_epOpen = false;
    uint64_t m_epUntil = 0;
@@ -769,6 +770,10 @@ private:
    float m_epMaxStep = 0.f;
    uint64_t m_iGaps = 0, m_gapsTotal = 0;
    float m_iMaxStep = 0.f;
+   bool m_haveLastRx = false;         // the last frame received: its (possibly corrected) stamp and its physics time
+   uint64_t m_lastRxTime = 0;
+   uint32_t m_lastRxPhys = 0;
+   uint64_t m_iRestamped = 0;         // frames of an older player moved back to their physics time
    std::vector<uint32_t> m_stepHist; // ball steps of the frames outside a gap, 0.5 VPU bins
    uint64_t m_stepFrames = 0;
    float m_stepMax = 0.f;
@@ -849,7 +854,7 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
       m_replaySound ? "on" : "off", m_neverPauses ? "yes" : "no", m_tableFile.c_str(), m_editCount, (unsigned long long)m_hash, VP_VERSION_STRING_POINTS_FULL));
    m_log.Info(Fmt("StopSound filter %s (DispReel sounds %zu, repeated-stop rule %s)%s", m_stopFilterOn ? "on" : "off (CASTCADE_STREAM_STOPFILTER=0)",
       m_stopFilter.ReelSounds(), m_stopFilter.RepeatRule() ? "on" : "off", m_stopAudit ? "; AUDIT: every stop is replayed, the ones the filter would drop are checked" : ""));
-   m_log.Info(watch ? Fmt("after a gap in the stream: %s", m_smooth ? "catch up over 80-250 ms (CASTCADE_STREAM_SMOOTH=0 jumps instead)" : "jump to the target (CASTCADE_STREAM_SMOOTH=0)")
+   m_log.Info(watch ? Fmt("after a gap in the stream: %s", m_smooth ? "catch up over 80-300 ms (CASTCADE_STREAM_SMOOTH=0 jumps instead)" : "jump to the target (CASTCADE_STREAM_SMOOTH=0)")
                     : Fmt("frames stamped with the physics clock; catch-up frames after a stall %s", m_catchupFrames ? "on" : "off (CASTCADE_STREAM_CATCHUP=0)"));
    if (m_stopAudit && !m_player->m_PlaySound)
       m_log.Warn("the StopSound audit needs PlaySound=1 in the watcher's settings: without it no sound plays and every check passes");
@@ -892,8 +897,9 @@ SessionImpl::~SessionImpl()
    {
       if (m_epOpen)
          LogGap();
-      m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; ball steps per frame outside them: %s", (unsigned long long)m_gapsTotal,
-         StepSummary().c_str()));
+      m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; %llu frames of an older player stamped late were put back at their "
+                     "physics time; ball steps per frame outside the gaps: %s",
+         (unsigned long long)m_gapsTotal, (unsigned long long)m_iRestamped, StepSummary().c_str()));
    }
    else
       m_log.Info(Fmt("whole session: %llu catch-ups after a stall sent %llu frames of their own", (unsigned long long)m_catchupsTotal, (unsigned long long)m_catchupFramesTotal));
@@ -1999,6 +2005,25 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
             p.closing = true;
             break;
          }
+         // A player before the physics-clock stamps (recordings made before 2026-11-16 included) stamped a frame
+         // when it was sent: after a stall in the frame's script timers, the frame that follows carries the physics
+         // of before the stall under a stamp of after it, and the stall's motion is crammed into the next frame
+         // interval. Such a frame is moved back to where its physics time puts it. Frames of a current player, and
+         // every frame without a stall, are stamped within a few ms of their physics time and are never moved.
+         f->arrived = now;
+         const uint32_t phys = SnapshotPhysicsMsec(*f->state);
+         if (m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
+         {
+            const uint64_t byPhysics = m_lastRxTime + (uint64_t)(phys - m_lastRxPhys) * 1000;
+            if (f->time > byPhysics + 40000)
+            {
+               f->time = byPhysics;
+               ++m_iRestamped;
+            }
+         }
+         m_lastRxTime = f->time;
+         m_lastRxPhys = phys;
+         m_haveLastRx = true;
          AddOffsetSample((int64_t)now - (int64_t)f->time);
          if (m.type == MSG_KEYFRAME)
             ApplyKeyframe(*f);
@@ -2050,7 +2075,7 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
 // newest frame, so it holds the last picture for the stall minus the delay whatever it does (a guess forward would be
 // wrong at the first thing the ball hits). What smoothing changes is the moment frames come back: without it the
 // shown time jumps to the target and the ball leaps over everything it did during the hold; with it the shown time
-// carries on from where it held and catches up with the target over 80 to 250 ms (0.3 of the lag), eased at both
+// carries on from where it held and catches up with the target over 80 to 300 ms (half the lag), eased at both
 // ends, so the missed motion is played quickly instead of skipped. With no hold of more than CATCHUP_MIN_LAG_USEC the
 // shown time is the target, exactly as without smoothing; calls are replayed once each and in order either way.
 void SessionImpl::StepTimeline(const uint64_t now)
@@ -2079,7 +2104,14 @@ void SessionImpl::StepTimeline(const uint64_t now)
          m_catchup = true;
          m_catchupStart = now;
          m_catchupLag = (double)(target - m_shown);
-         m_catchupLen = std::clamp(0.3 * m_catchupLag, 80000., 250000.);
+         // Half the lag: the shown time runs at up to 4 times the speed of play (smoothstep peaks at 1.5 times the
+         // mean); a third of the lag (6 times) gave single-frame ball steps of up to 2.5 times normal play's largest
+         m_catchupLen = std::clamp(0.5 * m_catchupLag, 80000., 300000.);
+         if (m_epOpen) // a hold too short to count as a gap of its own, inside one being measured
+         {
+            m_epUntil = (std::max)(m_epUntil, now + (uint64_t)m_catchupLen + 100000);
+            m_epCatchupMs = (std::max)(m_epCatchupMs, m_catchupLen / 1000.);
+         }
       }
       if (m_catchup)
       {
@@ -2102,6 +2134,7 @@ void SessionImpl::StepTimeline(const uint64_t now)
    {
       m_heldSince = now;
       m_heldStamp = newest;
+      m_heldArrival = m_timeline.back()->arrived;
    }
    else if (!held && m_held && m_haveShown)
    {
@@ -2110,16 +2143,17 @@ void SessionImpl::StepTimeline(const uint64_t now)
       {
          if (m_epOpen)
             LogGap();
-         int64_t next = newest;
+         uint64_t nextArrival = m_timeline.back()->arrived;
          for (const auto& f : m_timeline)
             if ((int64_t)f->time > m_heldStamp)
             {
-               next = (int64_t)f->time;
+               nextArrival = f->arrived;
                break;
             }
          m_epOpen = true;
+         m_epHeldSince = m_heldSince;
          m_epHeldMs = heldMs;
-         m_epGapMs = (double)(next - m_heldStamp) / 1000.;
+         m_epGapMs = (double)(nextArrival - m_heldArrival) / 1000.;
          m_epLagMs = (double)(target - m_heldStamp) / 1000.;
          m_epCatchupMs = m_catchup ? m_catchupLen / 1000. : 0.;
          m_epUntil = now + (uint64_t)(m_epCatchupMs * 1000.) + 100000;
@@ -2165,7 +2199,7 @@ void SessionImpl::StepTimeline(const uint64_t now)
    {
       m_epMaxStep = (std::max)(m_epMaxStep, step);
       if (m_epFirstMoveMs < 0. && step >= 1.f) // the first frame after the hold in which a ball visibly moves
-         m_epFirstMoveMs = (double)(now - m_heldSince) / 1000.;
+         m_epFirstMoveMs = (double)(now - m_epHeldSince) / 1000.;
       if (now >= m_epUntil)
          LogGap();
    }
@@ -2192,7 +2226,7 @@ void SessionImpl::LogGap()
    ++m_gapsTotal;
    const std::string how = m_epCatchupMs > 0. ? Fmt("caught up in %.0f ms", m_epCatchupMs) : m_smooth ? std::string("no catch-up (lag under 20 ms)") : std::string("jumped (smoothing off)");
    const std::string move = m_epFirstMoveMs >= 0. ? Fmt("a ball moved again %.0f ms after the hold began", m_epFirstMoveMs) : std::string("no ball moved");
-   m_log.Info(Fmt("stream gap: %.0f ms between frame stamps, picture held %.0f ms, %.0f ms behind when frames came back, %s; %s; largest ball step %.1f VPU in one frame",
+   m_log.Info(Fmt("stream gap: frames stopped arriving for %.0f ms, picture held %.0f ms, %.0f ms behind when frames came back, %s; %s; largest ball step %.1f VPU in one frame",
       m_epGapMs, m_epHeldMs, m_epLagMs, how.c_str(), move.c_str(), m_epMaxStep));
 }
 

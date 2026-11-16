@@ -48,6 +48,9 @@ struct StateSnapshot;
 // Watch role. Parses what CaptureState wrote. Returns nullptr on malformed input.
 std::shared_ptr<const StateSnapshot> ParseState(ByteReader& r);
 
+// The player's physics time (Player::m_time_msec) the snapshot was captured at
+uint32_t SnapshotPhysicsMsec(const StateSnapshot& s);
+
 // Watch role. Writes snapshots into the local table so that the next Render shows them.
 class StateApplier final
 {

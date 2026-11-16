@@ -546,6 +546,11 @@ void CaptureState(Player* player, const std::unordered_map<const Ball*, uint32_t
    StateAccess::Capture(player, ballIds, w);
 }
 
+uint32_t SnapshotPhysicsMsec(const StateSnapshot& s)
+{
+   return s.timeMsec;
+}
+
 uint64_t PhysicsClockUsec(Player* const player)
 {
    return StateAccess::PhysicsClock(player);
