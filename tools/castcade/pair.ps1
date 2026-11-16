@@ -19,6 +19,10 @@ param(
     # The watcher listens and the player connects (for a watcher who can accept connections when the player cannot)
     [switch]$WatchListens,
     [int]$Port = 47800,
+    # Override either instance's CASTCADE_STREAM_ADDR (loopback only), e.g. to put the Castcade companion's tunnel
+    # between them: -PlayAddr listen:127.0.0.1:<port> -WatchAddr connect:127.0.0.1:<port of the tunnel's listener>
+    [string]$PlayAddr,
+    [string]$WatchAddr,
     [int]$DelayMs = 50,
     [int]$ShotEvery = 5,
     [string]$OutDir,
@@ -107,10 +111,17 @@ foreach ($p in @($Exe, $WatchExe, $Table, $WatchTable, $Template)) { if (-not (T
 $Exe = (Resolve-Path -LiteralPath $Exe).Path; $WatchExe = (Resolve-Path -LiteralPath $WatchExe).Path
 $Table = (Resolve-Path -LiteralPath $Table).Path; $WatchTable = (Resolve-Path -LiteralPath $WatchTable).Path
 if ($Width -lt 200 -or $Height -lt 150) { Fail 'window size too small' }
-foreach ($ip in @('127.0.0.1')) {   # loopback only: binding 0.0.0.0 would raise a Windows Firewall prompt for pwsh
+foreach ($a in @($PlayAddr, $WatchAddr)) {   # loopback only, with the address spelled out (a bare port listens on every interface)
+    if ($a -and $a -notmatch '^(listen|connect):127\.0\.0\.1:\d{1,5}$') { Fail "address override must be listen:127.0.0.1:<port> or connect:127.0.0.1:<port>, not '$a'" }
+}
+# The ports this run will listen on: the default pair's $Port, or the overrides that listen.
+$listenPorts = @()
+if (-not $PlayAddr -and -not $WatchAddr) { $listenPorts = @($Port) }
+else { foreach ($a in @($PlayAddr, $WatchAddr)) { if ($a -match '^listen:127\.0\.0\.1:(\d+)$') { $listenPorts += [int]$Matches[1] } } }
+foreach ($lp in $listenPorts) {   # loopback only: binding 0.0.0.0 would raise a Windows Firewall prompt for pwsh
     $l = $null
-    try { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse($ip), $Port); $l.Start(); $l.Stop() }
-    catch { Fail "port $Port is not free on $ip ($($_.Exception.Message))" }
+    try { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse('127.0.0.1'), $lp); $l.Start(); $l.Stop() }
+    catch { Fail "port $lp is not free on 127.0.0.1 ($($_.Exception.Message))" }
 }
 # processes an earlier run of this script started must be gone
 $siblings = Split-Path -Parent $Run
@@ -218,11 +229,11 @@ function Start-Instance($inst) {
     $log = Join-Path $inst.Dir 'castcade.log'
     if ($inst.Name -eq 'play') {
         $psi.Environment['CASTCADE_STREAM'] = 'play'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($WatchListens) { "connect:127.0.0.1:$Port" } else { "listen:127.0.0.1:$Port" }
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($PlayAddr) { $PlayAddr } elseif ($WatchListens) { "connect:127.0.0.1:$Port" } else { "listen:127.0.0.1:$Port" }
         if ($Drive -eq 'game') { $psi.Environment['CASTCADE_TEST_INPUT'] = $InputFile }
     } else {
         $psi.Environment['CASTCADE_STREAM'] = 'watch'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($WatchListens) { "listen:127.0.0.1:$Port" } else { "connect:127.0.0.1:$Port" }
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = if ($WatchAddr) { $WatchAddr } elseif ($WatchListens) { "listen:127.0.0.1:$Port" } else { "connect:127.0.0.1:$Port" }
         $psi.Environment['CASTCADE_STREAM_DELAY_MS'] = "$DelayMs"
     }
     $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1'
