@@ -43,7 +43,7 @@ public:
 
 class HitTarget :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<IHitTarget, &IID_IHitTarget, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IHitTarget, &IID_IHitTarget, &LIBID_VPinballLib>,
    //public CComObjectRoot,
    public CComCoClass<HitTarget, &CLSID_HitTarget>,
    public EventProxy<HitTarget, &DIID_IHitTargetEvents>,
@@ -57,6 +57,7 @@ class HitTarget :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    static const float DROP_TARGET_LIMIT;
 

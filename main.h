@@ -154,6 +154,8 @@ static const string defaultPathSearch[]     = { string(), "user"s +PATH_SEPARATO
 
 #include "wintimer.h"
 
+#include "castcade/CastcadeDispatch.h"
+
 #include "eventproxy.h"
 
 #include "worker.h"

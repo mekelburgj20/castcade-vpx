@@ -81,7 +81,7 @@ private:
 
 class PinTable : public CWnd,
                  public CComObjectRootEx<CComSingleThreadModel>,
-                 public IDispatchImpl<ITable, &IID_ITable, &LIBID_VPinballLib>,
+                 public CastcadeDispatchImpl<ITable, &IID_ITable, &LIBID_VPinballLib>,
                  public IConnectionPointContainerImpl<PinTable>,
                  public EventProxy<PinTable, &DIID_ITableEvents>,
                  // IProvideClassInfo provides an ITypeInfo for the whole coclass
@@ -94,6 +94,7 @@ class PinTable : public CWnd,
                  public IEditable,
                  public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    STDMETHOD(get_BallFrontDecal)(/*[out, retval]*/ BSTR *pVal);
    STDMETHOD(put_BallFrontDecal)(/*[in]*/ BSTR newVal);
@@ -880,9 +881,10 @@ private:
 
 class ScriptGlobalTable : 
    public CComObjectRootEx<CComSingleThreadModel>, 
-   public IDispatchImpl<ITableGlobal, &IID_ITableGlobal, &LIBID_VPinballLib>, 
+   public CastcadeDispatchImpl<ITableGlobal, &IID_ITableGlobal, &LIBID_VPinballLib>, 
    public IScriptable
 {
+   friend struct castcade::StateAccess;
 public:
    // Headers to support communication between the game and the script.
    STDMETHOD(EndModal)();

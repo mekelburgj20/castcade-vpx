@@ -327,6 +327,13 @@ add_executable(vpinball WIN32
    src/audio/wavread.cpp
    src/audio/wavread.h
 
+   src/castcade/CastcadeDispatch.h
+   src/castcade/CastcadeState.cpp
+   src/castcade/CastcadeState.h
+   src/castcade/CastcadeStream.cpp
+   src/castcade/CastcadeStream.h
+   src/castcade/CastcadeWire.cpp
+   src/castcade/CastcadeWire.h
    src/core/player.cpp
    src/core/player.h
    src/core/Settings.cpp
@@ -621,6 +628,11 @@ target_precompile_headers(vpinball PUBLIC
    stdafx.h
 )
 
+# Castcade state stream: the wire file is independent of VPX and includes winsock2.h first
+set_source_files_properties(
+   src/castcade/CastcadeWire.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+)
+
 set(OPT_COMMON /Ob2 /O2 /Oi /fp:fast /fp:except- /Ot /GF /GS- /Gy /GR- /Oy /GT /GL /w44005 /Zc:__cplusplus /std:c++20)
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -647,6 +659,7 @@ target_link_libraries(vpinball
    dinput.lib
    nvapi.lib
    winmm.lib
+   ws2_32.lib
    hid.lib
    hidapi.lib
    setupapi.lib

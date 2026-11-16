@@ -37,11 +37,12 @@ public:
 class BallEx :
    public CComObjectRootEx<CComSingleThreadModel>,
    public CComCoClass<BallEx, &CLSID_Ball>,
-   public IDispatchImpl<IBall, &IID_IBall, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IBall, &IID_IBall, &LIBID_VPinballLib>,
    public IFireEvents,
    public IDebugCommands,
    public Renderable
 {
+   friend struct castcade::StateAccess;
 public:
    BallEx();
    ~BallEx();

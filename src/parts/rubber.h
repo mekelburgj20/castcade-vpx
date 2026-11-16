@@ -27,7 +27,7 @@ public:
 // Rubber
 
 class Rubber :
-   public IDispatchImpl<IRubber, &IID_IRubber, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IRubber, &IID_IRubber, &LIBID_VPinballLib>,
    public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Rubber, &CLSID_Rubber>,
@@ -42,6 +42,7 @@ class Rubber :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Rubber();
    virtual ~Rubber();

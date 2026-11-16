@@ -20,7 +20,7 @@ public:
 };
 
 class Decal :
-   public IDispatchImpl<IDecal, &IID_IDecal, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IDecal, &IID_IDecal, &LIBID_VPinballLib>,
    public CComObjectRoot,
    public ISelect,
    public IEditable,
@@ -28,6 +28,7 @@ class Decal :
    public IScriptable,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Decal();
    virtual ~Decal();

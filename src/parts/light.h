@@ -68,7 +68,7 @@ public:
 // Light
 
 class Light :
-   public IDispatchImpl<ILight, &IID_ILight, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ILight, &IID_ILight, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Light, &CLSID_Light>,
@@ -83,6 +83,7 @@ class Light :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Light();
    virtual ~Light();

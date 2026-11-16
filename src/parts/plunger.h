@@ -99,7 +99,7 @@ struct PlungerDesc
 // Plunger
 
 class Plunger :
-   public IDispatchImpl<IPlunger, &IID_IPlunger, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IPlunger, &IID_IPlunger, &LIBID_VPinballLib>,
    public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Plunger, &CLSID_Plunger>,
@@ -115,6 +115,7 @@ class Plunger :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    BEGIN_COM_MAP(Plunger)
       COM_INTERFACE_ENTRY(IDispatch)

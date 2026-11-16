@@ -63,7 +63,7 @@ struct _tracer {
 
 class LightSeq :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<ILightSeq, &IID_ILightSeq, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ILightSeq, &IID_ILightSeq, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    //public CComObjectRoot,
    public CComCoClass<LightSeq, &CLSID_LightSeq>,
@@ -78,6 +78,7 @@ class LightSeq :
    public IPerPropertyBrowsing     // Ability to fill in dropdown(s) in property browser
    //public EditableImpl<LightSeq>
 {
+   friend struct castcade::StateAccess;
 public:
    LightSeq();
    ~LightSeq();

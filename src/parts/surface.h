@@ -35,7 +35,7 @@ public:
 class Surface :
    public CComObjectRootEx<CComSingleThreadModel>,
    public CComCoClass<Surface, &CLSID_Wall>,
-   public IDispatchImpl<IWall, &IID_IWall, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IWall, &IID_IWall, &LIBID_VPinballLib>,
    public EventProxy<Surface, &DIID_IWallEvents>,
    public IConnectionPointContainerImpl<Surface>,
    public IProvideClassInfo2Impl<&CLSID_Wall, &DIID_IWallEvents, &LIBID_VPinballLib>,
@@ -48,6 +48,7 @@ class Surface :
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
    //public EditableImpl<Surface>
 {
+   friend struct castcade::StateAccess;
 public:
    Surface();
    virtual ~Surface();

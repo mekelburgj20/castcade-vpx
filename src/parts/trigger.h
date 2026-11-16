@@ -28,7 +28,7 @@ public:
 // Trigger
 
 class Trigger :
-   public IDispatchImpl<ITrigger, &IID_ITrigger, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ITrigger, &IID_ITrigger, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Trigger, &CLSID_Trigger>,
@@ -43,6 +43,7 @@ class Trigger :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Trigger();
    virtual ~Trigger();

@@ -28,7 +28,7 @@ class HitSpinner;
 // Spinner
 
 class Spinner :
-   public IDispatchImpl<ISpinner, &IID_ISpinner, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ISpinner, &IID_ISpinner, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Spinner, &CLSID_Spinner>,
@@ -42,6 +42,7 @@ class Spinner :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Spinner();
    virtual ~Spinner();

@@ -34,7 +34,7 @@ public:
 
 class DispReel :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<IDispReel, &IID_IDispReel, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IDispReel, &IID_IDispReel, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    //public CComObjectRoot,
    public CComCoClass<DispReel, &CLSID_DispReel>,
@@ -48,6 +48,7 @@ class DispReel :
    public Hitable,
    public IPerPropertyBrowsing     // Ability to fill in dropdown(s) in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    DispReel();
    virtual ~DispReel();

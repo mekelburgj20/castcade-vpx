@@ -27,7 +27,7 @@ public:
 
 class Textbox :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<ITextbox, &IID_ITextbox, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ITextbox, &IID_ITextbox, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    //public CComObjectRoot,
    public CComCoClass<Textbox, &CLSID_Textbox>,
@@ -40,6 +40,7 @@ class Textbox :
    public IFireEvents,
    public Hitable
 {
+   friend struct castcade::StateAccess;
 public:
    Textbox();
    virtual ~Textbox();

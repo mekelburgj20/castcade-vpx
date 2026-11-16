@@ -35,7 +35,7 @@ public:
 // Ramp
 
 class Ramp :
-   public IDispatchImpl<IRamp, &IID_IRamp, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IRamp, &IID_IRamp, &LIBID_VPinballLib>,
    public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Ramp, &CLSID_Ramp>,
@@ -50,6 +50,7 @@ class Ramp :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Ramp();
    virtual ~Ramp();

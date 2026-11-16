@@ -26,7 +26,7 @@ public:
 
 class Timer :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<ITimer, &IID_ITimer, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<ITimer, &IID_ITimer, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    //public CComObjectRoot,
    public CComCoClass<Timer, &CLSID_Timer>,
@@ -42,6 +42,7 @@ class Timer :
    public Hitable
    //public EditableImpl<Timer>
 {
+   friend struct castcade::StateAccess;
 public:
    Timer();
    virtual ~Timer();

@@ -29,7 +29,7 @@ public:
 };
 
 class Gate :
-   public IDispatchImpl<IGate, &IID_IGate, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IGate, &IID_IGate, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Gate, &CLSID_Gate>,
@@ -43,6 +43,7 @@ class Gate :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Gate();
    void SetGateType(GateType type);

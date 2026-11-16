@@ -60,7 +60,7 @@ public:
 class Flipper :
    public CComObjectRootEx<CComSingleThreadModel>,
    public CComCoClass<Flipper, &CLSID_Flipper>,
-   public IDispatchImpl<IFlipper, &IID_IFlipper, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IFlipper, &IID_IFlipper, &LIBID_VPinballLib>,
    public IConnectionPointContainerImpl<Flipper>,
    public IProvideClassInfo2Impl<&CLSID_Flipper, &DIID_IFlipperEvents, &LIBID_VPinballLib>,
    public EventProxy<Flipper, &DIID_IFlipperEvents>,
@@ -71,6 +71,7 @@ class Flipper :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Flipper();
    virtual ~Flipper();

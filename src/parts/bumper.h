@@ -34,7 +34,7 @@ public:
 
 class Bumper :
    //public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<IBumper, &IID_IBumper, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IBumper, &IID_IBumper, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Bumper, &CLSID_Bumper>,
@@ -49,6 +49,7 @@ class Bumper :
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
    //public EditableImpl<Bumper>
 {
+   friend struct castcade::StateAccess;
 public:
    Bumper();
    ~Bumper();

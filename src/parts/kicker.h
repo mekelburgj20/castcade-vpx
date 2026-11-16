@@ -29,7 +29,7 @@ class KickerHitCircle;
 // Kicker
 
 class Kicker :
-   public IDispatchImpl<IKicker, &IID_IKicker, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IKicker, &IID_IKicker, &LIBID_VPinballLib>,
    //public ISupportErrorInfo,
    public CComObjectRoot,
    public CComCoClass<Kicker, &CLSID_Kicker>,
@@ -43,6 +43,7 @@ class Kicker :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    Kicker();
    virtual ~Kicker();

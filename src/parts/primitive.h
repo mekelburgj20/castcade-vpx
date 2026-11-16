@@ -104,7 +104,7 @@ public:
 
 class Primitive :
    public CComObjectRootEx<CComSingleThreadModel>,
-   public IDispatchImpl<IPrimitive, &IID_IPrimitive, &LIBID_VPinballLib>,
+   public CastcadeDispatchImpl<IPrimitive, &IID_IPrimitive, &LIBID_VPinballLib>,
    //public CComObjectRoot,
    public CComCoClass<Primitive, &CLSID_Primitive>,
    public EventProxy<Primitive, &DIID_IPrimitiveEvents>,
@@ -118,6 +118,7 @@ class Primitive :
    public IFireEvents,
    public IPerPropertyBrowsing // Ability to fill in dropdown in property browser
 {
+   friend struct castcade::StateAccess;
 public:
    static constexpr int Max_Primitive_Sides = 100; //!! 100 works for sleepy, 99 doesn't
 
