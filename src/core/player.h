@@ -7,7 +7,7 @@
 #include "pininput.h"
 #include "LiveUI.h"
 
-namespace castcade { class Session; } // Castcade state stream (src/castcade/CastcadeStream.h)
+namespace castcade { class Session; class FrameProbe; class TestHarness; } // Castcade state stream (src/castcade/CastcadeStream.h), frame probe (CastcadeProbe.h), test tooling (CastcadeTest.h)
 
 #define DEFAULT_PLAYER_WIDTH 1024
 #define DEFAULT_PLAYER_FS_WIDTH 1920
@@ -686,6 +686,8 @@ public:
 #pragma endregion
 
    castcade::Session *m_castcade = nullptr; // Castcade state stream session, null unless CASTCADE_STREAM asks for one
+   castcade::FrameProbe *m_castcadeProbe = nullptr; // Castcade frame-hitch probe, null unless CASTCADE_FRAMELOG asks for one
+   castcade::TestHarness *m_castcadeTest = nullptr; // Castcade test tooling, null unless CASTCADE_TEST_INPUT or CASTCADE_TEST_NOPAUSE is set
 
 
    PinTable * const m_pEditorTable; // The untouched version of the table, as it is in the editor (The Player needs it to interact with the UI)

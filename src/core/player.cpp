@@ -27,6 +27,8 @@
 #endif
 #include "tinyxml2/tinyxml2.h"
 #include "castcade/CastcadeStream.h"
+#include "castcade/CastcadeProbe.h"
+#include "castcade/CastcadeTest.h"
 
 #if __cplusplus >= 202002L && !defined(__clang__)
 #define stable_sort std::ranges::stable_sort
@@ -324,6 +326,10 @@ Player::~Player()
    castcade::Session *const castcadeSession = m_castcade;
    m_castcade = nullptr;
    delete castcadeSession;
+   delete m_castcadeProbe;
+   m_castcadeProbe = nullptr;
+   delete m_castcadeTest;
+   m_castcadeTest = nullptr;
    m_ptable->StopPlaying();
    delete m_staticPrepassRT;
    delete m_ballImage;
@@ -713,6 +719,11 @@ void Player::OnClose()
    castcade::Session *const castcadeSession = m_castcade;
    m_castcade = nullptr;
    delete castcadeSession;
+   // After the session: its recorder and log report their last writes to the probe
+   delete m_castcadeProbe;
+   m_castcadeProbe = nullptr;
+   delete m_castcadeTest;
+   m_castcadeTest = nullptr;
 
     g_frameProfiler.LogWorstFrame();
 
@@ -986,7 +997,7 @@ void Player::RecomputePauseState()
 
    // Castcade watch role: a watcher's window is rarely focused (in VR, almost never); it keeps time and animation running
    // (also a player under test, CASTCADE_TEST_NOPAUSE)
-   if (m_castcade && m_castcade->NeverPauses())
+   if ((m_castcade && m_castcade->NeverPauses()) || (m_castcadeTest && m_castcadeTest->NeverPauses()))
       m_pause = false;
 }
 
@@ -1710,6 +1721,11 @@ HRESULT Player::Init()
    m_castcade = castcade::Session::Create(this);
    if (!m_castcade || !m_castcade->IsWatcher())
    {
+   // Castcade test tooling (scripted keys, no pause), with or without a play session; never on a watcher
+   m_castcadeTest = castcade::TestHarness::Create(this);
+   if (m_castcadeTest && m_castcadeTest->NeverPauses())
+      m_pause = false;
+
    m_ptable->m_pcv->Start(); // Hook up to events and start cranking script
 
    // Fire Init event for table object and all 'hitable' parts, also fire Animate event of parts having it since initial setup is considered as the initial animation event
@@ -1747,6 +1763,9 @@ HRESULT Player::Init()
    m_StartTime_usec = usec();
    m_curPhysicsFrameTime = m_StartTime_usec;
    m_nextPhysicsFrameTime = m_curPhysicsFrameTime + PHYSICS_STEPTIME;
+
+   // Castcade frame-hitch probe (CASTCADE_FRAMELOG): independent of any stream session
+   m_castcadeProbe = castcade::FrameProbe::Create();
 
    m_liveUI = new LiveUI(m_pin3d.m_pd3dPrimaryDevice);
 
@@ -4055,6 +4074,8 @@ void Player::OnIdle()
       {
       case 0:
       {
+         if (m_castcadeProbe)
+            m_castcadeProbe->OnFrameEnd(m_time_msec, m_phys_iterations);
          g_frameProfiler.NewFrame(m_time_msec);
          PLOGI_IF(debugLog) << "Frame Collect [Last frame length: " << ((double)g_frameProfiler.GetPrev(FrameProfiler::PROFILE_FRAME) / 1000.0) << "ms] at " << usec();
          PrepareFrame();
@@ -4133,6 +4154,8 @@ void Player::OnIdle()
       // This also leads to filling up the GPU render queue leading to a few frame latency, depending on driver setup (hence the use of a limiter).
 
       // Collect stats from previous frame and starts profiling a new frame
+      if (m_castcadeProbe)
+         m_castcadeProbe->OnFrameEnd(m_time_msec, m_phys_iterations);
       g_frameProfiler.NewFrame(m_time_msec);
 
       // In pause mode: input, physics, animation and audio are not processed but rendering is still performed. This allows to modify properties (transform, visibility,..) using the debugger and get direct feedback
@@ -4229,9 +4252,14 @@ void Player::PrepareFrame()
          }
    }
 
-   // Castcade watch role: show the streamed state and replay the player's script calls for this frame
+   // Castcade watch role: show the streamed state and replay the player's script calls for this frame (its time is
+   // the frame profiler's custom section 1, which the frame probe reports as "castcade")
    if (m_castcade && m_castcade->IsWatcher())
+   {
+      g_frameProfiler.EnterProfileSection(FrameProfiler::PROFILE_CUSTOM1);
       m_castcade->OnFrame();
+      g_frameProfiler.ExitProfileSection();
+   }
 
    // Fire all '-1' (the ones which are synced to the refresh rate) and '-2' (the ones used to sync with the controller) timers after physics and animation update but before rendering, to avoid the script being one frame late
    for (HitTimer *const pht : m_vht)
@@ -4242,9 +4270,17 @@ void Player::PrepareFrame()
          g_frameProfiler.ExitScriptSection(pht->m_name);
       }
 
+   // Castcade test tooling: this frame's scripted keys (they reach the script with the next ProcessKeys)
+   if (m_castcadeTest)
+      m_castcadeTest->OnFrame();
+
    // Castcade play role: the frame's script work is complete, send its state and script calls
    if (m_castcade && !m_castcade->IsWatcher())
+   {
+      g_frameProfiler.EnterProfileSection(FrameProfiler::PROFILE_CUSTOM1);
       m_castcade->OnFrame();
+      g_frameProfiler.ExitProfileSection();
+   }
 
    // Kill the profiler so that it does not affect performance => FIXME move to player
    if (m_infoMode != IF_PROFILING)

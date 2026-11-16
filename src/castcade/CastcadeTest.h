@@ -1,0 +1,34 @@
+// license:GPLv3+
+
+#pragma once
+
+// Castcade test tooling, independent of the stream session, so that a VPX with no session at all (the frame
+// probe's baseline runs) can be driven the same way as a player:
+//   CASTCADE_TEST_NOPAUSE=1     never pause when the window loses the focus (a watcher never does anyway)
+//   CASTCADE_TEST_INPUT=<file>  scripted key presses, fired inside VPX through the same queue a real key takes.
+//                               One event per line, '#' starts a comment:  <ms> <down|up> <key>
+//                               <ms> counts from the first frame (wall clock); <key> is start, credit, plunger,
+//                               lflip, rflip (the player's own bindings) or a decimal DirectInput scan code.
+// Its log lines ("test input ...") go to CASTCADE_STREAM_LOG when that is set, and to the VPX log.
+// Never created on a watcher.
+
+class Player;
+
+namespace castcade
+{
+
+class TestHarness
+{
+public:
+   // nullptr unless one of the variables above is set
+   static TestHarness* Create(Player* player);
+
+   virtual ~TestHarness() = default;
+
+   virtual bool NeverPauses() const = 0;
+
+   // Once per rendered frame, from Player::PrepareFrame after the frame's script timers
+   virtual void OnFrame() = 0;
+};
+
+}

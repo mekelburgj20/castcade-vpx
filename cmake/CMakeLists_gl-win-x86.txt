@@ -295,10 +295,14 @@ add_executable(vpinball WIN32
    src/audio/wavread.h
 
    src/castcade/CastcadeDispatch.h
+   src/castcade/CastcadeProbe.cpp
+   src/castcade/CastcadeProbe.h
    src/castcade/CastcadeState.cpp
    src/castcade/CastcadeState.h
    src/castcade/CastcadeStream.cpp
    src/castcade/CastcadeStream.h
+   src/castcade/CastcadeTest.cpp
+   src/castcade/CastcadeTest.h
    src/castcade/CastcadeWire.cpp
    src/castcade/CastcadeWire.h
    src/core/player.cpp

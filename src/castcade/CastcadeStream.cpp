@@ -526,18 +526,6 @@ private:
    Policy* NewPolicy(const int key, const std::string& kind, IDispatch* const sample);
    void LogSentByName(const char* const when);
 
-   // Test tooling (CASTCADE_TEST_INPUT)
-   struct TestKey
-   {
-      uint64_t ms;
-      bool down;
-      std::string key; // a binding name, or empty when code is a scan code
-      int code;
-      int line;
-   };
-   void LoadTestInput();
-   void FireTestInput(const uint64_t now);
-
    Player* const m_player;
    const bool m_watch;
    StreamLog m_log;
@@ -552,11 +540,6 @@ private:
    bool m_neverPauses = false;
    int64_t m_delayUsec = 50000;
    bool m_replaySound = true;
-
-   // Test tooling
-   std::vector<TestKey> m_testKeys;
-   size_t m_testNext = 0;
-   uint64_t m_testStart = 0;
 
    // Table identity
    uint32_t m_editCount = 0;
@@ -703,8 +686,6 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
 
    if (watch)
       m_applier = std::make_unique<StateApplier>(m_player);
-   else
-      LoadTestInput();
    // A watcher's window is rarely focused (a VR watcher's almost never): it must not start paused either
    // (Player::RecomputePauseState keeps it unpaused from here on)
    if (m_neverPauses)
@@ -1359,11 +1340,6 @@ void SessionImpl::PlayFrame(const uint64_t now)
    m_frameSeen = m_frameQueued = 0;
    m_frameTicks = 0;
 
-   if (m_testStart == 0)
-      m_testStart = now;
-   if (m_testNext < m_testKeys.size())
-      FireTestInput(now);
-
    if (m_listener)
       while (std::unique_ptr<TcpPeer> t = m_listener->Accept())
       {
@@ -1987,98 +1963,6 @@ void SessionImpl::LogStats(const uint64_t now)
    m_iFrames = 0;
    m_iBytesOut = m_iBytesIn = 0;
    m_statsStart = now;
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// Test tooling: CASTCADE_TEST_INPUT (play role; off unless the variable is set).
-//
-// Scripted key presses for automated tests, which can count on neither the focus nor a keyboard. Each event goes
-// into PinInput's queue with PushQueue(.., APP_KEYBOARD), where GetInputDeviceData puts a real key press (and the
-// touch input in Player::WndProc puts its virtual ones), so ProcessKeys handles it exactly as a real key: its own
-// checks first (exit, pause, tweak and debugger keys), then PinInput::FireKeyEvent, which tracks the pressed state
-// and fires the table's KeyDown / KeyUp events into the script.
-
-void SessionImpl::LoadTestInput()
-{
-   const std::string path = GetEnv("CASTCADE_TEST_INPUT");
-   if (path.empty())
-      return;
-   FILE* f = nullptr;
-   if (fopen_s(&f, path.c_str(), "r") != 0 || !f)
-   {
-      m_log.Error("test input: cannot read '" + path + "'; carrying on without scripted input");
-      return;
-   }
-   static const char* const names[] = { "start", "credit", "plunger", "lflip", "rflip" };
-   char line[512];
-   int lineNo = 0;
-   while (fgets(line, sizeof(line), f))
-   {
-      ++lineNo;
-      std::string s(line);
-      const size_t hash = s.find('#');
-      if (hash != std::string::npos)
-         s.resize(hash);
-      char a[64] = {}, b[64] = {}, c[64] = {}, extra[8] = {};
-      const int got = sscanf_s(s.c_str(), "%63s %63s %63s %7s", a, (unsigned)sizeof(a), b, (unsigned)sizeof(b), c, (unsigned)sizeof(c), extra, (unsigned)sizeof(extra));
-      if (got <= 0)
-         continue; // blank or comment
-      TestKey k { 0, false, std::string(), 0, lineNo };
-      bool ok = got == 3;
-      char* end = nullptr;
-      k.ms = strtoull(a, &end, 10);
-      ok = ok && end != a && *end == '\0';
-      if (strcmp(b, "down") == 0)
-         k.down = true;
-      else if (strcmp(b, "up") != 0)
-         ok = false;
-      if (std::find_if(std::begin(names), std::end(names), [&c](const char* n) { return strcmp(n, c) == 0; }) != std::end(names))
-         k.key = c;
-      else
-      {
-         const long code = strtol(c, &end, 10);
-         if (end == c || *end != '\0' || code < 1 || code > 255)
-            ok = false;
-         k.code = (int)code;
-      }
-      if (!ok)
-      {
-         while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
-            s.pop_back();
-         m_log.Warn(Fmt("test input line %d is not '<ms> <down|up> <start|credit|plunger|lflip|rflip|scan code>', skipped: %s", lineNo, s.c_str()));
-         continue;
-      }
-      m_testKeys.push_back(k);
-   }
-   fclose(f);
-   std::stable_sort(m_testKeys.begin(), m_testKeys.end(), [](const TestKey& x, const TestKey& y) { return x.ms < y.ms; });
-   m_log.Info(Fmt("test input: %zu events from '%s', the last at %llu ms", m_testKeys.size(), path.c_str(),
-      m_testKeys.empty() ? 0ull : (unsigned long long)m_testKeys.back().ms));
-}
-
-void SessionImpl::FireTestInput(const uint64_t now)
-{
-   const uint64_t elapsedMs = (now - m_testStart) / 1000;
-   while (m_testNext < m_testKeys.size() && m_testKeys[m_testNext].ms <= elapsedMs)
-   {
-      const TestKey& k = m_testKeys[m_testNext++];
-      int code = k.code;
-      if (!k.key.empty()) // resolved now, through the player's own key bindings
-      {
-         const EnumAssignKeys which = k.key == "start" ? eStartGameKey : k.key == "credit" ? eAddCreditKey : k.key == "plunger" ? ePlungerKey
-                                    : k.key == "lflip" ? eLeftFlipperKey : eRightFlipperKey;
-         code = (int)m_player->m_rgKeys[which];
-      }
-      DIDEVICEOBJECTDATA d = {};
-      d.dwOfs = (DWORD)code;
-      d.dwData = k.down ? 0x80 : 0;
-      d.dwTimeStamp = msec();
-      m_player->m_pininput.PushQueue(&d, APP_KEYBOARD);
-      m_log.Info(Fmt("test input at %llu ms (line %d, due %llu ms): %s %s, code %d", (unsigned long long)elapsedMs, k.line, (unsigned long long)k.ms,
-         k.key.empty() ? "scan code" : k.key.c_str(), k.down ? "down" : "up", code));
-   }
-   if (m_testNext == m_testKeys.size())
-      m_log.Info("test input finished");
 }
 
 } // namespace

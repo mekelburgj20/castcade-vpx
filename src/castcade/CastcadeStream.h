@@ -26,12 +26,8 @@
 //   CASTCADE_STREAM_SOUND     watch: 0 = do not replay sound calls (default 1)
 //   CASTCADE_STREAM_LOG       a file to append timestamped log lines to (they also go to the VPX log)
 //
-// Test switches (automated two-instance tests on one desktop, where neither window can count on the focus):
-//   CASTCADE_TEST_NOPAUSE=1   play: never pause when the window loses the focus (a watcher never does anyway)
-//   CASTCADE_TEST_INPUT=<file>  play: scripted key presses, fired inside VPX through the same queue a real key
-//                             takes. One event per line, '#' starts a comment:  <ms> <down|up> <key>
-//                             <ms> counts from the session's first frame (wall clock); <key> is start, credit,
-//                             plunger, lflip, rflip (the player's own bindings) or a decimal DirectInput scan code.
+// Test switches (CASTCADE_TEST_NOPAUSE, CASTCADE_TEST_INPUT) work with or without a session: CastcadeTest.h.
+// The frame-hitch probe (CASTCADE_FRAMELOG) too: CastcadeProbe.h.
 //
 // The engine hooks (src/core/player.cpp) each call one of the members below; with no session every hook is a
 // single null test, and the script call hook (CastcadeDispatch.h) a single bool test.

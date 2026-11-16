@@ -13,7 +13,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <iterator>
 #include <mutex>
+#include <share.h>
 #include <thread>
 
 namespace castcade
@@ -1239,6 +1242,7 @@ private:
          const bool stop = m_stop;
          lock.unlock();
          size_t done = 0;
+         const uint64_t t0 = NowUsec();
          while (done < batch.size() && !m_failed)
          {
             DWORD wrote = 0;
@@ -1247,6 +1251,8 @@ private:
                Fail(Win32Error("writing the recording", GetLastError()));
             done += wrote;
          }
+         if (done)
+            ReportIo("recorder", t0, NowUsec(), done);
          batch.clear();
          lock.lock();
          if (stop)
@@ -1285,6 +1291,135 @@ std::unique_ptr<StreamRecorder> CreateRecorder(const std::wstring& path, const R
       return nullptr;
    }
    return std::make_unique<FileRecorder>(file, path, info);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Async line writer and the I/O observer
+
+namespace
+{
+
+std::atomic<IoObserver> g_ioObserver { nullptr };
+
+class FileLineWriter final : public AsyncLineWriter
+{
+public:
+   FileLineWriter(FILE* const file, const char* const ioName, std::function<void(const std::string&)> mirror)
+      : m_file(file)
+      , m_ioName(ioName)
+      , m_mirror(std::move(mirror))
+   {
+      m_thread = std::thread([this] { Run(); });
+   }
+
+   ~FileLineWriter() override
+   {
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_stop = true;
+      }
+      m_cv.notify_all();
+      if (m_thread.joinable())
+         m_thread.join();
+      fclose(m_file);
+   }
+
+   void Line(std::string line) override
+   {
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_queue.push_back(std::move(line));
+         ++m_queued;
+      }
+      m_cv.notify_one();
+   }
+
+   void Flush() override
+   {
+      std::unique_lock<std::mutex> lock(m_mutex);
+      const uint64_t target = m_queued;
+      m_cv.notify_all();
+      m_done.wait(lock, [&] { return m_written >= target || m_stop; });
+   }
+
+   uint64_t LinesWritten() const override
+   {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      return m_written;
+   }
+
+private:
+   void Run()
+   {
+      std::vector<std::string> batch;
+      std::string text;
+      std::unique_lock<std::mutex> lock(m_mutex);
+      for (;;)
+      {
+         m_cv.wait(lock, [this] { return m_stop || !m_queue.empty(); });
+         batch.assign(std::make_move_iterator(m_queue.begin()), std::make_move_iterator(m_queue.end()));
+         m_queue.clear();
+         const bool stop = m_stop;
+         lock.unlock();
+         if (!batch.empty())
+         {
+            text.clear();
+            for (const std::string& s : batch)
+            {
+               text += s;
+               text += '\n';
+            }
+            const uint64_t t0 = NowUsec();
+            fwrite(text.data(), 1, text.size(), m_file);
+            fflush(m_file);
+            if (m_ioName)
+               ReportIo(m_ioName, t0, NowUsec(), text.size());
+            if (m_mirror)
+               for (const std::string& s : batch)
+                  m_mirror(s);
+         }
+         lock.lock();
+         m_written += batch.size();
+         batch.clear();
+         m_done.notify_all();
+         if (stop && m_queue.empty())
+            break;
+      }
+   }
+
+   FILE* const m_file;
+   const char* const m_ioName;
+   const std::function<void(const std::string&)> m_mirror;
+   std::thread m_thread;
+   mutable std::mutex m_mutex;
+   std::condition_variable m_cv, m_done;
+   std::deque<std::string> m_queue; // guarded by m_mutex
+   uint64_t m_queued = 0, m_written = 0; // guarded by m_mutex
+   bool m_stop = false;                  // guarded by m_mutex
+};
+
+} // namespace
+
+std::unique_ptr<AsyncLineWriter> OpenAsyncLineWriter(const std::string& path, const char* const ioName, std::function<void(const std::string&)> mirror)
+{
+   if (path.empty())
+      return nullptr;
+   FILE* const f = _fsopen(path.c_str(), "a", _SH_DENYNO);
+   if (!f)
+      return nullptr;
+   return std::make_unique<FileLineWriter>(f, ioName, std::move(mirror));
+}
+
+void SetIoObserver(const IoObserver observer)
+{
+   g_ioObserver.store(observer);
+}
+
+void ReportIo(const char* const what, const uint64_t startUsec, const uint64_t endUsec, const size_t bytes)
+{
+   const IoObserver o = g_ioObserver.load();
+   if (o)
+      o(what, startUsec, endUsec, bytes);
 }
 
 }

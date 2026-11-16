@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -333,5 +334,34 @@ public:
 
 // Creates (or replaces) the file at path; its folder must exist. Returns nullptr and sets err on failure.
 std::unique_ptr<StreamRecorder> CreateRecorder(const std::wstring& path, const RecordingInfo& info, std::string& err);
+
+// ---------------------------------------------------------------------------------------------------------
+// Text logs written off the caller's thread. A line is queued under one short lock; a thread of the writer's own
+// appends the queue to the file and flushes it. A slow or stuck disk (an antivirus scan, a synced folder) therefore
+// never stalls the render thread, which a synchronous fprintf + fflush of the stream log once did for 62 ms.
+
+class AsyncLineWriter
+{
+public:
+   virtual ~AsyncLineWriter() = default; // writes what is queued and closes
+
+   // Queues one line (without its newline). Never blocks on the disk.
+   virtual void Line(std::string line) = 0;
+   // Writes what is queued and waits until it is on the file (used before a process may end abruptly)
+   virtual void Flush() = 0;
+   virtual uint64_t LinesWritten() const = 0;
+};
+
+// Opens path for appending, shared for reading and writing (two VPX instances may append to one file). ioName, if
+// not null, names the writer's writes to the I/O observer below. mirror, if given, is called on the writer thread
+// with each line after it was written. Returns nullptr when the file cannot be opened.
+std::unique_ptr<AsyncLineWriter> OpenAsyncLineWriter(const std::string& path, const char* ioName = nullptr, std::function<void(const std::string&)> mirror = {});
+
+// Every file write the recorder and the async line writers make is reported here when an observer is set (the
+// frame probe sets one, to show that no long frame of the render thread coincides with a write): what wrote, the
+// write's start and end (NowUsec) and its byte count. Called on the writing thread.
+using IoObserver = void (*)(const char* what, uint64_t startUsec, uint64_t endUsec, size_t bytes);
+void SetIoObserver(IoObserver observer);
+void ReportIo(const char* what, uint64_t startUsec, uint64_t endUsec, size_t bytes);
 
 }

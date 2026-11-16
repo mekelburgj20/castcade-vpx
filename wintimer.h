@@ -372,6 +372,20 @@ public:
          return sum <= 0 ? 0. : (double) latency / (double) sum;
    }
    
+   // Castcade frame probe (src/castcade/CastcadeProbe.cpp): the current frame's script events (DISPID, calls,
+   // microseconds) and its timer log (each timer's name, then its microseconds as a U32), read just before NewFrame
+   // clears them
+   template <class F> void ForEachScriptEvent(F&& f) const
+   {
+      for (const auto& v : m_scriptEventData)
+         f(v.first, v.second.callCount, v.second.totalLength);
+   }
+   const char* GetTimerLog(size_t& len) const
+   {
+      len = m_profileTimersPos;
+      return m_profileTimers;
+   }
+
    void OnProcessInput()
    {
       unsigned long long ts = usec();
