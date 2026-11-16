@@ -23,6 +23,7 @@ param(
     [int]$Width = 960,
     [int]$Height = 540,
     [switch]$KeepOpen,
+    [int]$Seed = 1,
     [int]$WindowTimeout = 120,
     [string]$Template = 'C:\code\repos\castcade-vpx-deps\run\smoke.template.ini'
 )
@@ -42,7 +43,7 @@ function Log([string]$m) {
 
 # ---------------------------------------------------------------- helper types (fail before launching anything)
 try {
-    if ([IntPtr]::Size -ne 8) { throw 'needs a 64-bit PowerShell (SendInput struct layout)' }
+    if ([IntPtr]::Size -ne 8) { throw 'needs a 64-bit PowerShell' }
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
     Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
@@ -57,26 +58,11 @@ public static class PairWin {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-    [DllImport("user32.dll")] static extern void SwitchToThisWindow(IntPtr h, bool altTab);
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inp, int size);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
-    [StructLayout(LayoutKind.Explicit, Size = 40)] public struct INPUT {
-        [FieldOffset(0)] public uint type;
-        [FieldOffset(8)] public ushort wVk;
-        [FieldOffset(10)] public ushort wScan;
-        [FieldOffset(12)] public uint dwFlags;
-        [FieldOffset(16)] public uint time;
-        [FieldOffset(24)] public IntPtr extra;
-    }
     public class Win { public IntPtr H; public string Title; public string Cls; public bool Visible;
         public override string ToString() { return string.Format("0x{0:X} cls='{1}' title='{2}' visible={3}", H.ToInt64(), Cls, Title, Visible); } }
     public static void PerMonitorDpi() { SetThreadDpiAwarenessContext(new IntPtr(-4)); }
@@ -96,29 +82,6 @@ public static class PairWin {
     public static uint PidOf(IntPtr h) { uint pid; GetWindowThreadProcessId(h, out pid); return pid; }
     public static RECT Bounds(IntPtr h) {
         RECT r; if (DwmGetWindowAttribute(h, 9, out r, Marshal.SizeOf(typeof(RECT))) != 0) GetWindowRect(h, out r); return r;
-    }
-    // Plain SetForegroundWindow first; only if that fails, share input state with the current foreground thread for one call.
-    public static bool TryForeground(IntPtr h) {
-        if (GetForegroundWindow() == h) return true;
-        SetForegroundWindow(h);
-        if (GetForegroundWindow() == h) return true;
-        IntPtr fg = GetForegroundWindow(); uint fgPid;
-        uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, out fgPid);
-        uint me = GetCurrentThreadId(); bool att = false;
-        if (fgThread != 0 && fgThread != me) att = AttachThreadInput(me, fgThread, true);
-        BringWindowToTop(h); SetForegroundWindow(h);
-        if (att) AttachThreadInput(me, fgThread, false);
-        if (GetForegroundWindow() == h) return true;
-        SwitchToThisWindow(h, true);   // focus API only; sends no input to anyone
-        System.Threading.Thread.Sleep(30);
-        return GetForegroundWindow() == h;
-    }
-    // Scancode key event (DirectInput scancodes, as VPX reads them). Returns true if the OS accepted it.
-    public static bool Key(int sc, bool down) {
-        var i = new INPUT[1];
-        i[0].type = 1; i[0].wScan = (ushort)(sc & 0x7F);
-        i[0].dwFlags = 0x0008u | (down ? 0u : 0x0002u) | (sc > 0x7F ? 0x0001u : 0u);
-        return SendInput(1, i, 40) == 1;
     }
     // mean abs diff (0..255 over RGB) and % of pixels whose per-pixel mean abs RGB diff exceeds 40; inputs are BGRA bytes
     public static double[] Diff(byte[] a, byte[] b) {
@@ -249,16 +212,18 @@ function Start-Instance($inst) {
     $psi.UseShellExecute = $false
     $psi.WorkingDirectory = $inst.Dir
     foreach ($a in @('-Ini', $inst.Ini, '/ExtMinimized', '-Play', $inst.Table)) { $psi.ArgumentList.Add($a) }
-    foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CASTCADE_STREAM*' })) { [void]$psi.Environment.Remove($k) }
+    foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CASTCADE_*' })) { [void]$psi.Environment.Remove($k) }
     $log = Join-Path $inst.Dir 'castcade.log'
     if ($inst.Name -eq 'play') {
         $psi.Environment['CASTCADE_STREAM'] = 'play'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = "$Port"
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = "listen:127.0.0.1:$Port"
+        if ($Drive -eq 'game') { $psi.Environment['CASTCADE_TEST_INPUT'] = $InputFile }
     } else {
         $psi.Environment['CASTCADE_STREAM'] = 'watch'
-        $psi.Environment['CASTCADE_STREAM_ADDR'] = "127.0.0.1:$Port"
+        $psi.Environment['CASTCADE_STREAM_ADDR'] = "connect:127.0.0.1:$Port"
         $psi.Environment['CASTCADE_STREAM_DELAY_MS'] = "$DelayMs"
     }
+    $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1'
     $psi.Environment['CASTCADE_STREAM_LOG'] = $log
     Log ("start {0}: `"{1}`" {2}  [cwd {3}]" -f $inst.Name, $inst.Exe, (($psi.ArgumentList | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) -join ' '), $inst.Dir)
     $p = [Diagnostics.Process]::Start($psi)
@@ -286,60 +251,32 @@ function Save-Capture([IntPtr]$h, [string]$path) {
 }
 
 # ---------------------------------------------------------------- input (every key event is gated on foreground)
-$In = @{ Sent = 0; Skipped = 0; FgNames = @{}; FgFails = 0; Pending = New-Object System.Collections.Generic.List[object]; Stuck = @(); DownSent = @{}; DownSkipped = @{} }
-function Ensure-FG([IntPtr]$h) {
-    if ([PairWin]::GetForegroundWindow() -eq $h) { return $true }
-    [void][PairWin]::TryForeground($h)
-    Start-Sleep -Milliseconds 30
-    if ([PairWin]::GetForegroundWindow() -eq $h) { return $true }
-    $fg = [PairWin]::GetForegroundWindow(); $nm = '(none)'
-    if ($fg -ne [IntPtr]::Zero) { $nm = try { (Get-Process -Id ([PairWin]::PidOf($fg)) -ErrorAction Stop).Name } catch { '(unknown)' } }
-    $In.FgFails++; $In.FgNames[$nm] = 1 + [int]$In.FgNames[$nm]
-    if ($In.FgFails -le 3) { Log "could not take the foreground for my play window; foreground process is '$nm'" }
-    $false
-}
-function Do-Key($ev) {
-    $h = $I.play.Win
-    if ($ev.dir -eq 'down') {
-        if ($h -and (Ensure-FG $h) -and [PairWin]::Key($ev.sc, $true)) { $In.Sent++; $In.DownSent[$ev.id] = $ev }
-        else { $In.Skipped++; $In.DownSkipped[$ev.id] = 1 }
-    } elseif ($In.DownSent.ContainsKey($ev.id)) {
-        if ($h -and (Ensure-FG $h) -and [PairWin]::Key($ev.sc, $false)) { $In.Sent++; $In.DownSent.Remove($ev.id) }
-        else { $In.Pending.Add($ev) }   # keep retrying the release; never leave a pressed key behind if the window comes back
-    }
-}
-function Flush-Pending([switch]$Final) {
-    if ($In.Pending.Count -eq 0) { return }
-    $h = $I.play.Win
-    if ($h -and (Ensure-FG $h)) {
-        foreach ($e in @($In.Pending)) { if ([PairWin]::Key($e.sc, $false)) { $In.Sent++; $In.DownSent.Remove($e.id); [void]$In.Pending.Remove($e) } }
-    }
-    if ($Final -and $In.Pending.Count -gt 0) { $In.Stuck = @($In.Pending | ForEach-Object { $_.sc }); Log "WARNING: key(s) $($In.Stuck -join ',') were pressed by me and could not be released (no foreground)" }
-}
-# deterministic drive schedule, seconds after the play window appeared
-$driveEv = New-Object System.Collections.Generic.List[object]
+# ---------------------------------------------------------------- test input script (fired inside VPX via CASTCADE_TEST_INPUT)
+# Lines: "<ms> <down|up> <key>", ms from the play instance's first rendered frame. The harness sends no input to any window.
+$InputFile = Join-Path $Run 'play\input.txt'
+$InputCount = 0
 if ($Drive -eq 'game') {
-    $rng = [Random]::new(1234); $nid = 0
-    $tap = { param([double]$t, [int]$sc, [double]$hold)
-        $id = $script:nid++
-        $driveEv.Add([pscustomobject]@{ t = $t; dir = 'down'; sc = $sc; id = $id })
-        $driveEv.Add([pscustomobject]@{ t = $t + $hold; dir = 'up'; sc = $sc; id = $id })
+    $ev = New-Object System.Collections.Generic.List[object]
+    $end = ($Seconds + 10) * 1000
+    $tap = { param([int]$t, [string]$key, [int]$hold)
+        if ($t + $hold -le $end) { $ev.Add([pscustomobject]@{ t = $t; o = 1; line = "$t down $key" }); $ev.Add([pscustomobject]@{ t = $t + $hold; o = 0; line = "$($t + $hold) up $key" }) } }
+    $rng = [Random]::new($Seed)
+    & $tap 8000 'credit' 150; & $tap 8600 'credit' 150; & $tap 9200 'start' 150
+    & $tap 12350 'plunger' 1200
+    $t = 14000; $alt = 0; $nextPlunge = 24350; $nextStart = 54200
+    while ($t -lt $end) {
+        $hold = 120 + $rng.Next(0, 181)
+        if ($rng.Next(0, 5) -eq 0) { & $tap $t 'lflip' $hold; & $tap $t 'rflip' $hold }
+        else { & $tap $t $(if ($alt % 2 -eq 0) { 'lflip' } else { 'rflip' }) $hold; $alt++ }
+        $t += 700 + $rng.Next(0, 901)
+        while ($nextPlunge -le $t) { & $tap $nextPlunge 'plunger' 1200; $nextPlunge += 12000 }
+        while ($nextStart -le $t) { & $tap $nextStart 'start' 150; $nextStart += 45000 }
     }
-    $horizon = $Seconds + $WatchDelaySeconds + $WindowTimeout + 30
-    & $tap 8.0 $Keys.AddCreditKey 0.1; & $tap 8.5 $Keys.AddCreditKey 0.1; & $tap 9.0 $Keys.StartGameKey 0.1
-    & $tap 12.0 $Keys.PlungerKey 1.2
-    $t = 14.0; $alt = 0; $nextPlunge = 24.0; $nextStart = 54.0
-    while ($t -lt $horizon) {
-        $hold = (120 + $rng.Next(0, 181)) / 1000.0
-        if ($rng.Next(0, 5) -eq 0) { & $tap $t $Keys.LFlipKey $hold; & $tap $t $Keys.RFlipKey $hold }
-        else { & $tap $t $(if ($alt % 2 -eq 0) { $Keys.LFlipKey } else { $Keys.RFlipKey }) $hold; $alt++ }
-        $t += 0.7 + $rng.NextDouble() * 0.9
-        if ($t -ge $nextPlunge) { & $tap $nextPlunge $Keys.PlungerKey 1.2; $nextPlunge += 12 }
-        if ($t -ge $nextStart) { & $tap $nextStart $Keys.StartGameKey 0.1; $nextStart += 45 }
-    }
-    $sorted = @($driveEv | Sort-Object t, @{ e = { if ($_.dir -eq 'up') { 0 } else { 1 } } })   # release before a same-instant press
-    $driveEv.Clear(); $sorted | ForEach-Object { $driveEv.Add($_) }
-    Log "drive schedule: $($driveEv.Count) key events over $([int]$horizon) s (seeded)"
+    $sorted = @($ev | Sort-Object t, o)   # at the same instant: up before down
+    $lines = @("# generated by pair.ps1 (seed $Seed): <ms from first rendered frame> <down|up> <key>") + @($sorted | ForEach-Object { $_.line })
+    [IO.File]::WriteAllLines($InputFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    $InputCount = $sorted.Count
+    Log "wrote $InputCount events to $InputFile (seed $Seed, $end ms)"
 }
 
 # ---------------------------------------------------------------- run
@@ -378,11 +315,6 @@ try {
             }
             $shotEv = [System.Collections.Generic.List[object]]@($shotEv | Sort-Object t)
         }
-        # input
-        if ($tPlay -and $Drive -eq 'game') {
-            while ($di -lt $driveEv.Count -and ($now - $tPlay) -ge $driveEv[$di].t) { Do-Key $driveEv[$di]; $di++ }
-            Flush-Pending
-        }
         # screenshots (PrintWindow: no focus change)
         if ($tBoth) {
             while ($si -lt $shotEv.Count -and ($now - $tBoth) -ge $shotEv[$si].t) {
@@ -400,7 +332,6 @@ try {
 } finally {
     # ------------------------------------------------------------ cleanup (always)
     try {
-        try { Flush-Pending -Final } catch { Log "release of pending keys failed: $_" }
         if ($KeepOpen -and -not $fail) {
             Log ("-KeepOpen: leaving instances running. play PID {0}, watch PID {1}" -f $I.play.Pid, $I.watch.Pid)
         } else {
@@ -489,9 +420,10 @@ foreach ($n in 'play', 'watch') {
     if ($others) { Log "  other visible windows seen for ${n}: $($others -join ' ; ')" }
 }
 if ($Drive -eq 'game') {
-    Log ("input: {0} key events sent, {1} key-down(s) skipped for lack of foreground{2}" -f $In.Sent, $In.Skipped, $(if ($In.Skipped -gt 0) { '  ** INPUT WAS SKIPPED **' } else { '' }))
-    if ($In.FgFails -gt 0) { Log ("  foreground failures {0}; foreground processes seen: {1}" -f $In.FgFails, (($In.FgNames.Keys | ForEach-Object { "$_ x$($In.FgNames[$_])" }) -join ', ')) }
-    if ($In.Stuck.Count) { Log "  keys left pressed: $($In.Stuck -join ',')" }
+    $played = 'castcade.log (play) not written'
+    $pl = Join-Path $I.play.Dir 'castcade.log'
+    if (Test-Path -LiteralPath $pl) { $played = "{0} 'test input' lines in play\castcade.log" -f @(Get-Content -LiteralPath $pl | Where-Object { $_ -match 'test input' }).Count }
+    Log "input: $InputCount events written to $InputFile; $played"
 } else { Log 'input: none (-Drive none)' }
 if ($rows.Count) { Log 'compare (play vs watch, 192x108):'; $rows | Select-Object time, mean_abs_diff, pct_over_40 | Format-Table -AutoSize | Out-String -Width 120 | ForEach-Object { $_.TrimEnd() } | Write-Host }
 else { Log 'compare: no complete screenshot pairs' }
