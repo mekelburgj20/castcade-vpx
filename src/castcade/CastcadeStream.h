@@ -14,7 +14,14 @@
 //                               listen:<ipv4>:<port>             listen on that interface only (tests: 127.0.0.1,
 //                                                                which raises no Windows firewall prompt)
 //                               connect:<host>:<port> or <host>:<port>   connect, retrying every 2 s
-//                             Play default: listen on every interface, port 47800. Watch has no default.
+//                             Play default: listen on every interface, port 47800 (none when recording, below).
+//                             Watch has no default.
+//   CASTCADE_STREAM_RECORD    play: also write the stream to a file, exactly as a watcher connected from the
+//                             first frame would receive it, each message stamped with its time (format in
+//                             CastcadeWire.h; tools/castcade/launchers/castcade-replay.ps1 plays it to a
+//                             watcher). A folder (one that exists, a path ending in \, or a last part with no
+//                             extension) gets <table>.<yyyyMMdd-HHmmss>.castrec and is created if needed.
+//                             Without CASTCADE_STREAM_ADDR a recording player opens no socket at all.
 //   CASTCADE_STREAM_DELAY_MS  watch: how far behind the newest received frame to render (default 50)
 //   CASTCADE_STREAM_SOUND     watch: 0 = do not replay sound calls (default 1)
 //   CASTCADE_STREAM_LOG       a file to append timestamped log lines to (they also go to the VPX log)
