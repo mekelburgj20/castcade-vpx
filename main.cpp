@@ -385,8 +385,10 @@ public:
 
       m_szTableFileName.clear();
 
-      // Default ini path (can be overriden from command line)
-      m_szIniFileName = m_vpinball.m_szMyPrefPath + "VPinballX.ini"s;
+      // No ini chosen yet: -Ini on the command line sets it, otherwise the default is picked after the arguments
+      // (an ini next to the exe first, then the preference folder). Setting the preference-folder path here made
+      // that check dead code, so a portable install's ini was ignored unless -Ini was passed.
+      m_szIniFileName.clear();
 
       int nArgs;
       LPSTR *szArglist = CommandLineToArgvA(GetCommandLine(), &nArgs);
