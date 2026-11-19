@@ -89,7 +89,11 @@
 // state beside its play state, sequencer locks, animation phases, which hit objects collide, the timers, the game
 // clock); CASTCADE_TEST_BALLLOG=<ms> logs the local balls every <ms> while the table plays;
 // CASTCADE_TEST_MATCHNOUNDO=1 leaves the properties and the runtime state of a watch phase in place on purpose, to
-// show that the check and the pictures see a table that did not come back.
+// show that the check and the pictures see a table that did not come back; CASTCADE_TEST_UNDOLIMIT=<n> lowers the
+// number of properties a stream may put, so that a real stream passes it (state failed overflow);
+// CASTCADE_TEST_MUSIC=<file> calls the table's PlayMusic with that file 5 s into the session;
+// CASTCADE_TEST_OPTIONEVENT=1 fires the tweak menu's "table option changed" event once in every watch phase, after
+// the keyframe.
 //
 // The engine hooks (src/core/player.cpp) each call one of the members below; with no session every hook is a
 // single null test, and the script call hook (CastcadeDispatch.h) a single bool test.

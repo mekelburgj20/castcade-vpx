@@ -21,7 +21,8 @@ param(
     # closewhile: B watches A and B's table is closed (the way out through the session's destructor).
     # longwatch: B watches A for -LongMinutes; memory and handles of B before and after. focus: no CASTCADE_TEST_NOPAUSE:
     #   the instance whose window does not have the focus is paused by VPX, and is sent to watch and called back all the same.
-    [ValidateSet('swap', 'visit', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost', 'stalled', 'deadwatch', 'closewhile', 'longwatch', 'focus')][string]$Scenario = 'swap',
+    # overflow: B, whose undo list is limited to 10 entries (CASTCADE_TEST_UNDOLIMIT), is told to watch A: state failed overflow.
+    [ValidateSet('swap', 'visit', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost', 'stalled', 'deadwatch', 'closewhile', 'longwatch', 'focus', 'overflow')][string]$Scenario = 'swap',
     [string]$OtherTable,
     [string]$Exe = 'C:\code\repos\castcade-vpx-wt-handoff\build\Release\VPinballX_GL64.exe',
     # The instances run from a copy of the exe under this name, beside it: the installed Castcade companion takes any
@@ -32,13 +33,22 @@ param(
     [string[]]$YieldTo = @('ccmatch_GL64'),
     [switch]$Sound,                  # ini: PlaySound = 1 and PlayMusic = 1, both at volume 0 (the sound and music code runs, nothing is heard)
     [switch]$StreamSound,            # CASTCADE_STREAM_SOUND=1: the watched stream's sound calls are replayed (a match runs with 0)
+    # CASTCADE_TEST_OPTIONEVENT=1: every match instance fires the tweak menu's "table option changed" event once in each
+    # watch phase, while the other table is shown; each must be kept from the script and fired at the return
+    [switch]$OptionEvent,
+    # Every key of the scripted game comes this much later: the tables stay in their attract mode that long (an original
+    # table plays its light sequences there), the first watch phases happen in it, and the game then starts
+    [int]$AttractSeconds = 0,
+    [ValidateRange(0, 1)][int]$CacheMode = 0,  # the ini's CacheMode: 1 = VPX loads every texture to the GPU before the game starts
     # With -Sound: a piece of music (copied into the run folder) that each match instance plays through the table's own
     # PlayMusic 5 s after its start (CASTCADE_TEST_MUSIC), longer than the run. The tables on this PC that call PlayMusic
     # themselves all need PinUP Player.
     [string]$MusicFile = 'C:\Users\mekel\Documents\Emulators\VPX\VisualPinballX\music\TNA\TNA10.mp3',
     # A patched table, as real match tables are: the table's sidecar script (the owner's <table>.vbs, which loads the
     # hook) and the hook library castcade.vbs. Each instance then plays its own copy "cchand-<x> <table>.vpx" with both
-    # beside it, and writes its own journal %LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl, removed at the end.
+    # beside it; in the sidecar's copy the table id of Castcade_Init gets the prefix "cchand-<x> " (the id names the
+    # journal) and Castcade_Guard's two paths become the copies'. The journal
+    # %LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl is removed at the end.
     [string]$Sidecar,
     [string]$HookLib = 'C:\Users\mekel\Documents\Emulators\VPX\VisualPinballX\scripts\castcade.vbs',
     [int]$PlayOutSeconds = 0,        # after the scenario: both tables play on this long with no flipper pressed (the games end)
@@ -165,7 +175,7 @@ if (-not (Test-Path -LiteralPath $RunExe) -or (Get-FileHash -LiteralPath $RunExe
 # instances of this scenario: name, role, table
 $Names = @(switch ($Scenario) {
     'swap' { 'a', 'b' } 'visit' { 'a', 'b' } 'stalled' { 'a', 'b' } 'nolistener' { 'a' } 'controllost' { 'a', 'b' } 'mismatch' { 'a', 'b' } 'reaim' { 'a', 'b', 'c' } 'plainwatch' { 'a', 'b', 'w' }
-    'contract' { 'a', 'b' } 'streamlost' { 'a', 'b' } 'deadwatch' { 'a', 'b' } 'closewhile' { 'a', 'b' } 'longwatch' { 'a', 'b' } 'focus' { 'a', 'b' }
+    'contract' { 'a', 'b' } 'streamlost' { 'a', 'b' } 'deadwatch' { 'a', 'b' } 'closewhile' { 'a', 'b' } 'longwatch' { 'a', 'b' } 'focus' { 'a', 'b' } 'overflow' { 'a', 'b' }
 })
 $I = [ordered]@{}
 $ix = 0
@@ -216,7 +226,20 @@ if ($Sidecar) {
         $tdir = Join-Path $x.Dir 'table'; New-Item -ItemType Directory -Force $tdir | Out-Null
         $base = "cchand-$n " + [IO.Path]::GetFileNameWithoutExtension($x.Table)
         Copy-Item -LiteralPath $x.Table -Destination (Join-Path $tdir "$base.vpx")
-        Copy-Item -LiteralPath $Sidecar -Destination (Join-Path $tdir "$base.vbs")
+        # The sidecar names its journal itself (Castcade_Init "<table id>": the journal is <table id>.jsonl, whatever the
+        # file is called) and names two files Castcade_Guard may act on (the original .vpx it compares, and the sidecar
+        # it renames to .stale when that one changed). In this instance's copy the id gets the prefix cchand-<x> and
+        # both paths are the copies': the test writes a journal of its own name and cannot reach the owner's files.
+        # Bytes are kept as they are (Latin-1 round trip).
+        $l1 = [Text.Encoding]::GetEncoding(28591); $vbs = [IO.File]::ReadAllText($Sidecar, $l1)
+        $rxInit = [regex]'(?m)^(\s*Castcade_Init\s+")([^"]*)(")'
+        if (-not $rxInit.IsMatch($vbs)) { Fail "-Sidecar $Sidecar has no Castcade_Init line: not a Castcade sidecar" }
+        $vbs = $rxInit.Replace($vbs, { param($m) $m.Groups[1].Value + "cchand-$n " + $m.Groups[2].Value + $m.Groups[3].Value }, 1)
+        $rxGuard = [regex]'(?m)^(\s*Castcade_Guard\s+")([^"]*)("\s*,[^"]*"[^"]*"\s*,\s*")([^"]*)(")'
+        if ($vbs -match '(?m)^\s*Castcade_Guard\b' -and -not $rxGuard.IsMatch($vbs)) { Fail "-Sidecar ${Sidecar}: the Castcade_Guard line is not in the form this test knows; not run, since it names the owner's files" }
+        $vpxCopy = Join-Path $tdir "$base.vpx"; $vbsCopy = Join-Path $tdir "$base.vbs"
+        $vbs = $rxGuard.Replace($vbs, { param($m) $m.Groups[1].Value + $vpxCopy + $m.Groups[3].Value + $vbsCopy + $m.Groups[5].Value }, 1)
+        [IO.File]::WriteAllText($vbsCopy, $vbs, $l1)
         Copy-Item -LiteralPath $HookLib -Destination (Join-Path $tdir 'castcade.vbs')
         $x.Table = Join-Path $tdir "$base.vpx"; $x.Patched = $true
     }
@@ -304,7 +327,7 @@ $Keys = [ordered]@{ StartGameKey = 2; AddCreditKey = 6; PlungerKey = 28; LFlipKe
 function New-Ini([string]$dest, [int]$posX, [int]$posY) {
     $set = [ordered]@{
         'Player'   = [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = "$posY";
-                                 PlaySound = $(if ($Sound) { '1' } else { '0' }); PlayMusic = $(if ($Sound) { '1' } else { '0' }); CacheMode = '0' }
+                                 PlaySound = $(if ($Sound) { '1' } else { '0' }); PlayMusic = $(if ($Sound) { '1' } else { '0' }); CacheMode = "$CacheMode" }
         'PlayerVR' = [ordered]@{ AskToTurnOn = '2' }
         'Editor'   = [ordered]@{ EnableLog = '1' }
     }
@@ -339,7 +362,8 @@ function Write-Input([string]$file, [int]$seed) {
     $end = $FlipEndSeconds * 1000
     $last = ($FlipEndSeconds + $PlayOutSeconds) * 1000
     $tap = { param([int]$t, [string]$key, [int]$hold)
-        if ($t + $hold -le $last) { $ev.Add([pscustomobject]@{ t = $t; o = 1; line = "$t down $key" }); $ev.Add([pscustomobject]@{ t = $t + $hold; o = 0; line = "$($t + $hold) up $key" }) } }
+        $t += $AttractSeconds * 1000
+        if ($t + $hold -le $last + $AttractSeconds * 1000) { $ev.Add([pscustomobject]@{ t = $t; o = 1; line = "$t down $key" }); $ev.Add([pscustomobject]@{ t = $t + $hold; o = 0; line = "$($t + $hold) up $key" }) } }
     $rng = [Random]::new($seed)
     & $tap 8000 'credit' 150; & $tap 8600 'credit' 150
     if ($PlayOutSeconds -gt 0) { & $tap 20000 'start' 150; & $tap 23350 'plunger' 1200 }
@@ -372,6 +396,7 @@ function Start-Instance($inst) {
         $psi.Environment['CASTCADE_STREAM_ADDR'] = "listen:127.0.0.1:$($inst.Stream)"
         $psi.Environment['CASTCADE_STREAM_CONTROL'] = "connect:127.0.0.1:$($inst.Ctl)"
         $psi.Environment['CASTCADE_STREAM_SOUND'] = $(if ($StreamSound) { '1' } else { '0' })
+        if ($OptionEvent) { $psi.Environment['CASTCADE_TEST_OPTIONEVENT'] = '1' }
         $psi.Environment['CASTCADE_TEST_BALLLOG'] = '250'
         if ($Check) { $psi.Environment['CASTCADE_TEST_MATCHCHECK'] = '1' }
         if ($Sound -and $MusicFile -and (Test-Path -LiteralPath $MusicFile -PathType Leaf)) {
@@ -390,6 +415,7 @@ function Start-Instance($inst) {
     }
     $psi.Environment['CASTCADE_STREAM_DELAY_MS'] = "$DelayMs"
     if ($Scenario -eq 'focus' -and $inst.Name -eq 'b') { $psi.Environment['CASTCADE_TEST_PAUSE'] = '14,3600' } else { $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1' }
+    if ($Scenario -eq 'overflow' -and $inst.Name -eq 'b') { $psi.Environment['CASTCADE_TEST_UNDOLIMIT'] = '10' }
     $psi.Environment['CASTCADE_STREAM_LOG'] = (Join-Path $inst.Dir 'castcade.log')
     if (-not $NoFrameLog) { $psi.Environment['CASTCADE_FRAMELOG'] = (Join-Path $inst.Dir 'frames.log') }
     foreach ($k in $ExtraEnv.Keys) { $psi.Environment[$k] = "$($ExtraEnv[$k])" }
@@ -657,6 +683,14 @@ try {
             $r2 = Watch-Phase $I.b $I.a.Stream $I.a 2 'play'
             $rows.Add($r2); Log "after the reconnect: $($r2.result)"
             Pump 2
+        }
+        'overflow' {
+            # A stream that puts more properties than the table has (here: than CASTCADE_TEST_UNDOLIMIT=10 allows) is
+            # given up at once: state failed overflow, state playing, and the table as it was
+            $r = Watch-Phase $I.b $I.a.Stream $I.a 1 'play'
+            $rows.Add($r); Log "a stream past the undo limit: $($r.result) after $($r.watching_ms) ms; picture before/after $($r.before_after)"
+            if ($r.result -ne 'state failed overflow') { $notes.Add("expected 'state failed overflow', got '$($r.result)'") }
+            Pump 3
         }
         'mismatch' {
             $r = Watch-Phase $I.b $I.a.Stream $I.a 1 'play'
@@ -1113,7 +1147,8 @@ foreach ($n in $Names) {
         Log ("   keyframes {0}, their calls failed {1}; pre-pass puts to the file's value {2}, failed {3}; replayed calls failed {4}, unresolved {5} (stats lines)" -f $a.keyframes, $a.keyframe_calls_failed, $a.prepass_puts, $a.prepass_failed, $a.replay_failed, $a.replay_unresolved)
         if ($Check) { Log ("   property check: {0} runs, {1} properties differ, {2} equal within 0.01 % only; internal state ({3} parts and lists): {4} runs, {5} differ" -f $a.check_runs, $a.check_differ, $a.check_approx, $a.deep_parts, $a.deep_runs, $a.deep_differ) }
         Log ("   watch phases that began with: a target moving {0}, a light sequence playing {1}, a lamp under Duration {2}, lamps blinking {3}, a reel turning {4}, a primitive animating {5}; window not active {6}, paused by VPX {7} (paused again after the return: {8})" -f $a.began_target_moving, $a.began_sequence_playing, $a.began_duration, $a.began_blinking, $a.began_reel_turning, $a.began_primitive_animating, $a.began_window_inactive, $a.began_paused, $a.paused_after_return)
-        Log ("   events kept from its script: {0} before a keyframe (must be 0), {1} while the other table was shown; option events passed on {2}; its script has a Paused handler: {3}" -f $a.events_before_keyframe, $a.events_while_shown, $a.options_passed, $(if ($a.no_pause_handler) { 'NO' } else { 'yes' }))
+        Log ("   events kept from its script: {0} before a keyframe (must be 0), {1} while the other table was shown; option events passed on {2}; its script has a Paused handler: {3}" -f $a.events_before_keyframe, $a.events_while_shown, $a.options_passed, $(if ($a.no_pause_handler) { 'NO' } elseif ($a.phases -lt 1) { 'not looked at (it never watched)' } else { 'yes' }))
+        if ($OptionEvent -and $a.options_passed -ne $a.touched) { $problems.Add("${n}: $($a.options_passed) option events were passed on to the script after $($a.touched) watch phases in which one was fired") }
         Log ("   music of its own when a watch began: playing {0}, a stream not playing {1}; after the return: kept and playing {2}, kept and not playing {3}, LOST {4}" -f $a.began_music_playing, $a.began_music_silent, $a.music_kept_playing, $a.music_kept_silent, $a.music_lost)
         if ($a.events_before_keyframe) { $problems.Add("${n}: $($a.events_before_keyframe) events were kept from the script before a keyframe") }
         if ($a.music_lost -or ($a.began_music_playing -ne $a.music_kept_playing)) { $problems.Add("${n}: music playing when a watch began $($a.began_music_playing) times, playing again after it $($a.music_kept_playing) times, lost $($a.music_lost)") }
@@ -1149,8 +1184,20 @@ if ($Sidecar) {
     if ($JournalGrew) { $problems.Add("the journal of a watching table grew during $JournalGrew watch phases") }
 }
 if ($Scenario -eq 'longwatch' -and $script:LongWatch) { Log "long watch, memory and handles of b: $(($script:LongWatch | ConvertTo-Json -Compress))" }
+# One picture after a watch against the one before it: the two are 50 to 150 ms of the game apart (the last one before
+# the command, the first one after the answer), so the limit is -MaxPictureDiff or, where the table itself changes by
+# more than that between two frames (Flash switches its whole lighting when it serves a ball), 1.25 times the largest
+# difference of the run's pairs taken 120 ms apart with no watch between them. Pictures over -MaxPictureDiff are
+# always named.
+$noiseAll = @($rows | Where-Object { $null -ne $_.noise -and -not [double]::IsNaN([double]$_.noise) } | ForEach-Object { [double]$_.noise })
+$noiseMax = if ($noiseAll.Count) { ($noiseAll | Measure-Object -Maximum).Maximum } else { 0 }
+$picLimit = [math]::Max($MaxPictureDiff, 1.25 * $noiseMax)
 $overPic = @($rows | Where-Object { $null -ne $_.before_after -and -not [double]::IsNaN([double]$_.before_after) -and [double]$_.before_after -gt $MaxPictureDiff })
-if ($overPic.Count) { $problems.Add("$($overPic.Count) watch phases left a picture more than $MaxPictureDiff from the one before (swaps $((($overPic | ForEach-Object swap) | Select-Object -First 10) -join ','))") }
+$overHard = @($overPic | Where-Object { [double]$_.before_after -gt $picLimit })
+if ($overPic.Count) {
+    $txt = "$($overPic.Count) watch phases left a picture more than $MaxPictureDiff from the one before ($((($overPic | Select-Object -First 10 | ForEach-Object { "swap $($_.swap): $($_.before_after)" })) -join ', ')); two pictures of this table 120 ms apart with no watch differ by up to $([math]::Round($noiseMax, 3))"
+    if ($overHard.Count) { $problems.Add($txt) } else { Log "NOTE: $txt; not counted as a failure (limit $([math]::Round($picLimit, 3)))" }
+}
 # Over a run of swaps the picture after a watch must be as near the one before it as two pictures of the running game
 # 120 ms apart are: a table left with the other player's lamps passes the limit above on most swaps, not this one
 function Median($vals) { $v = @($vals | Where-Object { $null -ne $_ -and -not [double]::IsNaN([double]$_) } | ForEach-Object { [double]$_ } | Sort-Object); if ($v.Count) { $v[[int][math]::Floor(($v.Count - 1) * 0.5)] } else { [double]::NaN } }

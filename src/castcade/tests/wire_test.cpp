@@ -1528,6 +1528,178 @@ static void TestAsyncLineWriter()
    CHECK(OpenAsyncLineWriter("Z:\\no\\such\\folder\\castcade.log") == nullptr);
 }
 
+// The match role's control connection: which addresses count as this PC, and the line reader's limits
+static void TestLines()
+{
+   CHECK(WireStartup());
+   std::string n;
+   CHECK(LoopbackAddress("127.0.0.1", n) && n == "127.0.0.1");
+   CHECK(LoopbackAddress("127.255.0.9", n) && n == "127.255.0.9");
+   CHECK(LoopbackAddress("localhost", n) && n == "127.0.0.1");
+   for (const char* const bad : { "", "127", "127.0.0", "127.0.0.1.", ".127.0.0.1", "127.0.0.1.5", "127.0.0.256", "127.0.0.-1", "127.0.0.1 ", " 127.0.0.1",
+           "127.example.com", "127.0.0.1.example.com", "localhost.example.com", "LOCALHOST", "localhost.", "128.0.0.1", "192.168.1.20", "0.0.0.0", "1270.0.0.1",
+           "0x7f.0.0.1", "2130706433", "::1", "[::1]", "127.0.0.1:80", "127.0.0.1\n" })
+   {
+      n = "untouched";
+      CHECK(!LoopbackAddress(bad, n));
+      CHECK(n == "untouched");
+   }
+   {
+      std::string err;
+      CHECK(!ConnectLines("localhost", 9, err) && !err.empty()); // a name: refused without a lookup
+      err.clear();
+      CHECK(!ConnectLines("no-such-host.invalid", 9, err) && !err.empty());
+   }
+
+   // A raw listener of the test's own plays the companion, so that it can send anything
+   const uint16_t port = (uint16_t)(g_portBase + 9);
+   const SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   sockaddr_in a = {};
+   a.sin_family = AF_INET;
+   a.sin_port = htons(port);
+   inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+   const bool listening = ls != INVALID_SOCKET && bind(ls, (const sockaddr*)&a, sizeof(a)) == 0 && listen(ls, 4) == 0;
+   CHECK(listening);
+   if (!listening)
+   {
+      printf("lines: no listener on 127.0.0.1:%u (WSA error %d)\n", port, WSAGetLastError());
+      return;
+   }
+   const auto connect = [&](SOCKET& server) -> std::unique_ptr<LinePeer>
+   {
+      std::string err;
+      std::unique_ptr<LinePeer> c = ConnectLines("127.0.0.1", port, err);
+      CHECK(c != nullptr);
+      server = accept(ls, nullptr, nullptr);
+      CHECK(server != INVALID_SOCKET);
+      std::vector<std::string> none;
+      for (int i = 0; c && i < 200 && !c->Connected(); ++i)
+      {
+         c->Poll(none);
+         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      CHECK(c && c->Connected() && none.empty());
+      return c;
+   };
+   const auto sendAll = [](const SOCKET s, const std::string& bytes)
+   {
+      size_t at = 0;
+      while (at < bytes.size())
+      {
+         const int sent = send(s, bytes.data() + at, (int)std::min<size_t>(bytes.size() - at, 1 << 16), 0);
+         if (sent <= 0)
+            return false;
+         at += (size_t)sent;
+      }
+      return true;
+   };
+   // Polls until `want` lines are here, the connection closed, or 2 s passed. Returns whether the connection is open.
+   const auto pollFor = [](LinePeer& c, std::vector<std::string>& out, const size_t want, int* const polls = nullptr, size_t* const mostInOne = nullptr)
+   {
+      bool open = true;
+      for (int i = 0; i < 400 && open && out.size() < want; ++i)
+      {
+         const size_t before = out.size();
+         open = c.Poll(out);
+         if (polls && out.size() > before)
+            ++*polls;
+         if (mostInOne)
+            *mostInOne = std::max(*mostInOne, out.size() - before);
+         if (open && out.size() < want)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      return open;
+   };
+
+   {
+      // lines, a carriage return, an empty line, a line that arrives in two parts; and the other direction
+      SOCKET server = INVALID_SOCKET;
+      std::unique_ptr<LinePeer> c = connect(server);
+      std::vector<std::string> got;
+      CHECK(sendAll(server, "play\nwatch 127.0.0.1:48112\r\n\nwat"));
+      CHECK(pollFor(*c, got, 3));
+      CHECK(got.size() == 3 && got[0] == "play" && got[1] == "watch 127.0.0.1:48112" && got[2].empty());
+      CHECK(sendAll(server, "ch 127.0.0.1:1\n"));
+      CHECK(pollFor(*c, got, 4));
+      CHECK(got.size() == 4 && got[3] == "watch 127.0.0.1:1");
+      CHECK(c->Send("state playing"));
+      char buf[64] = {};
+      std::string back;
+      for (int i = 0; i < 200 && back.find('\n') == std::string::npos; ++i)
+      {
+         std::vector<std::string> none;
+         c->Poll(none);
+         u_long avail = 0;
+         ioctlsocket(server, FIONREAD, &avail);
+         if (avail)
+            back.append(buf, (size_t)std::max(0, recv(server, buf, sizeof(buf), 0)));
+         else
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      CHECK(back == "state playing\n");
+
+      // a line of exactly 2048 bytes is a line; the connection stays
+      got.clear();
+      CHECK(sendAll(server, std::string(2048, 'x') + "\nnext\n"));
+      CHECK(pollFor(*c, got, 2));
+      CHECK(got.size() == 2 && got[0].size() == 2048 && got[1] == "next");
+
+      // 200 KB of short lines in one go: every line arrives, in order, and no single Poll reads more than 64 KB
+      got.clear();
+      std::string many;
+      size_t count = 0;
+      while (many.size() < 200 * 1024)
+         many += "line " + std::to_string(count++) + " ........................................\n";
+      CHECK(sendAll(server, many));
+      int polls = 0;
+      size_t mostInOne = 0;
+      CHECK(pollFor(*c, got, count, &polls, &mostInOne));
+      bool inOrder = got.size() == count;
+      for (size_t i = 0; inOrder && i < count; ++i)
+         inOrder = got[i].rfind("line " + std::to_string(i) + " ", 0) == 0;
+      CHECK(inOrder);
+      const size_t lineBytes = many.size() / count; // about 50
+      CHECK(polls >= 3 && mostInOne * lineBytes <= 64 * 1024 + 2048 + lineBytes);
+      printf("lines: %zu lines (%zu KB) sent at once arrived over %d polls, %zu lines in the largest\n", count, many.size() / 1024, polls, mostInOne);
+
+      // a complete line of 2049 bytes closes the connection; the line before it is still delivered
+      got.clear();
+      CHECK(sendAll(server, "last\n" + std::string(2049, 'y') + "\nnever\n"));
+      CHECK(!pollFor(*c, got, 9));
+      CHECK(got.size() == 1 && got[0] == "last");
+      CHECK(!c->Connected() && !c->Alive());
+      closesocket(server);
+   }
+   {
+      // bytes with no end of line close it too, without waiting for more: 2049 may still be a line of 2048 with a
+      // carriage return, 2050 cannot be a line any more
+      SOCKET server = INVALID_SOCKET;
+      std::unique_ptr<LinePeer> c = connect(server);
+      std::vector<std::string> got;
+      CHECK(sendAll(server, std::string(2049, 'z')));
+      for (int i = 0; i < 40; ++i)
+      {
+         CHECK(c->Poll(got));
+         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      CHECK(sendAll(server, "z"));
+      CHECK(!pollFor(*c, got, 1));
+      CHECK(got.empty() && !c->Alive());
+      closesocket(server);
+   }
+   {
+      // the other end closes: the lines sent before the close arrive, then Poll says closed
+      SOCKET server = INVALID_SOCKET;
+      std::unique_ptr<LinePeer> c = connect(server);
+      std::vector<std::string> got;
+      CHECK(sendAll(server, "play\nhalf a li"));
+      closesocket(server);
+      CHECK(!pollFor(*c, got, 9));
+      CHECK(got.size() == 1 && got[0] == "play");
+   }
+   closesocket(ls);
+}
+
 int main(int argc, char** argv)
 {
    if (argc > 1)
@@ -1551,6 +1723,7 @@ int main(int argc, char** argv)
    TestRecorder();
    TestAsyncLineWriter();
    TestUnwind();
+   TestLines();
    printf("SUMMARY: %d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;
 }

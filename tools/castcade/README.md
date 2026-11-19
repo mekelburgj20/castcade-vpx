@@ -83,6 +83,8 @@ one exists. Do not build while a test runs: the compiler takes the cores, and th
   own 4 s timeout. Each must leave B's game as a pause of that length would: with `-Check` no property and no
   internal field differs, and no event was kept from its script. The summary says how many of them began with a
   drop target moving, a light sequence playing, a lamp under `Duration`, lamps blinking, a reel turning.
+- `overflow`: B runs with `CASTCADE_TEST_UNDOLIMIT=10` (a stream may put 10 properties instead of as many as the
+  table has, plus 256) and is told to watch A: `state failed overflow`, `state playing`, its table as it was.
 - `closewhile`: B watches A and B's table is closed: B must be back on its own game before its script ends (the log
   line `back to playing (this table closes)`) and exit with code 0. `longwatch`: B watches A for `-LongMinutes` (10);
   B's private bytes, working set, handles and threads before, 20 s in, at the end and 10 s after its return.
@@ -125,9 +127,21 @@ and ends, so a looping sound the own table had started (`PlaySound` with a loop 
 watch and stays off until the script starts it again; with `CASTCADE_STREAM_SOUND=0` no sound of the own table is
 touched.
 
+`-AttractSeconds <n>` moves every key of the scripted game n seconds back: the tables stay in their attract mode that
+long, so the first watch phases begin while an original table plays its light sequences (the summary counts the
+phases that began with a sequence playing), and the game starts after them. `-CacheMode 1` writes `CacheMode = 1`
+into the ini (VPX then loads every texture to the GPU before the game starts).
+
+`-OptionEvent` sets `CASTCADE_TEST_OPTIONEVENT=1`: each match instance fires the tweak menu's "table option changed"
+event (`OptionEvent 1`) once in every watch phase, after the keyframe; the run fails unless each was kept from the
+script and fired at the return.
+
 `-Sidecar <table>.vbs` (and `-HookLib`, default the owner's `scripts\castcade.vbs`) runs a patched table, as match
 tables are: each instance gets its own copy `cchand-<x> <table>.vpx` in its run folder with the sidecar under the same
-name and the hook library beside it, and the hook writes `%LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl`. In
+name and the hook library beside it. The hook names its journal after the table id in the sidecar's `Castcade_Init`
+line, not after the file, and `Castcade_Guard` names the original table and the sidecar it would rename: in the
+copy the id gets the prefix `cchand-<x> ` and both paths are the copies' (nothing else is changed), so the hook
+writes `%LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl` and cannot reach the installed table's files. In
 the `swap` scenario the journal of the table that watches must not grow during the watch. At the end both journals
 are copied into the run folder (`journal-<x>.jsonl`), removed from Castcade's folder, and read by `-JournalTool` (the
 castcade repo's `vpx-hook/spike/tail-journal.py`): balls seen ending, `game_end`. `-PlayOutSeconds <n>` lets both
@@ -142,7 +156,9 @@ per watch phase: the milliseconds to `state watching` and to `state playing`, th
 The run fails (exit code 1, `PROBLEM:` lines) when: a watch phase did not end as the scenario expects; a `watch` was
 answered after 5 s or a `play` after 2 s; a picture after a watch differs from the one before it by more than
 `-MaxPictureDiff` (mean absolute difference of the RGB values, 0 to 255, of the two captures scaled to 192x108; default
-1.5), or, over a `swap` run, the median of those differences is above 1.25 times the median difference of the two
+1.5) and by more than 1.25 times the largest difference of the run's pairs taken 120 ms apart with no watch (the two
+pictures are 50 to 150 ms of the game apart, and Flash switches its whole lighting between two frames when it serves
+a ball: 6 to 7 on that scale; such a picture is named in a `NOTE:` line), or, over a `swap` run, the median of those differences is above 1.25 times the median difference of the two
 pictures taken 120 ms apart before each watch, plus 0.1 (the pictures are a weak witness on a busy table: with
 `-ExtraEnv @{ CASTCADE_TEST_MATCHNOUNDO = '1' }`, which leaves the other player's lamps on the table, Attack from Mars
 stays under 1.5 on every swap and fails only this median and the property check, with about 200 properties each

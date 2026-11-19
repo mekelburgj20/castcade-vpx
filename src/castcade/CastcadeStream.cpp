@@ -2980,6 +2980,8 @@ private:
    bool m_staticRefresh = false;
    bool m_check = false;
    bool m_testNoUndo = false; // CASTCADE_TEST_MATCHNOUNDO=1: leave the undo list and the runtime state unapplied
+   bool m_testOption = false; // CASTCADE_TEST_OPTIONEVENT=1: one OptionEvent in every watch phase, after its keyframe
+   bool m_testOptionFired = false;
    std::wstring m_testMusic;  // CASTCADE_TEST_MUSIC
    uint64_t m_testMusicAt = 0;
    uint64_t m_ballLogUsec = 0, m_nextBallLog = 0;
@@ -3074,6 +3076,7 @@ MatchSession::MatchSession(Player* const player)
    m_ballLogUsec = (uint64_t)std::clamp(atoi(GetEnv("CASTCADE_TEST_BALLLOG").c_str()), 0, 60000) * 1000;
    // Test: CASTCADE_TEST_MUSIC=<file> calls the table's own PlayMusic with that file 5 s into the session, as a line
    // of its script would (the tables that play music on the test PC all need PinUP Player beside them)
+   m_testOption = GetEnv("CASTCADE_TEST_OPTIONEVENT") == "1";
    m_testMusic = GetEnvW(L"CASTCADE_TEST_MUSIC");
    m_testMusicAt = NowUsec() + 5000000;
 
@@ -3128,6 +3131,12 @@ void MatchSession::OnFrame()
       CheckWatch(now);
       if (!m_watching)
          return;
+      if (m_testOption && m_disturbed && !m_testOptionFired)
+      {
+         m_testOptionFired = true;
+         m_log.Info("TEST: OptionEvent 1 fired as the tweak menu fires it when a table option changes (CASTCADE_TEST_OPTIONEVENT), while the other player's table is shown");
+         m_player->m_ptable->FireKeyEvent(DISPID_GameEvents_OptionEvent, 1);
+      }
       m_play.OnFrame(); // this table's own watchers: its state as it was, under a stamp that stands still
       return;
    }
@@ -3402,6 +3411,7 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    g_holdEvents = true;
    m_heldBeforeKeyframe = m_heldWhileShown = 0;
    m_heldOptions.clear();
+   m_testOptionFired = false;
    m_overflow = false;
    m_play.Freeze();
    m_ownPhysics = SaveOwnPhysics(m_player);
@@ -3612,6 +3622,13 @@ size_t MatchSession::UndoLimit()
       total += it->second;
    }
    m_undoLimit = total + 256;
+   // Test: CASTCADE_TEST_UNDOLIMIT=<n> sets the limit low enough for a real stream to pass it
+   const int test = atoi(GetEnv("CASTCADE_TEST_UNDOLIMIT").c_str());
+   if (test > 0)
+   {
+      m_log.Warn(Fmt("TEST: the undo list is limited to %d entries (CASTCADE_TEST_UNDOLIMIT) instead of %zu", test, m_undoLimit));
+      m_undoLimit = (size_t)test;
+   }
    return m_undoLimit;
 }
 
