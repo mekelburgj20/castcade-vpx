@@ -802,7 +802,7 @@ foreach ($n in $Names) {
         prepass_puts = 0; prepass_failed = 0; undo_max = 0; keyframes = 0; keyframe_calls_failed = 0; replay_failed = 0; replay_unresolved = 0; check_runs = 0; check_differ = 0; check_approx = 0;
         warnings = 0; errors = 0; leave_ms_max = 0.0; enter_ms_max = 0.0; prepass_ms_max = 0.0; keys_passed = 0; reasons = @{}; switch_times = (New-Object System.Collections.Generic.List[datetime]);
         frames_over_25 = 0; frames_over_100 = 0; frame_max_ms = 0.0; switch_frame_max_ms = 0.0; switch_frames_over = 0; ball_episodes = 0; ball_episodes_after_first_watch = 0; ball_log_lines = 0;
-        entered_with_moving_ball = 0; first_watch_gametime = $null; first_bad = (New-Object System.Collections.Generic.List[string]) }
+        entered_with_moving_ball = 0; first_watch_gametime = $null; held = 0; held_served = 0; held_closed = 0; held_ms_max = 0.0; first_bad = (New-Object System.Collections.Generic.List[string]) }
     $cl = Join-Path $x.Dir 'castcade.log'
     $balls = New-Object System.Collections.Generic.List[object]; $lastBallT = 0
     if (Test-Path -LiteralPath $cl) {
@@ -829,6 +829,9 @@ foreach ($n in $Names) {
                 $a.put_back += [int]$Matches[3]; $a.undo_max = [math]::Max($a.undo_max, [int]$Matches[4]); $a.put_back_own_value += [int]$Matches[5]; $a.put_back_failed += [int]$Matches[6]; $a.put_back_lost += [int]$Matches[7]
                 if ($Matches[9] -eq 'identical') { $a.physics_identical++ } else { $a.physics_different++ }
                 $a.keys_passed += [int]$Matches[11]; $a.leave_ms_max = [math]::Max($a.leave_ms_max, [double]$Matches[12]); $s = Stamp $line; if ($s) { $a.switch_times.Add($s) } }
+            elseif ($line -match 'held: this table is not playing yet') { $a.held++ }
+            elseif ($line -match 'served after ([\d.]+) ms on hold') { $a.held_served++; $a.held_ms_max = [math]::Max($a.held_ms_max, [double]$Matches[1]) }
+            elseif ($line -match 'closed: held 10 s') { $a.held_closed++ }
             elseif ($line -match 'match check: (\d+) properties compared, (\d+) differ, (\d+) equal within') { $a.check_runs++; $a.check_differ += [int]$Matches[2]; $a.check_approx += [int]$Matches[3] }
             elseif ($line -match '\[watch pid \d+\] stats .*failed (\d+), unresolved (\d+)') { $a.replay_failed += [int]$Matches[1]; $a.replay_unresolved += [int]$Matches[2] }
         }
@@ -888,6 +891,7 @@ foreach ($n in $Names) {
         Log ("   keyframes {0}, their calls failed {1}; pre-pass puts to the file's value {2}, failed {3}; replayed calls failed {4}, unresolved {5} (stats lines)" -f $a.keyframes, $a.keyframe_calls_failed, $a.prepass_puts, $a.prepass_failed, $a.replay_failed, $a.replay_unresolved)
         if ($Check) { Log ("   property check: {0} runs, {1} properties differ, {2} equal within 0.01 % only" -f $a.check_runs, $a.check_differ, $a.check_approx) }
         Log ("   longest: entering {0} ms, keyframe pre-pass {1} ms, leaving {2} ms; key events passed on at returns {3}" -f $a.enter_ms_max, $a.prepass_ms_max, $a.leave_ms_max, $a.keys_passed)
+        Log ("   watchers that reached it while it was not playing: held {0}, served once it played {1} (longest hold {2} ms), closed after 10 s {3}" -f $a.held, $a.held_served, $a.held_ms_max, $a.held_closed)
         Log ("   balls put in play on its game clock: {0}, of which {1} after its first watch phase; watch phases that began with a ball of its own in motion: {2}" -f $a.ball_episodes, $a.ball_episodes_after_first_watch, $a.entered_with_moving_ball)
         if ($a.physics_different) { $problems.Add("${n}: own physics state DIFFERENT after $($a.physics_different) watch phases") }
         if ($a.put_back_failed -or $a.put_back_lost) { $problems.Add("${n}: $($a.put_back_failed) properties could not be put back, $($a.put_back_lost) lost") }
