@@ -9,7 +9,9 @@ camera. In VR that is the watcher's own head: you stand at your table and see th
 flippers, lights and targets on it.
 
 This build is Panasony's VPX 10.8.0 (OpenGL / VR, 64 bit) plus the stream. Without the launchers below it
-behaves like that build.
+behaves like that build, except for two crashes of 10.8.0 that it does not have: closing the table's
+editor view (the "x" at the right of the menu bar) while its game runs is ignored, and a table script
+that sets MusicVolume before any music plays no longer ends VPX.
 
 Install
 -------
@@ -75,8 +77,10 @@ What is not in this iteration
 - The ROM's sound and the external DMD window (VPinMAME runs only on the player's PC). A DMD drawn inside
   the table (the VR room / in-table DMD most VR tables have) does come across.
 - B2S backglass, PuP packs, FlexDMD windows: anything that is a separate program on the player's PC.
-- Taking turns inside one running game. Today a VPX is either the player or a watcher for as long as the
-  table is open.
+- Taking turns inside one running game, with these launchers: they are play, watch, record and replay, and
+  with them a VPX is either the player or a watcher for as long as the table is open. The build itself can
+  take turns (each player keeps a game of their own and sees the other player's table in between), but only
+  when the Castcade app runs the match; no launcher here starts that.
 
 If something is wrong
 ---------------------
