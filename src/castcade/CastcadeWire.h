@@ -270,6 +270,29 @@ std::unique_ptr<TcpListener> ListenTcp(uint16_t port, std::string& err, const ch
 // nullptr and sets err if the address cannot be resolved or the socket cannot be created.
 std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, uint16_t port, std::string& err);
 
+// One TCP connection that carries text lines (UTF-8, each ended by '\n'; a '\r' before it is dropped): the match
+// role's control connection to the companion (CastcadeStream.h). Non-blocking like TcpPeer, and made the same way.
+class LinePeer
+{
+public:
+   virtual ~LinePeer() = default;
+
+   // Queues one line (the '\n' is added) and writes what the socket takes now. False once the connection is closed.
+   virtual bool Send(const std::string& line) = 0;
+
+   // Completes a pending connect, flushes, reads what is available and appends each complete line to out. Returns
+   // false once the connection is closed or failed (also when a line grows past 4096 bytes); lines read before that
+   // are still delivered. Never blocks.
+   virtual bool Poll(std::vector<std::string>& out) = 0;
+
+   virtual bool Connected() const = 0; // false while connecting and after the close
+   virtual bool Alive() const = 0;     // connecting or connected
+   virtual void Close() = 0;
+};
+
+// Starts a connection to host:port, as ConnectTcp does
+std::unique_ptr<LinePeer> ConnectLines(const std::string& host, uint16_t port, std::string& err);
+
 // ---------------------------------------------------------------------------------------------------------
 // Recording: the bytes a watcher connected from the first frame would have received, each message stamped
 // with the time it was sent, in a file. A replay tool that sends the chunks at their recorded pace looks to a

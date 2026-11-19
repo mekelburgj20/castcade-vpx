@@ -3,6 +3,9 @@
 #include "stdafx.h"
 #include "CastcadeState.h"
 
+#include <algorithm>
+#include <cstdio>
+
 // What is carried, per class, and how a watcher makes Render show it:
 //
 //   Flipper    mover angle                 Flipper::Render reads it directly
@@ -539,7 +542,697 @@ struct StateAccess
 #endif
       player->SetScreenOffset(player->m_NudgeShake * dispX, -player->m_NudgeShake * dispY);
    }
+
+   // ------------------------------------------------------------------------------------------------------
+   // Match role: the saves and restores of a watch phase (CastcadeState.h)
+
+   struct LightRt
+   {
+      float inPlayState, currentIntensity, finalLightState;
+      double filamentTemperature;
+      int duration;
+      U32 timeNextBlink, timerDurationEndTime, blinkFrame;
+      bool lockedByLS;
+   };
+   struct SeqRt
+   {
+      U32 timeNextUpdate;
+      int blinkSequence;
+      _tracer th1, th2, tt1, tt2;
+      LightSeqQueue queue;
+      SequencerState playAnimation;
+      int tailLength, pauseValue, replayCount, updateRate;
+      bool playInProgress, pauseInProgress;
+   };
+   struct PrimRt
+   {
+      float currentFrame, speed;
+      bool doAnimation, endless, lockedByLS, inPlayState;
+   };
+   struct FlasherRt
+   {
+      bool lockedByLS, inPlayState;
+   };
+   struct ReelRt
+   {
+      DispReel::ReelInfo info[MAX_REELS];
+      U32 timeNextUpdate;
+   };
+
+   static void SaveRuntime(Player* const player, TableRuntime& out);
+   static void RestoreRuntime(Player* const player, const TableRuntime& in, const bool stampsFromNow);
+
+   struct FlipperPh
+   {
+      float angularMomentum, angularAcceleration, angleSpeed, angleCur, curTorque, contactTorque, angleStart, angleEnd;
+      short enableRotateEvent;
+      bool direction, solState, isInContact, enabled, visible, lastHitFace;
+   };
+   struct GatePh
+   {
+      float anglespeed, angle, angleMin, angleMax;
+      bool open, forcedMove, hitDirection;
+   };
+   struct SpinnerPh
+   {
+      float anglespeed, angle;
+   };
+   struct PlungerPh
+   {
+      float pos, speed, travelLimit, pullForce, reverseImpulse, fireSpeed, fireBounce, restPos, mech0, mech1, mech2, scatterVelocity, initialSpeed;
+      int fireTimer, autoFireTimer, retractWaitLoop;
+      bool strokeEventsArmed, addRetractMotion, retractMotion;
+   };
+   struct BumperPh
+   {
+      float ringAnimOffset, rotx, roty, skirtCounter;
+      Vertex3Ds hitBallPosition;
+      bool hitEvent, updateSkirt, doSkirtAnimation, ringDown, ringAnimate;
+   };
+   struct TargetPh
+   {
+      float moveAnimationOffset;
+      U32 timeStamp;
+      bool isDropped, moveAnimation, moveDown, hitEvent;
+   };
+   struct TriggerPh
+   {
+      float animHeightOffset;
+      bool hitEvent, unhitEvent, doAnimation, moveDown;
+   };
+   struct SlingPh
+   {
+      unsigned int eventTimeReset;
+      U32 timeReset;
+      bool doHitEvent, iframe;
+   };
+
+   static void SavePhysics(Player* const player, OwnPhysics& out);
+   static void RestorePhysics(Player* const player, const OwnPhysics& in);
+
+   static void BeginWatch(Player* const player, OwnPlayer& own);
+   static void HideOwn(Player* const player, OwnPlayer& own);
+   static unsigned int EndWatch(Player* const player, OwnPlayer& own);
+   static std::string LiveBalls(Player* const player);
 };
+
+struct TableRuntime
+{
+   std::vector<StateAccess::LightRt> lights;
+   std::vector<StateAccess::SeqRt> seqs;
+   std::vector<StateAccess::PrimRt> prims;
+   std::vector<StateAccess::FlasherRt> flashers;
+   std::vector<StateAccess::ReelRt> reels;
+};
+
+struct OwnPhysics
+{
+   std::vector<StateAccess::FlipperPh> flippers;
+   std::vector<StateAccess::GatePh> gates;
+   std::vector<StateAccess::SpinnerPh> spinners;
+   std::vector<StateAccess::PlungerPh> plungers;
+   std::vector<StateAccess::BumperPh> bumpers;
+   std::vector<StateAccess::TargetPh> targets;
+   std::vector<StateAccess::TriggerPh> triggers;
+   std::vector<StateAccess::SlingPh> slings; // every segment of every slingshot wall, in order
+};
+
+struct OwnPlayer
+{
+   struct OwnBall
+   {
+      Ball* ball;
+      unsigned int id;
+      bool visible;
+      Vertex3Ds pos, vel;
+   };
+   U64 elapsedUsec = 0; // physics clock minus the game's start: what the script's GameTime counts
+   U32 timeMsec = 0, lastFrameTimeMsec = 0;
+   std::vector<OwnBall> balls;
+   Ball* active = nullptr;
+   Ball* activeDebug = nullptr;
+   Ball* activeBC = nullptr;
+   unsigned int nextBallId = 0;
+   AudioPlayer* audio = nullptr;
+   bool hidden = false;
+};
+
+struct SavedMaterial
+{
+   Material* target;
+   Material copy;
+};
+
+void StateAccess::SaveRuntime(Player* const player, TableRuntime& out)
+{
+   for (IEditable* const pe : player->m_ptable->m_vedit)
+   {
+      switch (pe->GetItemType())
+      {
+      case eItemLight:
+      {
+         const Light* const p = static_cast<Light*>(pe);
+         out.lights.push_back(LightRt { p->m_inPlayState, p->m_currentIntensity, p->m_finalLightState, p->m_currentFilamentTemperature, p->m_duration, p->m_timenextblink,
+            p->m_timerDurationEndTime, p->m_iblinkframe, p->m_lockedByLS });
+         break;
+      }
+      case eItemLightSeq:
+      {
+         const LightSeq* const p = static_cast<LightSeq*>(pe);
+         out.seqs.push_back(SeqRt { p->m_timeNextUpdate, p->m_blinkSequence, p->m_th1, p->m_th2, p->m_tt1, p->m_tt2, p->m_queue, p->m_playAnimation, p->m_tailLength,
+            p->m_pauseValue, p->m_replayCount, p->m_updateRate, p->m_playInProgress, p->m_pauseInProgress });
+         break;
+      }
+      case eItemPrimitive:
+      {
+         const Primitive* const p = static_cast<Primitive*>(pe);
+         out.prims.push_back(PrimRt { p->m_currentFrame, p->m_speed, p->m_doAnimation, p->m_endless, p->m_lockedByLS, p->m_inPlayState });
+         break;
+      }
+      case eItemFlasher:
+      {
+         const Flasher* const p = static_cast<Flasher*>(pe);
+         out.flashers.push_back(FlasherRt { p->m_lockedByLS, p->m_inPlayState });
+         break;
+      }
+      case eItemDispReel:
+      {
+         const DispReel* const p = static_cast<DispReel*>(pe);
+         ReelRt r;
+         memcpy(r.info, p->m_reelInfo, sizeof(r.info));
+         r.timeNextUpdate = p->m_timeNextUpdate;
+         out.reels.push_back(r);
+         break;
+      }
+      default: break;
+      }
+   }
+}
+
+void StateAccess::RestoreRuntime(Player* const player, const TableRuntime& in, const bool stampsFromNow)
+{
+   const U32 now = player->m_time_msec;
+   size_t il = 0, is = 0, ip = 0, ifl = 0, ir = 0;
+   for (IEditable* const pe : player->m_ptable->m_vedit)
+   {
+      switch (pe->GetItemType())
+      {
+      case eItemLight:
+      {
+         if (il >= in.lights.size())
+            break;
+         const LightRt& s = in.lights[il++];
+         Light* const p = static_cast<Light*>(pe);
+         p->m_inPlayState = s.inPlayState;
+         p->m_currentIntensity = s.currentIntensity;
+         p->m_finalLightState = s.finalLightState;
+         p->m_currentFilamentTemperature = s.filamentTemperature;
+         p->m_duration = s.duration;
+         p->m_timenextblink = s.timeNextBlink;
+         p->m_timerDurationEndTime = s.timerDurationEndTime;
+         // The pattern itself is a property: if the pattern now in place is shorter, start it again
+         p->m_iblinkframe = s.blinkFrame < (U32)p->m_d.m_rgblinkpattern.length() ? s.blinkFrame : 0;
+         p->m_lockedByLS = s.lockedByLS;
+         if (stampsFromNow)
+         {
+            p->m_timenextblink = now + p->m_d.m_blinkinterval;
+            p->m_timerDurationEndTime = now + s.duration;
+         }
+         break;
+      }
+      case eItemLightSeq:
+      {
+         if (is >= in.seqs.size())
+            break;
+         const SeqRt& s = in.seqs[is++];
+         LightSeq* const p = static_cast<LightSeq*>(pe);
+         p->m_timeNextUpdate = s.timeNextUpdate;
+         p->m_blinkSequence = s.blinkSequence;
+         p->m_th1 = s.th1;
+         p->m_th2 = s.th2;
+         p->m_tt1 = s.tt1;
+         p->m_tt2 = s.tt2;
+         p->m_queue = s.queue;
+         p->m_playAnimation = s.playAnimation;
+         p->m_tailLength = s.tailLength;
+         p->m_pauseValue = s.pauseValue;
+         p->m_replayCount = s.replayCount;
+         p->m_updateRate = s.updateRate;
+         p->m_playInProgress = s.playInProgress;
+         p->m_pauseInProgress = s.pauseInProgress;
+         if (stampsFromNow)
+            p->m_timeNextUpdate = now + (U32)(std::max)(s.updateRate, 0);
+         break;
+      }
+      case eItemPrimitive:
+      {
+         if (ip >= in.prims.size())
+            break;
+         const PrimRt& s = in.prims[ip++];
+         Primitive* const p = static_cast<Primitive*>(pe);
+         if (p->m_currentFrame != s.currentFrame && !p->m_mesh.m_animationFrames.empty() && !p->m_d.m_staticRendering)
+            p->m_vertexBufferRegenerate = true; // Primitive::Render rebuilds the mesh of the frame put back
+         p->m_currentFrame = s.currentFrame;
+         p->m_speed = s.speed;
+         p->m_doAnimation = s.doAnimation;
+         p->m_endless = s.endless;
+         p->m_lockedByLS = s.lockedByLS;
+         p->m_inPlayState = s.inPlayState;
+         break;
+      }
+      case eItemFlasher:
+      {
+         if (ifl >= in.flashers.size())
+            break;
+         const FlasherRt& s = in.flashers[ifl++];
+         Flasher* const p = static_cast<Flasher*>(pe);
+         p->m_lockedByLS = s.lockedByLS;
+         p->m_inPlayState = s.inPlayState;
+         break;
+      }
+      case eItemDispReel:
+      {
+         if (ir >= in.reels.size())
+            break;
+         const ReelRt& s = in.reels[ir++];
+         DispReel* const p = static_cast<DispReel*>(pe);
+         memcpy(p->m_reelInfo, s.info, sizeof(s.info));
+         p->m_timeNextUpdate = stampsFromNow ? now + (U32)(std::max)(p->m_d.m_updateinterval, 0) : s.timeNextUpdate;
+         break;
+      }
+      default: break;
+      }
+   }
+}
+
+void StateAccess::SavePhysics(Player* const player, OwnPhysics& out)
+{
+   ForEachPart(player->m_ptable, [&](const PartClass c, IEditable* const pe)
+   {
+      switch (c)
+      {
+      case PC_Flipper:
+      {
+         const Flipper* const p = static_cast<Flipper*>(pe);
+         FlipperPh s = {};
+         if (p->m_phitflipper)
+         {
+            const FlipperMoverObject& m = p->m_phitflipper->m_flipperMover;
+            s = FlipperPh { m.m_angularMomentum, m.m_angularAcceleration, m.m_angleSpeed, m.m_angleCur, m.m_curTorque, m.m_contactTorque, m.m_angleStart, m.m_angleEnd,
+               m.m_enableRotateEvent, m.m_direction, m.m_solState, m.m_isInContact, m.m_enabled, m.m_visible, m.m_lastHitFace };
+         }
+         out.flippers.push_back(s);
+         break;
+      }
+      case PC_Gate:
+      {
+         const Gate* const p = static_cast<Gate*>(pe);
+         GatePh s = {};
+         if (p->m_phitgate)
+         {
+            const GateMoverObject& m = p->m_phitgate->m_gateMover;
+            s = GatePh { m.m_anglespeed, m.m_angle, m.m_angleMin, m.m_angleMax, m.m_open, m.m_forcedMove, m.m_hitDirection };
+         }
+         out.gates.push_back(s);
+         break;
+      }
+      case PC_Spinner:
+      {
+         const Spinner* const p = static_cast<Spinner*>(pe);
+         SpinnerPh s = {};
+         if (p->m_phitspinner)
+            s = SpinnerPh { p->m_phitspinner->m_spinnerMover.m_anglespeed, p->m_phitspinner->m_spinnerMover.m_angle };
+         out.spinners.push_back(s);
+         break;
+      }
+      case PC_Plunger:
+      {
+         const Plunger* const p = static_cast<Plunger*>(pe);
+         PlungerPh s = {};
+         if (p->m_phitplunger)
+         {
+            const PlungerMoverObject& m = p->m_phitplunger->m_plungerMover;
+            s = PlungerPh { m.m_pos, m.m_speed, m.m_travelLimit, m.m_pullForce, m.m_reverseImpulse, m.m_fireSpeed, m.m_fireBounce, m.m_restPos, m.m_mech0, m.m_mech1, m.m_mech2,
+               m.m_scatterVelocity, m.m_initialSpeed, m.m_fireTimer, m.m_autoFireTimer, m.m_retractWaitLoop, m.m_strokeEventsArmed, m.m_addRetractMotion, m.m_retractMotion };
+         }
+         out.plungers.push_back(s);
+         break;
+      }
+      case PC_Bumper:
+      {
+         const Bumper* const p = static_cast<Bumper*>(pe);
+         BumperPh s = {};
+         s.rotx = p->m_rotx;
+         s.roty = p->m_roty;
+         s.skirtCounter = p->m_skirtCounter;
+         s.updateSkirt = p->m_updateSkirt;
+         s.doSkirtAnimation = p->m_doSkirtAnimation;
+         s.ringDown = p->m_ringDown;
+         s.ringAnimate = p->m_ringAnimate;
+         if (p->m_pbumperhitcircle)
+         {
+            s.ringAnimOffset = p->m_pbumperhitcircle->m_bumperanim_ringAnimOffset;
+            s.hitBallPosition = p->m_pbumperhitcircle->m_bumperanim_hitBallPosition;
+            s.hitEvent = p->m_pbumperhitcircle->m_bumperanim_hitEvent;
+         }
+         out.bumpers.push_back(s);
+         break;
+      }
+      case PC_HitTarget:
+      {
+         const HitTarget* const p = static_cast<HitTarget*>(pe);
+         out.targets.push_back(TargetPh { p->m_moveAnimationOffset, p->m_timeStamp, p->m_d.m_isDropped, p->m_moveAnimation, p->m_moveDown, p->m_hitEvent });
+         break;
+      }
+      case PC_Trigger:
+      {
+         const Trigger* const p = static_cast<Trigger*>(pe);
+         out.triggers.push_back(TriggerPh { p->m_animHeightOffset, p->m_hitEvent, p->m_unhitEvent, p->m_doAnimation, p->m_moveDown });
+         break;
+      }
+      case PC_Slingshot:
+      {
+         const Surface* const p = static_cast<Surface*>(pe);
+         for (const LineSegSlingshot* const ls : p->m_vlinesling)
+            out.slings.push_back(SlingPh { ls->m_EventTimeReset, ls->m_TimeReset, ls->m_doHitEvent, ls->m_iframe });
+         break;
+      }
+      default: break;
+      }
+   });
+}
+
+void StateAccess::RestorePhysics(Player* const player, const OwnPhysics& in)
+{
+   size_t i[PC_Count] = {};
+   size_t sling = 0;
+   ForEachPart(player->m_ptable, [&](const PartClass c, IEditable* const pe)
+   {
+      const size_t at = i[c]++;
+      switch (c)
+      {
+      case PC_Flipper:
+      {
+         Flipper* const p = static_cast<Flipper*>(pe);
+         if (at >= in.flippers.size() || !p->m_phitflipper)
+            break;
+         const FlipperPh& s = in.flippers[at];
+         FlipperMoverObject& m = p->m_phitflipper->m_flipperMover;
+         m.m_angularMomentum = s.angularMomentum;
+         m.m_angularAcceleration = s.angularAcceleration;
+         m.m_angleSpeed = s.angleSpeed;
+         m.m_angleCur = s.angleCur;
+         m.m_curTorque = s.curTorque;
+         m.m_contactTorque = s.contactTorque;
+         m.m_angleStart = s.angleStart;
+         m.m_angleEnd = s.angleEnd;
+         m.m_enableRotateEvent = s.enableRotateEvent;
+         m.m_direction = s.direction;
+         m.m_solState = s.solState;
+         m.m_isInContact = s.isInContact;
+         m.m_enabled = s.enabled;
+         m.m_visible = s.visible;
+         m.m_lastHitFace = s.lastHitFace;
+         break;
+      }
+      case PC_Gate:
+      {
+         Gate* const p = static_cast<Gate*>(pe);
+         if (at >= in.gates.size() || !p->m_phitgate)
+            break;
+         const GatePh& s = in.gates[at];
+         GateMoverObject& m = p->m_phitgate->m_gateMover;
+         m.m_anglespeed = s.anglespeed;
+         m.m_angle = s.angle;
+         m.m_angleMin = s.angleMin;
+         m.m_angleMax = s.angleMax;
+         m.m_open = s.open;
+         m.m_forcedMove = s.forcedMove;
+         m.m_hitDirection = s.hitDirection;
+         break;
+      }
+      case PC_Spinner:
+      {
+         Spinner* const p = static_cast<Spinner*>(pe);
+         if (at >= in.spinners.size() || !p->m_phitspinner)
+            break;
+         p->m_phitspinner->m_spinnerMover.m_anglespeed = in.spinners[at].anglespeed;
+         p->m_phitspinner->m_spinnerMover.m_angle = in.spinners[at].angle;
+         break;
+      }
+      case PC_Plunger:
+      {
+         Plunger* const p = static_cast<Plunger*>(pe);
+         if (at >= in.plungers.size() || !p->m_phitplunger)
+            break;
+         const PlungerPh& s = in.plungers[at];
+         PlungerMoverObject& m = p->m_phitplunger->m_plungerMover;
+         m.m_pos = s.pos;
+         m.m_speed = s.speed;
+         m.m_travelLimit = s.travelLimit;
+         m.m_pullForce = s.pullForce;
+         m.m_reverseImpulse = s.reverseImpulse;
+         m.m_fireSpeed = s.fireSpeed;
+         m.m_fireBounce = s.fireBounce;
+         m.m_restPos = s.restPos;
+         m.m_mech0 = s.mech0;
+         m.m_mech1 = s.mech1;
+         m.m_mech2 = s.mech2;
+         m.m_scatterVelocity = s.scatterVelocity;
+         m.m_initialSpeed = s.initialSpeed;
+         m.m_fireTimer = s.fireTimer;
+         m.m_autoFireTimer = s.autoFireTimer;
+         m.m_retractWaitLoop = s.retractWaitLoop;
+         m.m_strokeEventsArmed = s.strokeEventsArmed;
+         m.m_addRetractMotion = s.addRetractMotion;
+         m.m_retractMotion = s.retractMotion;
+         break;
+      }
+      case PC_Bumper:
+      {
+         Bumper* const p = static_cast<Bumper*>(pe);
+         if (at >= in.bumpers.size())
+            break;
+         const BumperPh& s = in.bumpers[at];
+         if (p->m_pbumperhitcircle)
+         {
+            p->m_pbumperhitcircle->m_bumperanim_ringAnimOffset = s.ringAnimOffset;
+            RebuildBumperRing(p);
+            if (fabsf(p->m_rotx - s.rotx) > 1e-6f || fabsf(p->m_roty - s.roty) > 1e-6f)
+               SetBumperSkirt(p, s.rotx, s.roty); // rebuilds the skirt's vertex buffer
+            p->m_pbumperhitcircle->m_bumperanim_hitBallPosition = s.hitBallPosition;
+            p->m_pbumperhitcircle->m_bumperanim_hitEvent = s.hitEvent;
+         }
+         p->m_rotx = s.rotx;
+         p->m_roty = s.roty;
+         p->m_skirtCounter = s.skirtCounter;
+         p->m_updateSkirt = s.updateSkirt;
+         p->m_doSkirtAnimation = s.doSkirtAnimation;
+         p->m_ringDown = s.ringDown;
+         p->m_ringAnimate = s.ringAnimate;
+         break;
+      }
+      case PC_HitTarget:
+      {
+         HitTarget* const p = static_cast<HitTarget*>(pe);
+         if (at >= in.targets.size())
+            break;
+         const TargetPh& s = in.targets[at];
+         const bool moved = p->m_moveAnimationOffset != s.moveAnimationOffset;
+         p->m_moveAnimationOffset = s.moveAnimationOffset;
+         p->m_timeStamp = s.timeStamp;
+         p->m_d.m_isDropped = s.isDropped;
+         p->m_moveAnimation = s.moveAnimation;
+         p->m_moveDown = s.moveDown;
+         p->m_hitEvent = s.hitEvent;
+         if (moved && p->m_meshBuffer)
+            p->UpdateTarget();
+         break;
+      }
+      case PC_Trigger:
+      {
+         Trigger* const p = static_cast<Trigger*>(pe);
+         if (at >= in.triggers.size())
+            break;
+         const TriggerPh& s = in.triggers[at];
+         p->m_animHeightOffset = s.animHeightOffset;
+         p->m_hitEvent = s.hitEvent;
+         p->m_unhitEvent = s.unhitEvent;
+         p->m_doAnimation = s.doAnimation;
+         p->m_moveDown = s.moveDown;
+         break;
+      }
+      case PC_Slingshot:
+      {
+         Surface* const p = static_cast<Surface*>(pe);
+         for (LineSegSlingshot* const ls : p->m_vlinesling)
+         {
+            if (sling >= in.slings.size())
+               break;
+            const SlingPh& s = in.slings[sling++];
+            ls->m_EventTimeReset = s.eventTimeReset;
+            ls->m_TimeReset = s.timeReset;
+            ls->m_doHitEvent = s.doHitEvent;
+            ls->m_iframe = s.iframe;
+         }
+         break;
+      }
+      default: break;
+      }
+   });
+}
+
+void StateAccess::BeginWatch(Player* const player, OwnPlayer& own)
+{
+   own.elapsedUsec = player->m_curPhysicsFrameTime - player->m_StartTime_usec;
+   own.timeMsec = player->m_time_msec;
+   own.lastFrameTimeMsec = player->m_last_frame_time_msec;
+   for (Ball* const ball : player->m_vball)
+      own.balls.push_back(OwnPlayer::OwnBall { ball, ball->m_id, ball->m_visible, ball->m_d.m_pos, ball->m_d.m_vel });
+   own.active = player->m_pactiveball;
+   own.activeDebug = player->m_pactiveballDebug;
+   own.activeBC = player->m_pactiveballBC;
+   own.nextBallId = Ball::ballID;
+   // As a watcher: its window is rarely the focused one, and the stream must go on being shown
+   player->m_pause = false;
+}
+
+void StateAccess::HideOwn(Player* const player, OwnPlayer& own)
+{
+   if (own.hidden)
+      return;
+   own.hidden = true;
+   for (const OwnPlayer::OwnBall& b : own.balls)
+      b.ball->m_visible = false;
+   // The music is paused already (Player::PauseMusic). Set aside, a replayed PlayMusic or EndMusic cannot end it.
+   own.audio = player->m_audio;
+   player->m_audio = nullptr;
+}
+
+unsigned int StateAccess::EndWatch(Player* const player, OwnPlayer& own)
+{
+   if (own.hidden)
+   {
+      for (const OwnPlayer::OwnBall& b : own.balls)
+         if (std::find(player->m_vball.begin(), player->m_vball.end(), b.ball) != player->m_vball.end())
+            b.ball->m_visible = b.visible;
+      delete player->m_audio; // music the watched player's stream started here
+      player->m_audio = own.audio;
+      own.hidden = false;
+      // The screen offset of the watched player's nudges, back to this table's own
+      const int gainX = player->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "AnalogNudgeGainX"s, 100);
+      const int gainY = player->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "AnalogNudgeGainY"s, 100);
+      ApplyNudge(player, player->m_tableDisplacement.x, player->m_tableDisplacement.y, (float)player->m_curAccel[0].x * (float)(2.0 / JOYRANGE),
+         (float)player->m_curAccel[0].y * (float)(2.0 / JOYRANGE), gainX, gainY);
+   }
+   const auto live = [player](Ball* const b) { return b && std::find(player->m_vball.begin(), player->m_vball.end(), b) != player->m_vball.end(); };
+   player->m_pactiveball = live(own.active) ? own.active : nullptr;
+   player->m_pactiveballDebug = live(own.activeDebug) ? own.activeDebug : (player->m_vball.empty() ? nullptr : player->m_vball.front());
+   player->m_pactiveballBC = live(own.activeBC) ? own.activeBC : nullptr;
+   // The watcher's balls took ids from the counter the script's own balls are numbered with
+   Ball::ballID = own.nextBallId;
+
+   // The game clock (the script's GameTime, the timers' next fire times, the blink and animation stamps of the parts)
+   // ran on while the other player's table was shown, so that its lights faded and blinked. Back to where this
+   // game stopped; m_noTimeCorrect then makes the next UpdatePhysics start from now, as after VPX's own pause.
+   const U64 elapsedNow = player->m_curPhysicsFrameTime - player->m_StartTime_usec;
+   player->m_StartTime_usec = player->m_curPhysicsFrameTime - own.elapsedUsec;
+   player->m_time_msec = own.timeMsec;
+   player->m_last_frame_time_msec = own.lastFrameTimeMsec;
+   player->m_noTimeCorrect = true;
+   return elapsedNow > own.elapsedUsec ? (unsigned int)((elapsedNow - own.elapsedUsec) / 1000) : 0u;
+}
+
+std::string StateAccess::LiveBalls(Player* const player)
+{
+   char buf[160];
+   snprintf(buf, sizeof(buf), "t=%u n=%zu", player->m_time_msec, player->m_vball.size());
+   std::string s = buf;
+   for (const Ball* const b : player->m_vball)
+   {
+      snprintf(buf, sizeof(buf), " #%u %.1f %.1f %.1f %.2f %.2f", b->m_id, b->m_d.m_pos.x, b->m_d.m_pos.y, b->m_d.m_pos.z, b->m_d.m_vel.x, b->m_d.m_vel.y);
+      s += buf;
+   }
+   return s;
+}
+
+std::shared_ptr<const TableRuntime> SaveTableRuntime(Player* const player)
+{
+   auto s = std::make_shared<TableRuntime>();
+   StateAccess::SaveRuntime(player, *s);
+   return s;
+}
+
+void RestoreTableRuntime(Player* const player, const TableRuntime& saved, const bool stampsFromNow)
+{
+   StateAccess::RestoreRuntime(player, saved, stampsFromNow);
+}
+
+std::shared_ptr<const OwnPhysics> SaveOwnPhysics(Player* const player)
+{
+   auto s = std::make_shared<OwnPhysics>();
+   StateAccess::SavePhysics(player, *s);
+   return s;
+}
+
+void RestoreOwnPhysics(Player* const player, const OwnPhysics& saved)
+{
+   StateAccess::RestorePhysics(player, saved);
+}
+
+std::shared_ptr<OwnPlayer> BeginWatchPhase(Player* const player)
+{
+   auto s = std::make_shared<OwnPlayer>();
+   StateAccess::BeginWatch(player, *s);
+   return s;
+}
+
+void HideOwnTable(Player* const player, OwnPlayer& own)
+{
+   StateAccess::HideOwn(player, own);
+}
+
+unsigned int EndWatchPhase(Player* const player, OwnPlayer& own)
+{
+   return StateAccess::EndWatch(player, own);
+}
+
+std::string DescribeOwnBalls(const OwnPlayer& own)
+{
+   std::string s = std::to_string(own.balls.size());
+   char buf[160];
+   for (const OwnPlayer::OwnBall& b : own.balls)
+   {
+      snprintf(buf, sizeof(buf), "%s #%u (%.1f, %.1f, %.1f) v (%.2f, %.2f, %.2f)", &b == &own.balls.front() ? ":" : ";", b.id, b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y,
+         b.vel.z);
+      s += buf;
+   }
+   return s;
+}
+
+std::string DescribeLiveBalls(Player* const player)
+{
+   return StateAccess::LiveBalls(player);
+}
+
+std::shared_ptr<const SavedMaterial> SaveMaterial(Player* const player, const std::wstring& name)
+{
+   if (!player || !player->m_ptable || !g_pvp)
+      return nullptr;
+   char sz[MAX_PATH];
+   WideCharToMultiByteNull(CP_ACP, 0, name.c_str(), -1, sz, MAX_PATH, nullptr, nullptr);
+   Material* const mat = player->m_ptable->GetMaterial(sz);
+   if (!mat || mat == &g_pvp->m_dummyMaterial)
+      return nullptr;
+   return std::make_shared<SavedMaterial>(SavedMaterial { mat, *mat });
+}
+
+void RestoreMaterial(Player* const player, const SavedMaterial& saved)
+{
+   // The table's materials live as long as the table: the pointer taken during this watch phase is still theirs
+   if (player && player->m_ptable)
+      *saved.target = saved.copy;
+}
 
 void CaptureState(Player* player, const std::unordered_map<const Ball*, uint32_t>& ballIds, ByteWriter& w)
 {

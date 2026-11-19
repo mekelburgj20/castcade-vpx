@@ -2,6 +2,8 @@
 
 class Ball;
 
+namespace castcade { extern bool g_holdEvents; } // Castcade match role: src/castcade/CastcadeDispatch.h
+
 class EventProxyBase
 {
 public:
@@ -77,6 +79,9 @@ public:
 
    HRESULT FireDispID(const DISPID dispid, DISPPARAMS * const pdispparams) override
    {
+      // Castcade match role: while another player's table is shown here, the local script gets no event at all
+      if (castcade::g_holdEvents)
+         return S_OK;
       T* const pT = (T*)this;
       pT->Lock();
       IUnknown** pp = IConnectionPointImpl<T, psrcid, CComDynamicUnkArray>::m_vec.begin();

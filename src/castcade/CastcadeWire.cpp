@@ -1037,7 +1037,172 @@ std::unique_ptr<TcpListener> ListenTcp(const uint16_t port, std::string& err, co
    return std::make_unique<SocketListener>(s, actual);
 }
 
+namespace
+{
+
+// A non-blocking socket with a connect to host:port under way, or INVALID_SOCKET with err set
+SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err);
+
+constexpr size_t MAX_LINE = 4096;
+
+class LineSocket final : public LinePeer
+{
+public:
+   explicit LineSocket(const SOCKET s)
+      : m_sock(s)
+   {
+   }
+   ~LineSocket() override { Close(); }
+
+   bool Send(const std::string& line) override
+   {
+      if (m_sock == INVALID_SOCKET)
+         return false;
+      m_out += line;
+      m_out += '\n';
+      if (m_connecting)
+         return true;
+      return Flush();
+   }
+
+   bool Poll(std::vector<std::string>& out) override
+   {
+      if (m_sock == INVALID_SOCKET)
+         return false;
+      if (m_connecting)
+      {
+         fd_set wr, ex;
+         FD_ZERO(&wr);
+         FD_ZERO(&ex);
+         FD_SET(m_sock, &wr);
+         FD_SET(m_sock, &ex);
+         const timeval tv = { 0, 0 };
+         const int n = select(0, nullptr, &wr, &ex, &tv);
+         if (n == SOCKET_ERROR)
+         {
+            Close();
+            return false;
+         }
+         if (n == 0)
+            return true; // still connecting
+         int soErr = 0;
+         int len = sizeof(soErr);
+         if (FD_ISSET(m_sock, &ex) || getsockopt(m_sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &len) != 0 || soErr != 0 || !FD_ISSET(m_sock, &wr))
+         {
+            Close();
+            return false;
+         }
+         m_connecting = false;
+      }
+      if (!Flush())
+         return false;
+
+      bool closing = false;
+      char buf[4096];
+      for (;;)
+      {
+         const int n = recv(m_sock, buf, (int)sizeof(buf), 0);
+         if (n > 0)
+         {
+            m_in.append(buf, (size_t)n);
+            continue;
+         }
+         if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
+            closing = true;
+         break;
+      }
+      size_t pos = 0;
+      for (;;)
+      {
+         const size_t nl = m_in.find('\n', pos);
+         if (nl == std::string::npos)
+            break;
+         std::string line = m_in.substr(pos, nl - pos);
+         if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+         out.push_back(std::move(line));
+         pos = nl + 1;
+      }
+      m_in.erase(0, pos);
+      if (m_in.size() > MAX_LINE)
+         closing = true;
+      if (closing)
+      {
+         Close();
+         return false;
+      }
+      return true;
+   }
+
+   bool Connected() const override { return m_sock != INVALID_SOCKET && !m_connecting; }
+   bool Alive() const override { return m_sock != INVALID_SOCKET; }
+
+   void Close() override
+   {
+      if (m_sock != INVALID_SOCKET)
+      {
+         closesocket(m_sock);
+         m_sock = INVALID_SOCKET;
+      }
+      m_connecting = false;
+      m_out.clear();
+      m_in.clear();
+   }
+
+private:
+   bool Flush()
+   {
+      size_t pos = 0;
+      while (pos < m_out.size())
+      {
+         const int n = send(m_sock, m_out.data() + pos, (int)(m_out.size() - pos), 0);
+         if (n > 0)
+            pos += (size_t)n;
+         else if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+            break;
+         else
+         {
+            Close();
+            return false;
+         }
+      }
+      m_out.erase(0, pos);
+      if (m_out.size() > 64 * MAX_LINE) // the other end reads nothing
+      {
+         Close();
+         return false;
+      }
+      return true;
+   }
+
+   SOCKET m_sock;
+   bool m_connecting = true;
+   std::string m_out;
+   std::string m_in;
+};
+
+} // namespace
+
+std::unique_ptr<LinePeer> ConnectLines(const std::string& host, const uint16_t port, std::string& err)
+{
+   const SOCKET s = StartConnect(host, port, err);
+   if (s == INVALID_SOCKET)
+      return nullptr;
+   return std::make_unique<LineSocket>(s);
+}
+
 std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port, std::string& err)
+{
+   const SOCKET s = StartConnect(host, port, err);
+   if (s == INVALID_SOCKET)
+      return nullptr;
+   return std::make_unique<SocketPeer>(s, true, host + ":" + std::to_string(port));
+}
+
+namespace
+{
+
+SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err)
 {
    addrinfo hints = {};
    hints.ai_family = AF_INET;
@@ -1050,7 +1215,7 @@ std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port
       err = WsaError("resolving the address", rc != 0 ? rc : WSAHOST_NOT_FOUND);
       if (res)
          freeaddrinfo(res);
-      return nullptr;
+      return INVALID_SOCKET;
    }
 
    const sockaddr_in addr = *(const sockaddr_in*)res->ai_addr;
@@ -1060,13 +1225,13 @@ std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port
    if (s == INVALID_SOCKET)
    {
       err = WsaError("socket", WSAGetLastError());
-      return nullptr;
+      return INVALID_SOCKET;
    }
    if (!SetNonBlocking(s))
    {
       err = WsaError("ioctlsocket", WSAGetLastError());
       closesocket(s);
-      return nullptr;
+      return INVALID_SOCKET;
    }
    SetNoDelay(s);
 
@@ -1077,11 +1242,13 @@ std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port
       {
          err = WsaError("connect", e);
          closesocket(s);
-         return nullptr;
+         return INVALID_SOCKET;
       }
    }
-   return std::make_unique<SocketPeer>(s, true, host + ":" + std::to_string(port));
+   return s;
 }
+
+} // namespace
 
 // ---------------------------------------------------------------------------------------------------------
 // Recording

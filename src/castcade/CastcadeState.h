@@ -86,4 +86,47 @@ private:
    std::unique_ptr<Impl> m_impl;
 };
 
+// ---------------------------------------------------------------------------------------------------------
+// Match role (CASTCADE_STREAM=match): a table that plays its own game shows another player's for a while and
+// then gets its own back. What a script can read back as a property is put back by the session's undo list;
+// the rest of what a watch phase changes is saved and restored here, field by field.
+
+// What the script's methods, the light sequencers and time put into the parts and no property returns: every
+// light's play state, fade and blink phase, a flasher's and a primitive's sequencer state, a primitive's
+// animation, a light sequencer's whole run state, a reel's digits. Saved once before the script starts (the state
+// the table file gives, which is what a stream's keyframe builds on) and again when a watch phase begins.
+struct TableRuntime;
+std::shared_ptr<const TableRuntime> SaveTableRuntime(Player* player);
+// stampsFromNow: the saved time stamps (a blinker's next step, a reel's next update) are of another time: they start
+// again from the game clock as it is now. False when the game clock itself is put back to when they were saved.
+void RestoreTableRuntime(Player* player, const TableRuntime& saved, bool stampsFromNow);
+
+// Everything a StateApplier writes on the local parts, and what a replayed put can move behind it: the movers of
+// flippers, gates, spinners and plungers, and the hit animations of bumpers, targets, triggers and slingshots.
+struct OwnPhysics;
+std::shared_ptr<const OwnPhysics> SaveOwnPhysics(Player* player);
+void RestoreOwnPhysics(Player* player, const OwnPhysics& saved);
+
+// The player's own side of a watch phase: its clocks, its balls, its music.
+struct OwnPlayer;
+// Start of a watch phase: remembers the game clock, the balls and the ball id counter; the player no longer pauses
+std::shared_ptr<OwnPlayer> BeginWatchPhase(Player* player);
+// Once the other player's table is about to be drawn: the local balls are hidden (never destroyed: the script holds
+// them) and the local music is set aside
+void HideOwnTable(Player* player, OwnPlayer& own);
+// End of a watch phase, after the watcher's balls are gone. Shows the local balls and gives the music back when they
+// were set aside, and puts the game clock back to where it was when the phase began, without a burst of physics for
+// the time in between (as VPX itself resumes from a pause). Returns the milliseconds the clock was moved back.
+unsigned int EndWatchPhase(Player* player, OwnPlayer& own);
+// Logs: "2: #1 (431.0, 1622.5, 25.0) v (0.00, -3.10, 0.00); #2 ..." for the local balls of a watch phase
+std::string DescribeOwnBalls(const OwnPlayer& own);
+// The local time (Player::m_time_msec) and the local balls, for the test log (CASTCADE_TEST_BALLLOG)
+std::string DescribeLiveBalls(Player* player);
+
+// PinTable::GetMaterial(name): the material a replayed UpdateMaterial / MaterialColor is about to change, copied; and
+// the copy written back. An unknown name gives nullptr.
+struct SavedMaterial;
+std::shared_ptr<const SavedMaterial> SaveMaterial(Player* player, const std::wstring& name);
+void RestoreMaterial(Player* player, const SavedMaterial& saved);
+
 }

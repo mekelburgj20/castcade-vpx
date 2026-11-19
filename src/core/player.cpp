@@ -4266,6 +4266,8 @@ void Player::PrepareFrame()
    }
 
    // Fire all '-1' (the ones which are synced to the refresh rate) and '-2' (the ones used to sync with the controller) timers after physics and animation update but before rendering, to avoid the script being one frame late
+   // Castcade: not while this table shows another player's (a watcher's script never started; a match session's sleeps)
+   if (!m_castcade || !m_castcade->IsWatcher())
    for (HitTimer *const pht : m_vht)
       if (pht->m_interval < 0)
       {

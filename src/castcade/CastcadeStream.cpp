@@ -36,6 +36,8 @@ namespace castcade
 {
 
 bool g_recordCalls = false;
+bool g_baselinePuts = false;
+bool g_holdEvents = false;
 
 namespace
 {
@@ -382,6 +384,14 @@ public:
          m_out = OpenAsyncLineWriter(std::string(), nullptr, mirror(true));
    }
 
+   // Match role: the parts of one session write through one writer (one file handle, one thread, lines in order),
+   // each under its own role name. A writer per watch phase would open the file on the render thread at every turn.
+   void OpenShared(const StreamLog& other, const char* const role)
+   {
+      m_role = role;
+      m_out = other.m_out;
+   }
+
    void Info(const std::string& s) { Write("", s); }
    void Warn(const std::string& s) { Write("WARNING ", s); }
    void Error(const std::string& s) { Write("ERROR ", s); }
@@ -399,7 +409,7 @@ private:
       m_out->Line(head + s);
    }
 
-   std::unique_ptr<AsyncLineWriter> m_out;
+   std::shared_ptr<AsyncLineWriter> m_out;
    std::string m_role;
 };
 
@@ -589,13 +599,76 @@ struct Hello
    uint8_t features = 0; // HELLO_*; 0 from a build before the byte existed
 };
 
+// Owned VARIANTs in IDispatch::Invoke's argument order (rgvarg): for a property put, [0] is the value and the index
+// arguments follow
+struct VarList
+{
+   VarList() = default;
+   VarList(const VarList&) = delete;
+   VarList& operator=(const VarList&) = delete;
+   VarList(VarList&& o) noexcept
+      : v(std::move(o.v))
+   {
+      o.v.clear();
+   }
+   VarList& operator=(VarList&& o) noexcept
+   {
+      if (this != &o)
+      {
+         Clear();
+         v = std::move(o.v);
+         o.v.clear();
+      }
+      return *this;
+   }
+   ~VarList() { Clear(); }
+   void Clear()
+   {
+      for (VARIANT& x : v)
+         VariantClear(&x);
+      v.clear();
+   }
+   std::vector<VARIANT> v;
+};
+
+// Match role: the value a property had before this table's script first put it (the table file's value)
+struct Baseline
+{
+   uint32_t obj = 0;
+   DISPID dispid = 0;
+   bool readable = false; // false: the property has no getter, or its value cannot be a put's argument
+   VarList args;
+};
+
+// Match role: sees what a watch phase is about to replay onto the local table, before it is replayed
+struct ReplayObserver
+{
+   virtual ~ReplayObserver() = default;
+   virtual void BeforeKeyframe(const RxFrame& kf) = 0;
+   virtual void BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) = 0;
+};
+
+// Match role: the watch session of one watch phase gets its address and its log from the match session
+struct InnerWatch
+{
+   std::string host;
+   uint16_t port = 0;
+   ReplayObserver* observer = nullptr;
+   const StreamLog* log = nullptr;
+   bool staticRefresh = false; // rebuild the static pre-render after a keyframe, as a plain watcher does
+};
+
 class SessionImpl;
+class MatchSession;
 SessionImpl* g_session = nullptr;
 
 class SessionImpl final : public Session
 {
+   friend class MatchSession;
+
 public:
-   SessionImpl(Player* const player, const bool watch);
+   // inner: the watch phase of a match session. matchPlay: the play part of one.
+   SessionImpl(Player* const player, const bool watch, const InnerWatch* const inner = nullptr, const bool matchPlay = false);
    ~SessionImpl() override;
 
    bool IsWatcher() const override { return m_watch; }
@@ -606,6 +679,7 @@ public:
    void OnPhysicsStep(const unsigned long long targetUsec) override;
 
    void Record(IDispatch* const obj, const DISPID dispid, const WORD flags, const DISPPARAMS* const params);
+   void BaselineBefore(IDispatch* const obj, const DISPID dispid, const DISPPARAMS* const params);
 
 private:
    // Setup
@@ -650,7 +724,16 @@ private:
    bool ParseHello(const Message& m, Hello& h) const;
    bool CheckHello(const Hello& h, std::string& why) const;
    void AccountBytes(Peer& p);
-   void Note(const std::string& text, const U32 ms = NOTE_MS) { m_notes.emplace_back(text, ms); }
+   void Note(const std::string& text, const U32 ms = NOTE_MS)
+   {
+      if (!m_quiet) // a match session writes nothing on the table: the companion has the match's display
+         m_notes.emplace_back(text, ms);
+   }
+
+   // Match role, the play part
+   void CaptureOwnState(); // into m_state: the physics state now, or the one held while another player's table is shown
+   void Freeze();
+   void Unfreeze();
    void FlushNotes();
    void LogStats(const uint64_t now);
    Policy* NewPolicy(const int key, const std::string& kind, IDispatch* const sample);
@@ -658,7 +741,23 @@ private:
 
    Player* const m_player;
    const bool m_watch;
+   const bool m_inner;     // the watch phase of a match session
+   const bool m_matchPlay; // the play part of a match session
+   const bool m_quiet;     // no notifications on the table
+   ReplayObserver* const m_observer;
+   const bool m_staticRefresh;
    StreamLog m_log;
+
+   // Match role, the play part: while another player's table is shown here, this table's own state as it was when
+   // the watch began is what its own watchers are sent, under a stamp that stands still (a paused player's stream)
+   bool m_frozen = false;
+   std::vector<uint8_t> m_frozenState;
+   uint64_t m_frozenStamp = 0;
+   // Match role, the play part: the table file's value of every property this table's script has put
+   std::unordered_map<std::string, Baseline> m_baseline;
+   std::unordered_set<uint64_t> m_baselineSeen; // (object id << 32 | DISPID) of the puts without index arguments
+   bool m_inBaseline = false;
+   uint64_t m_baselineUnreadable = 0;
 
    // Configuration
    std::string m_addrText;
@@ -807,17 +906,25 @@ private:
 // ---------------------------------------------------------------------------------------------------------
 // Setup and teardown
 
-SessionImpl::SessionImpl(Player* const player, const bool watch)
+SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatch* const inner, const bool matchPlay)
    : m_player(player)
    , m_watch(watch)
+   , m_inner(inner != nullptr)
+   , m_matchPlay(matchPlay)
+   , m_quiet(inner != nullptr || matchPlay)
+   , m_observer(inner ? inner->observer : nullptr)
+   , m_staticRefresh(inner ? inner->staticRefresh : true)
    , m_tsc0(__rdtsc())
    , m_qpc0(NowUsec())
 {
-   m_log.Open(GetEnv("CASTCADE_STREAM_LOG"), watch ? "watch" : "play");
+   if (inner)
+      m_log.OpenShared(*inner->log, "watch");
+   else
+      m_log.Open(GetEnv("CASTCADE_STREAM_LOG"), watch ? "watch" : "play");
 
    const std::wstring recordSpec = GetEnvW(L"CASTCADE_STREAM_RECORD");
    const bool record = !watch && !recordSpec.empty();
-   m_addrText = GetEnv("CASTCADE_STREAM_ADDR");
+   m_addrText = inner ? "connect:" + inner->host + ":" + std::to_string(inner->port) : GetEnv("CASTCADE_STREAM_ADDR");
    // A player that records and has no address opens no socket at all: no listener on every interface by
    // default, so no Windows Firewall prompt
    if (m_addrText.empty() && !watch && !record)
@@ -875,7 +982,8 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
    const size_t slash = file.find_last_of("\\/");
    m_tableFile = slash == std::string::npos ? file : file.substr(slash + 1);
 
-   g_session = this; // before the identity probes, which go through OnScriptCall
+   if (!m_inner)
+      g_session = this; // before the identity probes, which go through OnScriptCall
    BuildObjectMap();
 
    m_log.Info(Fmt("session start: role %s, address %s (%s %s:%u), delay %d ms, sound %s, never pauses %s, table '%s', %u editables, hash %016llx, build %s",
@@ -910,13 +1018,20 @@ SessionImpl::SessionImpl(Player* const player, const bool watch)
 
    m_statsStart = NowUsec();
    if (!watch)
+   {
       g_recordCalls = true; // the script starts right after this returns: its global code is recorded too
+      g_baselinePuts = m_matchPlay;
+   }
 }
 
 SessionImpl::~SessionImpl()
 {
-   g_recordCalls = false;
-   g_session = nullptr;
+   if (!m_inner) // a match session's watch phase ends while its play part goes on
+   {
+      g_recordCalls = false;
+      g_baselinePuts = false;
+      g_session = nullptr;
+   }
    // Test: CASTCADE_TEST_EXITWARN=<n> writes n warnings right before the session ends, so that the log's writer
    // thread is still mirroring them into the VPX log while this thread waits for it (the exit hang of 050a169)
    const int exitWarn = std::clamp(atoi(GetEnv("CASTCADE_TEST_EXITWARN").c_str()), 0, 100000);
@@ -1237,10 +1352,110 @@ void SessionImpl::Record(IDispatch* const obj, const DISPID dispid, const WORD f
       m_probeSeen = obj;
       return;
    }
+   if (m_inBaseline) // the session's own read of a property, not a script call
+      return;
    const uint64_t t0 = __rdtsc();
    ++m_frameSeen;
    RecordImpl(obj, dispid, flags, params);
    m_frameTicks += __rdtsc() - t0;
+}
+
+// Match role. A watch phase must first bring this table to what the table file gives, for every property this
+// table's script has put and the watched player's has not (a lamp lit in this game and never touched in the other
+// one), and no keyframe carries such a value. So it is read here, the first time the script is about to put a
+// property (object, DISPID, index arguments): what the property holds then is what the file gave it. Every later
+// put of it costs one lookup of the object and one of the property.
+void SessionImpl::BaselineBefore(IDispatch* const obj, const DISPID dispid, const DISPPARAMS* const params)
+{
+   if (!params || params->cArgs == 0 || params->cArgs > 8)
+      return;
+   const uint64_t t0 = __rdtsc();
+   const auto it = m_objects.find(obj);
+   if (it != m_objects.end() && it->second.cls != KC_BALL)
+   {
+      const ObjInfo& o = it->second;
+      const bool plain = params->cArgs == 1;
+      const uint64_t fast = ((uint64_t)o.id << 32) | (uint32_t)dispid;
+      if (!plain || !m_baselineSeen.count(fast))
+      {
+         const Policy& p = *o.policy;
+         uint8_t rule = 0;
+         const auto r = p.rules.find(dispid);
+         if (r != p.rules.end())
+            rule = r->second;
+         bool wanted = (rule & RULE_PUT) != 0 || (p.putsByDefault && !(rule & RULE_NO_PUT));
+         m_key.assign(8, '\0');
+         memcpy(m_key.data(), &o.id, 4);
+         memcpy(m_key.data() + 4, &dispid, 4);
+         if (wanted && !plain)
+         {
+            m_args.clear();
+            for (UINT i = 1; wanted && i < params->cArgs; ++i)
+               wanted = EncodeVariant(m_args, params->rgvarg[i]);
+            m_key.append((const char*)m_args.data(), m_args.size());
+         }
+         if (wanted && !m_baseline.count(m_key))
+         {
+            Baseline b;
+            b.obj = o.id;
+            b.dispid = dispid;
+            b.args.v.resize(params->cArgs);
+            for (VARIANT& v : b.args.v)
+               VariantInit(&v);
+            bool ok = true;
+            for (UINT i = 1; ok && i < params->cArgs; ++i)
+               ok = SUCCEEDED(VariantCopyInd(&b.args.v[i], &params->rgvarg[i]));
+            if (ok)
+            {
+               DISPPARAMS get = { params->cArgs > 1 ? params->rgvarg + 1 : nullptr, nullptr, params->cArgs - 1, 0 };
+               m_inBaseline = true;
+               b.readable = SUCCEEDED(obj->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &get, &b.args.v[0], nullptr, nullptr));
+               m_inBaseline = false;
+               // A value that cannot be a put's argument again (an object) is of no use here
+               if (b.readable && (V_VT(&b.args.v[0]) == VT_DISPATCH || V_VT(&b.args.v[0]) == VT_UNKNOWN))
+                  b.readable = false;
+               if (!b.readable)
+               {
+                  VariantClear(&b.args.v[0]);
+                  ++m_baselineUnreadable;
+               }
+               m_baseline.emplace(m_key, std::move(b));
+            }
+         }
+         if (plain)
+            m_baselineSeen.insert(fast);
+      }
+   }
+   m_frameTicks += __rdtsc() - t0;
+}
+
+void SessionImpl::CaptureOwnState()
+{
+   m_state.clear();
+   if (m_frozen)
+      m_state.raw(m_frozenState.data(), m_frozenState.size());
+   else
+      CaptureState(m_player, m_ballIds, m_state);
+}
+
+// Match role: this table is about to show another player's. From here to Unfreeze nothing is recorded (what is
+// replayed here is not this table's script), and this table's own watchers get its state as it is now.
+void SessionImpl::Freeze()
+{
+   m_frozenStamp = PhysicsStamp();
+   m_state.clear();
+   CaptureState(m_player, m_ballIds, m_state);
+   m_frozenState = m_state.vec();
+   m_frozen = true;
+   g_recordCalls = false;
+   g_baselinePuts = false;
+}
+
+void SessionImpl::Unfreeze()
+{
+   m_frozen = false;
+   g_recordCalls = true;
+   g_baselinePuts = m_matchPlay;
 }
 
 // The hot path: one lookup for the object, one for the policy, encode into a reusable buffer, one lookup in
@@ -1399,8 +1614,7 @@ void SessionImpl::RecordImpl(IDispatch* const obj, const DISPID dispid, const WO
 
 void SessionImpl::BuildFrame(ByteWriter& w, const uint64_t time)
 {
-   m_state.clear();
-   CaptureState(m_player, m_ballIds, m_state);
+   CaptureOwnState();
    w.clear();
    w.u64(time);
    w.u32(m_frameSeq);
@@ -1412,8 +1626,7 @@ void SessionImpl::BuildFrame(ByteWriter& w, const uint64_t time)
 // The physics state now plus every stored put and sticky method in the order they were made
 void SessionImpl::BuildKeyframe(ByteWriter& w)
 {
-   m_state.clear();
-   CaptureState(m_player, m_ballIds, m_state);
+   CaptureOwnState();
    w.clear();
    w.u64(PhysicsStamp());
    w.u32(m_frameSeq);
@@ -1646,6 +1859,8 @@ void SessionImpl::PlayFrame(const uint64_t now)
 
 uint64_t SessionImpl::PhysicsStamp() const
 {
+   if (m_frozen) // match role, another player's table is shown here: this game stands still, and so does its stamp
+      return m_frozenStamp;
    // usec() and NowUsec() both count QueryPerformanceCounter, from different origins
    const int64_t behind = (int64_t)usec() - (int64_t)PhysicsClockUsec(m_player);
    return (uint64_t)((int64_t)NowUsec() - behind);
@@ -1700,7 +1915,7 @@ void SessionImpl::EmitFrame(const uint64_t stamp)
 // 144 fps), only during a catch-up; normal frames are unchanged.
 void SessionImpl::OnPhysicsStep(const unsigned long long targetUsec)
 {
-   if (m_watch || !m_catchupFrames || m_lastFrameAt == 0 || (!m_recorder && m_peers.empty()))
+   if (m_watch || m_frozen || !m_catchupFrames || m_lastFrameAt == 0 || (!m_recorder && m_peers.empty()))
       return;
    const uint64_t phys = PhysicsClockUsec(m_player);
    const double interval = std::clamp(m_frameIntervalUsec, 3000., 17000.);
@@ -1916,6 +2131,9 @@ void SessionImpl::Replay(RxFrame& f)
          }
          continue;
       }
+      // Match role: the value about to be replaced is read first, so that this table's own can be put back
+      if (m_observer)
+         m_observer->BeforeCall(c, c.argc ? &f.args[c.argStart] : nullptr, cls, target);
       DISPPARAMS dp;
       dp.rgvarg = c.argc ? &f.args[c.argStart] : nullptr;
       dp.cArgs = c.argc;
@@ -1965,11 +2183,16 @@ void SessionImpl::ApplyKeyframe(RxFrame& kf)
    m_applier->Reset();
    m_timeline.clear();
    m_haveShown = m_held = m_catchup = m_epOpen = false;
+   // Match role: a keyframe builds on the table as its file gives it, which a table that has played its own game
+   // is not: the match session brings it there first (and hides the local balls)
+   if (m_observer)
+      m_observer->BeforeKeyframe(kf);
    m_applier->Apply(*kf.state, *kf.state, 1.f);
    const uint64_t failedBefore = m_iFailed + m_iUnresolved;
    const uint32_t replayedBefore = m_frameReplayed;
    Replay(kf);
-   MarkStaticPrepassDirty(m_player); // the desktop static pre-render is rebuilt from the replicated state
+   if (m_staticRefresh)
+      MarkStaticPrepassDirty(m_player); // the desktop static pre-render is rebuilt from the replicated state
    m_keyframeApplied = true;
    m_log.Info(Fmt("keyframe applied: %zu bytes, state %zu bytes, %zu calls (%u replayed, %llu failed or unresolved)", kf.bytes, kf.stateBytes, kf.calls.size(),
       m_frameReplayed - replayedBefore, (unsigned long long)(m_iFailed + m_iUnresolved - failedBefore)));
@@ -1996,6 +2219,10 @@ void SessionImpl::Refuse(const std::string& why)
 void SessionImpl::StopAllSoundsHere(const char* const why)
 {
    if (!m_watch || !m_player->m_ptable)
+      return;
+   // Match role with the stream's sound off (what a match runs with: the companion carries the sound): nothing the
+   // stream does plays here, so every sound that plays is this table's own, and stays
+   if (m_inner && !m_replaySound)
       return;
    const int before = CountPlayingSounds(m_player);
    m_player->m_ptable->StopAllSounds();
@@ -2519,11 +2746,928 @@ void SessionImpl::LogStats(const uint64_t now)
    m_statsStart = now;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Match role: a play session that can be sent to watch another player and called back (CastcadeStream.h).
+//
+// Playing is the play role, unchanged (m_play). A watch phase puts a watch session (m_watch, today's watch role
+// with its address given by the "watch" command) on top of the local table, which has played its own game:
+//
+//   Entering. The table's Paused event fires (a ROM table pauses VPinMAME in it), then no event reaches the script
+//   any more (g_holdEvents: timers, hits, keys, animation events), Player skips the physics and the timers as it
+//   does for a watcher (IsWatcher), and nothing is recorded. The local table is not touched until the other
+//   player's keyframe has arrived: a watch that never connects costs the player nothing but the pause.
+//
+//   The keyframe. A keyframe builds on the table as its file gives it. So first: the local balls are hidden (not
+//   destroyed, the script holds them), the state no property returns (TableRuntime) goes to what it was before
+//   the script started, and every property this table's script has put that the keyframe does not put goes to its
+//   file value (SessionImpl::BaselineBefore read it). Then the keyframe as on any watcher.
+//
+//   The undo list. Before any put reaches a local object in a watch phase (those of the step above included), the
+//   first time for that (object, property, index arguments), its value is read into m_undo. Where this table's own
+//   script last put that same value, the script's own argument is kept instead of the getter's (a getter may
+//   convert units; the put of the script's argument is the computation that made the state). A property with no
+//   getter (the DMD's pixels) is put back from the play part's stored calls. Materials changed by UpdateMaterial or
+//   MaterialColor are copied whole before the first change.
+//
+//   Leaving. The watch session ends (its balls are destroyed). The movers are put back first, so that a put's own
+//   side effect sees this table's angles; then the undo list, newest first; then the TableRuntime and the physics
+//   state saved at the start, the balls, the ball id counter, the music. The game clock goes back to where it stood
+//   (EndWatchPhase), recording resumes, events flow again, keys that changed while watching reach the script, the
+//   UnPaused event fires, and "state playing" goes out.
+//
+// Every way out of a watch phase is LeaveWatch: the "play" command, a refused stream, no stream within 4 s of a
+// "watch", a stream that stopped for 10 s, the player closing its table, a lost control connection, an unknown
+// command, this table closing.
+//
+// What the companion counts on (castcade repo, docs/design/state-stream-in-match.md and its control client): hello
+// and "state playing" are sent as soon as the connection exists, before anything is read; every "watch", a re-aim
+// included, is answered within 5 s by "state watching" or "state failed <reason>"; after a "state failed" this table
+// is back by itself and says "state playing"; a "play" while playing is answered "state playing"; a "watch" right
+// behind a "play" works; each token of a line is printable ASCII without spaces.
+
+constexpr uint64_t WATCH_FIRST_USEC = 4000000; // from a "watch" to its keyframe: the companion waits 5 s for the answer
+constexpr uint64_t WATCH_LOST_USEC = 10000000; // a stream that was shown and stopped: its 2 s retries get this long
+
+// One token of a control line: printable ASCII, no space, at most 128 characters
+std::string Token(const std::string& s)
+{
+   std::string t = s.substr(0, 128);
+   for (char& c : t)
+      if (c <= ' ' || c > '~')
+         c = '_';
+   return t.empty() ? std::string("_") : t;
+}
+
+bool IsNumber(const VARTYPE vt)
+{
+   switch (vt)
+   {
+   case VT_I1: case VT_I2: case VT_I4: case VT_I8: case VT_INT:
+   case VT_UI1: case VT_UI2: case VT_UI4: case VT_UI8: case VT_UINT:
+   case VT_R4: case VT_R8: case VT_CY: case VT_DATE: return true;
+   default: return false;
+   }
+}
+
+// Whether two property values are the same: numbers within the tolerance (relative, absolute below 1), booleans and
+// strings exactly. Anything else is never the same.
+bool SameValue(const VARIANT& a, const VARIANT& b, const double tolerance)
+{
+   if (IsNumber(V_VT(&a)) && IsNumber(V_VT(&b)))
+   {
+      VARIANT x, y;
+      VariantInit(&x);
+      VariantInit(&y);
+      if (FAILED(VariantChangeType(&x, const_cast<VARIANT*>(&a), 0, VT_R8)) || FAILED(VariantChangeType(&y, const_cast<VARIANT*>(&b), 0, VT_R8)))
+         return false;
+      const double p = V_R8(&x), q = V_R8(&y);
+      return fabs(p - q) <= tolerance * (std::max)(1.0, (std::max)(fabs(p), fabs(q)));
+   }
+   if (V_VT(&a) == VT_BOOL && V_VT(&b) == VT_BOOL)
+      return (V_BOOL(&a) != 0) == (V_BOOL(&b) != 0);
+   if (V_VT(&a) == VT_BSTR && V_VT(&b) == VT_BSTR)
+   {
+      const UINT n = SysStringLen(V_BSTR(&a));
+      return n == SysStringLen(V_BSTR(&b)) && (n == 0 || memcmp(V_BSTR(&a), V_BSTR(&b), n * sizeof(OLECHAR)) == 0);
+   }
+   return false;
+}
+
+std::string VarText(const VARIANT& v)
+{
+   if (V_VT(&v) & VT_ARRAY)
+      return "(array)";
+   VARIANT s;
+   VariantInit(&s);
+   if (FAILED(VariantChangeType(&s, const_cast<VARIANT*>(&v), 0, VT_BSTR)))
+      return Fmt("(vt %u)", (unsigned)V_VT(&v));
+   const std::string text = V_VT(&v) == VT_BSTR ? "'" + Narrow(V_BSTR(&s)) + "'" : Narrow(V_BSTR(&s));
+   VariantClear(&s);
+   return text;
+}
+
+class MatchSession final : public Session, private ReplayObserver
+{
+public:
+   explicit MatchSession(Player* const player);
+   ~MatchSession() override;
+
+   bool IsWatcher() const override { return m_watching; }
+   bool NeverPauses() const override { return m_watching || m_play.NeverPauses(); }
+   // While watching, the balls that come and go are the watch session's
+   void OnBallCreated(Ball* const ball) override
+   {
+      if (!m_watching)
+         m_play.OnBallCreated(ball);
+   }
+   void OnBallDestroyed(Ball* const ball) override
+   {
+      if (!m_watching)
+         m_play.OnBallDestroyed(ball);
+   }
+   void OnFrame() override;
+   void OnPhysicsStep(const unsigned long long targetUsec) override
+   {
+      if (!m_watching)
+         m_play.OnPhysicsStep(targetUsec);
+   }
+   bool OnKeyEvent(const int dispid, const int keycode) override;
+
+private:
+   struct Undo
+   {
+      std::string key;
+      uint32_t obj = 0;
+      DISPID dispid = 0;
+      uint8_t kind = CALL_PUT;
+      bool readable = false;  // args.v[0] holds the value to put back
+      bool fromStore = false; // ... and it is this table's own stored argument
+      VarList args;
+   };
+   struct CheckProp
+   {
+      uint32_t obj;
+      IDispatch* disp;
+      MEMBERID id;
+   };
+
+   // ReplayObserver
+   void BeforeKeyframe(const RxFrame& kf) override;
+   void BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) override;
+
+   void ServiceControl(const uint64_t now);
+   void Command(const std::string& line, const uint64_t now);
+   void Send(const std::string& line);
+   void EnterWatch(const std::string& host, const uint16_t port, const uint64_t now);
+   void StartInner(const std::string& host, const uint16_t port);
+   void CheckWatch(const uint64_t now);
+   void LeaveWatch(const char* const why, const char* const failed);
+
+   IDispatch* ResolveOwn(const uint32_t id) const;
+   bool MakeKey(const uint32_t obj, const DISPID dispid, const VARIANT* const args, const size_t argc, std::string& key);
+   void Capture(const std::string& key, const uint32_t obj, const DISPID dispid, const uint8_t kind, const VARIANT* const args, const size_t argc, IDispatch* const target);
+   HRESULT Put(IDispatch* const target, const DISPID dispid, const uint8_t kind, const VARIANT* const args, const size_t argc) const;
+   bool PutFileValue(const std::string& key, const uint32_t obj, const DISPID dispid, const VarList& desired);
+   std::string CallName(const uint32_t obj, const DISPID dispid) const;
+
+   // CASTCADE_TEST_MATCHCHECK
+   void BuildCheckProps();
+   void Fingerprint(std::vector<std::vector<uint8_t>>& out) const;
+   void CompareFingerprint();
+
+   Player* const m_player;
+   SessionImpl m_play;
+   StreamLog m_log;
+   std::unique_ptr<SessionImpl> m_watch;
+   const DISPID m_dispidPut = DISPID_PROPERTYPUT;
+
+   // Configuration
+   std::string m_ctlHost;
+   uint16_t m_ctlPort = 0;
+   bool m_ctlOk = false;
+   bool m_wsa = false;
+   bool m_staticRefresh = false;
+   bool m_check = false;
+   bool m_testNoUndo = false; // CASTCADE_TEST_MATCHNOUNDO=1: leave the undo list and the runtime state unapplied
+   uint64_t m_ballLogUsec = 0, m_nextBallLog = 0;
+
+   // The control connection
+   std::unique_ptr<LinePeer> m_ctl;
+   bool m_ctlUp = false; // connected, hello sent
+   uint64_t m_ctlNextRetry = 0;
+   uint64_t m_ctlLastFailLog = 0;
+   std::vector<std::string> m_lines;
+
+   // The local table's objects by stream id (as a watcher's map)
+   std::vector<IDispatch*> m_ownDisp;
+   std::vector<const WCHAR*> m_ownName;
+   IDispatch* m_tableDisp = nullptr;
+   IDispatch* m_globalDisp = nullptr;
+   DISPID m_dispUpdateMaterial = DISPID_UNKNOWN, m_dispMaterialColor = DISPID_UNKNOWN;
+   std::shared_ptr<const TableRuntime> m_fileRuntime; // before the script started
+
+   // The watch phase
+   bool m_watching = false;
+   bool m_disturbed = false;   // a keyframe has been applied: the local table shows another player's
+   bool m_saidWatching = false;
+   int m_upFrames = 0;
+   std::string m_watchAddr;
+   uint64_t m_watchSince = 0;
+   uint64_t m_noStreamSince = 0;
+   uint64_t m_phases = 0;
+   std::shared_ptr<const OwnPhysics> m_ownPhysics;
+   std::shared_ptr<const TableRuntime> m_ownRuntime;
+   std::shared_ptr<OwnPlayer> m_own;
+   std::vector<Undo> m_undo;
+   std::unordered_map<std::string, size_t> m_undoIndex;
+   std::unordered_map<std::wstring, std::shared_ptr<const SavedMaterial>> m_materials;
+   std::unordered_set<std::string> m_kfKeys;
+   ByteWriter m_enc;
+   std::string m_keyBuf;
+   int m_warned = 0;
+
+   // Keys: what the script was last told, and what happened while it was not told
+   std::unordered_map<int, bool> m_keysTold, m_keysNow;
+
+   // CASTCADE_TEST_MATCHCHECK
+   std::vector<CheckProp> m_checkProps;
+   bool m_checkBuilt = false;
+   std::vector<std::vector<uint8_t>> m_checkBefore;
+};
+
+MatchSession::MatchSession(Player* const player)
+   : m_player(player)
+   , m_play(player, false, nullptr, true)
+{
+   m_log.OpenShared(m_play.m_log, "match");
+   m_fileRuntime = SaveTableRuntime(player);
+
+   PinTable* const table = player->m_ptable;
+   m_ownDisp.assign(table->m_vedit.size(), nullptr);
+   m_ownName.assign(table->m_vedit.size(), nullptr);
+   for (size_t i = 0; i < table->m_vedit.size(); ++i)
+      if (IScriptable* const ps = table->m_vedit[i]->GetScriptable())
+      {
+         m_ownDisp[i] = ps->GetDispatch();
+         m_ownName[i] = ps->m_wzName;
+      }
+   m_tableDisp = table->GetDispatch();
+   m_globalDisp = table->m_psgt->GetDispatch();
+   {
+      LPOLESTR a = const_cast<LPOLESTR>(L"UpdateMaterial"), b = const_cast<LPOLESTR>(L"MaterialColor");
+      if (FAILED(m_globalDisp->GetIDsOfNames(IID_NULL, &a, 1, LOCALE_USER_DEFAULT, &m_dispUpdateMaterial)))
+         m_dispUpdateMaterial = DISPID_UNKNOWN;
+      if (FAILED(m_globalDisp->GetIDsOfNames(IID_NULL, &b, 1, LOCALE_USER_DEFAULT, &m_dispMaterialColor)))
+         m_dispMaterialColor = DISPID_UNKNOWN;
+   }
+
+   m_staticRefresh = GetEnv("CASTCADE_STREAM_STATICREFRESH") == "1";
+   m_check = GetEnv("CASTCADE_TEST_MATCHCHECK") == "1";
+   m_testNoUndo = GetEnv("CASTCADE_TEST_MATCHNOUNDO") == "1";
+   if (m_testNoUndo)
+      m_log.Warn("TEST: CASTCADE_TEST_MATCHNOUNDO=1, properties and runtime state are NOT put back after a watch phase (shows that the checks see it)");
+   m_ballLogUsec = (uint64_t)std::clamp(atoi(GetEnv("CASTCADE_TEST_BALLLOG").c_str()), 0, 60000) * 1000;
+
+   // connect:<loopback host>:<port>, nothing else: the companion listens on this PC
+   const std::string ctl = GetEnv("CASTCADE_STREAM_CONTROL");
+   bool listen = true;
+   if (ctl.rfind("connect:", 0) == 0 && ParseAddr(ctl, listen, m_ctlHost, m_ctlPort) && !listen
+      && (m_ctlHost == "localhost" || m_ctlHost.rfind("127.", 0) == 0))
+   {
+      m_wsa = WireStartup();
+      m_ctlOk = m_wsa;
+   }
+   if (m_ctlOk)
+      m_log.Info(Fmt("role match: control connection to %s:%u (retried every 2 s); playing until told to watch; static pre-render after a keyframe %s%s",
+         m_ctlHost.c_str(), m_ctlPort, m_staticRefresh ? "rebuilt (CASTCADE_STREAM_STATICREFRESH=1)" : "kept", m_check ? "; TEST: every property compared after each watch phase" : ""));
+   else
+      m_log.Error(ctl.empty() ? std::string("role match without CASTCADE_STREAM_CONTROL (connect:127.0.0.1:<port>): this table plays and can never be told to watch")
+                              : "CASTCADE_STREAM_CONTROL '" + ctl + "' is not connect:127.0.0.1:<port> (this PC only): this table plays and can never be told to watch");
+}
+
+MatchSession::~MatchSession()
+{
+   // The table closes: its own state back first, so that its script ends on its own game (the Exit event follows)
+   if (m_watching)
+      LeaveWatch("this table closes", nullptr);
+   g_holdEvents = false;
+   if (m_ctl)
+   {
+      m_lines.clear();
+      m_ctl->Poll(m_lines); // flushes
+      m_ctl->Close();
+   }
+   if (m_wsa)
+      WireShutdown();
+   m_log.Info(Fmt("role match: %llu watch phases in this session", (unsigned long long)m_phases));
+}
+
+void MatchSession::OnFrame()
+{
+   const uint64_t now = NowUsec();
+   if (m_watching)
+   {
+      // Player calls a watcher before the frame's script timers: a "play" puts this table back before they run, and
+      // Player then calls again after them, as it calls a player
+      ServiceControl(now);
+      if (!m_watching)
+         return;
+      m_watch->OnFrame();
+      CheckWatch(now);
+      if (!m_watching)
+         return;
+      m_play.OnFrame(); // this table's own watchers: its state as it was, under a stamp that stands still
+      return;
+   }
+   m_play.OnFrame(); // first: the calls of this frame belong to this table's stream, whatever the control connection says next
+   if (m_ballLogUsec && now >= m_nextBallLog)
+   {
+      m_nextBallLog = now + m_ballLogUsec;
+      m_log.Info("balls " + DescribeLiveBalls(m_player));
+   }
+   ServiceControl(now);
+}
+
+void MatchSession::Send(const std::string& line)
+{
+   const bool sent = m_ctl && m_ctl->Connected() && m_ctl->Send(line);
+   m_log.Info((sent ? "control > " : "control (not connected) > ") + line);
+}
+
+void MatchSession::ServiceControl(const uint64_t now)
+{
+   if (!m_ctlOk)
+      return;
+   if (!m_ctl && now >= m_ctlNextRetry)
+   {
+      m_ctlNextRetry = now + RETRY_USEC;
+      m_ctlUp = false;
+      std::string err;
+      m_ctl = ConnectLines(m_ctlHost, m_ctlPort, err);
+      if (!m_ctl && now - m_ctlLastFailLog >= CONNECT_FAIL_LOG_USEC)
+      {
+         m_ctlLastFailLog = now;
+         m_log.Warn(Fmt("control: cannot connect to %s:%u: %s", m_ctlHost.c_str(), m_ctlPort, err.c_str()));
+      }
+   }
+   if (!m_ctl)
+      return;
+   m_lines.clear();
+   const bool alive = m_ctl->Poll(m_lines);
+   if (!m_ctlUp && m_ctl->Connected())
+   {
+      m_ctlUp = true;
+      m_log.Info(Fmt("control: connected to %s:%u", m_ctlHost.c_str(), m_ctlPort));
+      // hello <protocol> <build> <editables> <table hash>: the table identity is the stream's own (BuildHello)
+      Send(Fmt("hello 1 %s %u %016llx", Token(VP_VERSION_STRING_POINTS_FULL).c_str(), m_play.m_editCount, (unsigned long long)m_play.m_hash));
+      Send("state playing"); // true whenever a control connection begins: without one this table plays
+   }
+   // A line may end the connection's use (LeaveWatch sends on it), never the connection itself
+   const std::vector<std::string> lines = std::move(m_lines);
+   m_lines.clear();
+   for (const std::string& line : lines)
+      Command(line, now);
+   if (alive)
+      return;
+   if (m_ctlUp)
+      m_log.Warn("control: connection lost, retrying every 2 s");
+   else if (now - m_ctlLastFailLog >= CONNECT_FAIL_LOG_USEC)
+   {
+      m_ctlLastFailLog = now;
+      m_log.Info(Fmt("control: nothing listens on %s:%u yet, retrying every 2 s", m_ctlHost.c_str(), m_ctlPort));
+   }
+   m_ctl.reset();
+   m_ctlUp = false;
+   m_ctlNextRetry = now + RETRY_USEC;
+   if (m_watching)
+      LeaveWatch("the control connection is lost", nullptr);
+}
+
+void MatchSession::Command(const std::string& line, const uint64_t now)
+{
+   m_log.Info("control < " + line);
+   if (line == "play")
+   {
+      if (m_watching)
+         LeaveWatch("play", nullptr);
+      else
+         Send("state playing");
+      return;
+   }
+   if (line.rfind("watch ", 0) == 0)
+   {
+      const std::string addr = line.substr(6);
+      const size_t colon = addr.rfind(':');
+      uint16_t port = 0;
+      if (colon != std::string::npos && colon > 0 && addr.find(' ') == std::string::npos && ParsePort(addr.substr(colon + 1), port))
+      {
+         EnterWatch(addr.substr(0, colon), port, now);
+         return;
+      }
+      m_log.Warn("control: '" + line + "' is not watch <host>:<port>");
+      if (m_watching)
+         LeaveWatch("a watch command without an address", "badaddress");
+      else
+      {
+         Send("state failed badaddress");
+         Send("state playing");
+      }
+      return;
+   }
+   m_log.Warn("control: unknown command '" + line + "': playing");
+   if (m_watching)
+      LeaveWatch("an unknown command", nullptr);
+   else
+      Send("state playing");
+}
+
+bool MatchSession::OnKeyEvent(const int dispid, const int keycode)
+{
+   if (dispid != DISPID_GameEvents_KeyDown && dispid != DISPID_GameEvents_KeyUp)
+      return false;
+   const bool down = dispid == DISPID_GameEvents_KeyDown;
+   if (m_watching)
+   {
+      m_keysNow[keycode] = down; // not this player's turn: the script is told at the end, if it still matters
+      return true;
+   }
+   m_keysTold[keycode] = down;
+   return false;
+}
+
+void MatchSession::StartInner(const std::string& host, const uint16_t port)
+{
+   InnerWatch iw;
+   iw.host = host;
+   iw.port = port;
+   iw.observer = this;
+   iw.log = &m_log;
+   iw.staticRefresh = m_staticRefresh;
+   m_watch = std::make_unique<SessionImpl>(m_player, true, &iw);
+   m_saidWatching = false;
+   m_upFrames = 0;
+}
+
+void MatchSession::EnterWatch(const std::string& host, const uint16_t port, const uint64_t now)
+{
+   const std::string addr = host + ":" + std::to_string(port);
+   if (m_watching)
+   {
+      if (addr == m_watchAddr && m_watch && !m_watch->m_refused)
+      {
+         m_log.Info("already watching " + addr);
+         if (m_saidWatching)
+            Send("state watching");
+         return;
+      }
+      // The next player is up: the same watch phase, another stream. Its keyframe starts from the file state again.
+      m_log.Info("re-aiming the watch from " + m_watchAddr + " to " + addr);
+      m_watch.reset();
+      m_watchAddr = addr;
+      m_noStreamSince = now;
+      StartInner(host, port);
+      return;
+   }
+
+   const uint64_t t0 = NowUsec();
+   // The pause a real pause is: the script hears Paused (a ROM table stops VPinMAME in it), the music pauses
+   m_player->PauseMusic();
+   g_holdEvents = true;
+   m_play.Freeze();
+   m_ownPhysics = SaveOwnPhysics(m_player);
+   m_ownRuntime = SaveTableRuntime(m_player);
+   m_own = BeginWatchPhase(m_player);
+   if (m_check)
+   {
+      if (!m_checkBuilt)
+         BuildCheckProps();
+      Fingerprint(m_checkBefore);
+   }
+   m_keysNow = m_keysTold;
+   m_watching = true;
+   m_disturbed = false;
+   m_watchSince = now;
+   m_noStreamSince = now;
+   m_watchAddr = addr;
+   ++m_phases;
+   StartInner(host, port);
+   m_log.Info(Fmt("entering watch %llu of %s: own balls %s; own game paused in %.2f ms", (unsigned long long)m_phases, addr.c_str(), DescribeOwnBalls(*m_own).c_str(),
+      (double)(NowUsec() - t0) / 1000.));
+}
+
+void MatchSession::CheckWatch(const uint64_t now)
+{
+   SessionImpl& w = *m_watch;
+   if (w.m_refused)
+   {
+      LeaveWatch("the stream was refused (not the same table)", "refused");
+      return;
+   }
+   if (w.m_bye)
+   {
+      LeaveWatch("the watched player closed its table", "closed");
+      return;
+   }
+   const bool up = !w.m_peers.empty() && w.m_peers.front().helloOk && w.m_keyframeApplied;
+   if (up)
+   {
+      m_noStreamSince = 0;
+      // The keyframe was applied in an earlier frame: its picture has been drawn
+      if (!m_saidWatching && ++m_upFrames >= 2)
+      {
+         m_saidWatching = true;
+         Send("state watching");
+      }
+      return;
+   }
+   m_upFrames = 0;
+   if (m_noStreamSince == 0)
+      m_noStreamSince = now;
+   else if (now - m_noStreamSince >= (m_saidWatching ? WATCH_LOST_USEC : WATCH_FIRST_USEC))
+      LeaveWatch(m_saidWatching ? "the stream stopped for 10 s" : "no stream within 4 s of the watch command", m_saidWatching ? "lost" : "timeout");
+}
+
+IDispatch* MatchSession::ResolveOwn(const uint32_t id) const
+{
+   if (id == ID_TABLE)
+      return m_tableDisp;
+   if (id == ID_GLOBAL)
+      return m_globalDisp;
+   return id < m_ownDisp.size() ? m_ownDisp[id] : nullptr;
+}
+
+std::string MatchSession::CallName(const uint32_t obj, const DISPID dispid) const
+{
+   IDispatch* const d = ResolveOwn(obj);
+   const std::string who = obj == ID_TABLE ? "Table" : obj == ID_GLOBAL ? "Global" : (obj < m_ownName.size() && m_ownName[obj]) ? Narrow(m_ownName[obj]) : Fmt("object %u", obj);
+   return who + "." + MemberName(d, dispid);
+}
+
+// The key the play part stores a put under (RecordImpl): object, DISPID, the encoded index arguments
+bool MatchSession::MakeKey(const uint32_t obj, const DISPID dispid, const VARIANT* const args, const size_t argc, std::string& key)
+{
+   key.assign(8, '\0');
+   memcpy(key.data(), &obj, 4);
+   memcpy(key.data() + 4, &dispid, 4);
+   if (argc > 1)
+   {
+      m_enc.clear();
+      for (size_t i = 1; i < argc; ++i)
+         if (!EncodeVariant(m_enc, args[i]))
+            return false;
+      key.append((const char*)m_enc.data(), m_enc.size());
+   }
+   return true;
+}
+
+HRESULT MatchSession::Put(IDispatch* const target, const DISPID dispid, const uint8_t kind, const VARIANT* const args, const size_t argc) const
+{
+   DISPPARAMS dp;
+   dp.rgvarg = const_cast<VARIANT*>(args);
+   dp.cArgs = (UINT)argc;
+   dp.cNamedArgs = 1;
+   dp.rgdispidNamedArgs = const_cast<DISPID*>(&m_dispidPut);
+   return target->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, kind == CALL_PUTREF ? DISPATCH_PROPERTYPUTREF : DISPATCH_PROPERTYPUT, &dp, nullptr, nullptr, nullptr);
+}
+
+// First touch of a property in this watch phase: its value now, which is this table's own
+void MatchSession::Capture(const std::string& key, const uint32_t obj, const DISPID dispid, const uint8_t kind, const VARIANT* const args, const size_t argc, IDispatch* const target)
+{
+   Undo u;
+   u.key = key;
+   u.obj = obj;
+   u.dispid = dispid;
+   u.kind = kind;
+   u.args.v.resize(argc);
+   for (VARIANT& v : u.args.v)
+      VariantInit(&v);
+   bool ok = true;
+   for (size_t i = 1; ok && i < argc; ++i)
+      ok = SUCCEEDED(VariantCopyInd(&u.args.v[i], const_cast<VARIANT*>(&args[i])));
+   if (ok && kind == CALL_PUT)
+   {
+      DISPPARAMS get = { argc > 1 ? u.args.v.data() + 1 : nullptr, nullptr, (UINT)(argc - 1), 0 };
+      u.readable = SUCCEEDED(target->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &get, &u.args.v[0], nullptr, nullptr));
+      if (u.readable && (V_VT(&u.args.v[0]) == VT_DISPATCH || V_VT(&u.args.v[0]) == VT_UNKNOWN))
+         u.readable = false;
+      if (!u.readable)
+         VariantClear(&u.args.v[0]);
+   }
+   // This table's own last put of the property: the value to put back when there is nothing to read, and the better
+   // one when it is what was read
+   const auto st = m_play.m_stored.find(key);
+   if (ok && st != m_play.m_stored.end() && st->second.kind == kind && st->second.argc == argc)
+   {
+      VARIANT sv;
+      VariantInit(&sv);
+      ByteReader r(st->second.args.data(), st->second.args.size());
+      if (DecodeVariant(r, sv))
+      {
+         if (!u.readable || SameValue(u.args.v[0], sv, 1e-6))
+         {
+            VariantClear(&u.args.v[0]);
+            u.args.v[0] = sv; // ownership moves
+            u.readable = true;
+            u.fromStore = true;
+         }
+         else
+            VariantClear(&sv);
+      }
+   }
+   m_undoIndex.emplace(key, m_undo.size());
+   m_undo.push_back(std::move(u));
+}
+
+void MatchSession::BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target)
+{
+   if (cls == KC_BALL) // the watch session's own balls: gone with it
+      return;
+   if (c.kind == CALL_METHOD)
+   {
+      // What the other methods change is in the TableRuntime and the physics state saved when the phase began
+      if (c.obj == ID_GLOBAL && c.argc >= 1 && (c.dispid == m_dispUpdateMaterial || c.dispid == m_dispMaterialColor))
+      {
+         std::wstring name;
+         const VARIANT& n = args[c.argc - 1]; // a decoded argument: a plain BSTR
+         if (V_VT(&n) == VT_BSTR && V_BSTR(&n))
+            name.assign(V_BSTR(&n), SysStringLen(V_BSTR(&n)));
+         if (!name.empty() && !m_materials.count(name))
+            if (std::shared_ptr<const SavedMaterial> s = SaveMaterial(m_player, name))
+               m_materials.emplace(name, std::move(s));
+      }
+      return;
+   }
+   if (!MakeKey(c.obj, c.dispid, args, c.argc, m_keyBuf) || m_undoIndex.count(m_keyBuf))
+      return;
+   Capture(m_keyBuf, c.obj, c.dispid, c.kind, args, c.argc, target);
+}
+
+// The keyframe's pre-pass for one property: to the value the table file gave it. False when the put failed.
+bool MatchSession::PutFileValue(const std::string& key, const uint32_t obj, const DISPID dispid, const VarList& desired)
+{
+   IDispatch* const target = ResolveOwn(obj);
+   if (!target)
+      return false;
+   const bool first = !m_undoIndex.count(key);
+   if (first)
+   {
+      Capture(key, obj, dispid, CALL_PUT, desired.v.data(), desired.v.size(), target);
+      const Undo& u = m_undo.back();
+      if (u.readable && !u.fromStore && SameValue(u.args.v[0], desired.v[0], 0.))
+         return true; // it holds the file's value already
+   }
+   return SUCCEEDED(Put(target, dispid, CALL_PUT, desired.v.data(), desired.v.size()));
+}
+
+void MatchSession::BeforeKeyframe(const RxFrame& kf)
+{
+   const uint64_t t0 = NowUsec();
+   if (!m_disturbed)
+   {
+      m_disturbed = true;
+      HideOwnTable(m_player, *m_own);
+   }
+   // What no property returns: as before any script ran (the stamps of blinkers and reels start from now)
+   RestoreTableRuntime(m_player, *m_fileRuntime, true);
+
+   m_kfKeys.clear();
+   for (const RxCall& c : kf.calls)
+      if (c.kind != CALL_METHOD && !(c.obj & ID_BALL) && MakeKey(c.obj, c.dispid, &kf.args[c.argStart], c.argc, m_keyBuf))
+         m_kfKeys.insert(m_keyBuf);
+
+   // Every property this table's script has put, or an earlier stream of this phase has, that this keyframe does not
+   // put: to the table file's value
+   size_t puts = 0, failed = 0, unreadable = 0;
+   for (const auto& kv : m_play.m_baseline)
+   {
+      if (m_kfKeys.count(kv.first))
+         continue;
+      if (!kv.second.readable)
+      {
+         ++unreadable;
+         continue;
+      }
+      ++puts;
+      if (!PutFileValue(kv.first, kv.second.obj, kv.second.dispid, kv.second.args))
+      {
+         ++failed;
+         if (m_warned < MAX_LOGGED)
+         {
+            ++m_warned;
+            m_log.Warn("keyframe pre-pass: could not put the file's value of " + CallName(kv.second.obj, kv.second.dispid));
+         }
+      }
+   }
+   for (size_t i = 0; i < m_undo.size(); ++i)
+   {
+      const Undo& u = m_undo[i];
+      if (m_kfKeys.count(u.key) || m_play.m_baseline.count(u.key) || !u.readable || u.kind != CALL_PUT)
+         continue; // (a property this table's script never put: what was read at its first touch is the file's value)
+      IDispatch* const target = ResolveOwn(u.obj);
+      ++puts;
+      if (!target || FAILED(Put(target, u.dispid, u.kind, u.args.v.data(), u.args.v.size())))
+         ++failed;
+   }
+   m_log.Info(Fmt("keyframe pre-pass: local balls hidden, runtime state to the file's, %zu of %zu own properties not in the keyframe put to the file's value (%zu failed, %zu "
+                  "with no readable value left as they are); %zu in the undo list; %.2f ms",
+      puts, m_play.m_baseline.size(), failed, unreadable, m_undo.size(), (double)(NowUsec() - t0) / 1000.));
+}
+
+void MatchSession::LeaveWatch(const char* const why, const char* const failed)
+{
+   const uint64_t t0 = NowUsec();
+   if (m_watch)
+   {
+      m_watch->StopAllSoundsHere("the watch ends"); // nothing with the stream's sound off
+      m_watch.reset();                             // its balls are destroyed
+   }
+
+   size_t undone = 0, fromStore = 0, putFailed = 0, lost = 0;
+   const size_t materials = m_materials.size();
+   if (m_disturbed)
+   {
+      // The movers first: a put's own side effect (a gate told to open or close) must see this table's angles
+      RestoreOwnPhysics(m_player, *m_ownPhysics);
+      for (size_t i = m_undo.size(); i-- > 0;)
+      {
+         const Undo& u = m_undo[i];
+         IDispatch* const target = ResolveOwn(u.obj);
+         if (m_testNoUndo)
+            continue;
+         if (!u.readable || !target)
+         {
+            // No getter and never put by this table's script: nothing says what it was
+            ++lost;
+            if (m_warned < MAX_LOGGED)
+            {
+               ++m_warned;
+               m_log.Warn("cannot put back " + CallName(u.obj, u.dispid) + ": it has no readable value and this table's script never set it");
+            }
+            continue;
+         }
+         if (FAILED(Put(target, u.dispid, u.kind, u.args.v.data(), u.args.v.size())))
+         {
+            ++putFailed;
+            if (m_warned < MAX_LOGGED)
+            {
+               ++m_warned;
+               m_log.Warn("putting back " + CallName(u.obj, u.dispid) + " = " + VarText(u.args.v[0]) + " failed");
+            }
+            continue;
+         }
+         ++undone;
+         fromStore += u.fromStore ? 1 : 0;
+      }
+      for (const auto& kv : m_materials)
+         RestoreMaterial(m_player, *kv.second);
+      if (!m_testNoUndo)
+         RestoreTableRuntime(m_player, *m_ownRuntime, false);
+      RestoreOwnPhysics(m_player, *m_ownPhysics);
+      if (m_staticRefresh)
+         MarkStaticPrepassDirty(m_player);
+   }
+   // The balls shown again, the ball id counter, the music, and the game clock back to where this game stood
+   const unsigned int clockBack = EndWatchPhase(m_player, *m_own);
+
+   // The same bytes a watcher of this table was sent when the phase began?
+   ByteWriter after;
+   CaptureState(m_player, m_play.m_ballIds, after);
+   const bool samePhysics = after.vec() == m_play.m_frozenState;
+   if (m_check)
+      CompareFingerprint();
+
+   const size_t undoSize = m_undo.size();
+   const bool disturbed = m_disturbed;
+   m_undo.clear();
+   m_undoIndex.clear();
+   m_materials.clear();
+   m_ownPhysics.reset();
+   m_ownRuntime.reset();
+   m_disturbed = false;
+   m_saidWatching = false;
+
+   m_play.Unfreeze();
+   m_watching = false;
+   m_player->RecomputePauseState();
+   g_holdEvents = false;
+   m_player->UnpauseMusic(); // UnPaused: a ROM table lets VPinMAME run again
+   // Keys that changed while the script was not told: it hears the difference now (a flipper button let go)
+   const std::unordered_map<int, bool> now = std::move(m_keysNow);
+   m_keysNow.clear();
+   size_t keys = 0;
+   for (const auto& kv : now)
+   {
+      const auto told = m_keysTold.find(kv.first);
+      if ((told != m_keysTold.end() && told->second) != kv.second)
+      {
+         ++keys;
+         m_keysTold[kv.first] = kv.second;
+         m_player->m_ptable->FireKeyEvent(kv.second ? DISPID_GameEvents_KeyDown : DISPID_GameEvents_KeyUp, kv.first);
+      }
+   }
+
+   m_log.Info(Fmt("back to playing (%s) after %.2f s of watch %llu: %s; %zu of %zu properties put back (%zu with this table's own stored value, %zu failed, %zu lost), "
+                  "%zu materials; own physics state %s (balls %s); game clock set back %u ms; %zu key events passed on; %.2f ms",
+      why, (double)(t0 - m_watchSince) / 1e6, (unsigned long long)m_phases, disturbed ? "the table had shown the other player's" : "the table was never touched", undone,
+      undoSize, fromStore, putFailed, lost, materials, samePhysics ? "identical" : "DIFFERENT", DescribeOwnBalls(*m_own).c_str(), clockBack, keys,
+      (double)(NowUsec() - t0) / 1000.));
+   if (!samePhysics)
+      m_log.Error("the local physics state after the watch is not the one before it");
+   m_own.reset();
+
+   if (failed)
+      Send(std::string("state failed ") + failed);
+   Send("state playing");
+}
+
+// CASTCADE_TEST_MATCHCHECK=1: every property of every part and of the table that can be read without arguments, read
+// when a watch phase begins and again when it has ended. Thousands of calls: a test's check, not a match's.
+void MatchSession::BuildCheckProps()
+{
+   m_checkBuilt = true;
+   const auto add = [this](const uint32_t obj, IDispatch* const disp)
+   {
+      ITypeInfo* ti = nullptr;
+      if (!disp || FAILED(disp->GetTypeInfo(0, LOCALE_USER_DEFAULT, &ti)) || !ti)
+         return;
+      TYPEATTR* ta = nullptr;
+      if (SUCCEEDED(ti->GetTypeAttr(&ta)) && ta)
+      {
+         for (UINT f = 0; f < ta->cFuncs; ++f)
+         {
+            FUNCDESC* fd = nullptr;
+            if (FAILED(ti->GetFuncDesc(f, &fd)) || !fd)
+               continue;
+            const bool noArgs = fd->cParams == 0 || (fd->cParams == 1 && (fd->lprgelemdescParam[0].paramdesc.wParamFlags & PARAMFLAG_FRETVAL));
+            // Not the properties that return an object: nothing to compare, and Kicker.LastCapturedBall answers with a
+            // message box when there is none
+            // (the type info is the dual interface's: the value comes back through an [out, retval] pointer parameter;
+            // a dispinterface's would give it as the return type)
+            VARTYPE ret = fd->elemdescFunc.tdesc.vt;
+            if (fd->cParams == 1)
+            {
+               const TYPEDESC& td = fd->lprgelemdescParam[0].tdesc;
+               ret = (td.vt == VT_PTR && td.lptdesc) ? td.lptdesc->vt : td.vt;
+            }
+            const bool object = ret == VT_PTR || ret == VT_DISPATCH || ret == VT_UNKNOWN;
+            if (fd->invkind == INVOKE_PROPERTYGET && noArgs && !object && !(fd->wFuncFlags & (FUNCFLAG_FRESTRICTED | FUNCFLAG_FHIDDEN)))
+               m_checkProps.push_back(CheckProp { obj, disp, fd->memid });
+            ti->ReleaseFuncDesc(fd);
+         }
+         ti->ReleaseTypeAttr(ta);
+      }
+      ti->Release();
+   };
+   for (size_t i = 0; i < m_ownDisp.size(); ++i)
+      add((uint32_t)i, m_ownDisp[i]);
+   add(ID_TABLE, m_tableDisp);
+}
+
+void MatchSession::Fingerprint(std::vector<std::vector<uint8_t>>& out) const
+{
+   out.resize(m_checkProps.size());
+   ByteWriter w;
+   for (size_t i = 0; i < m_checkProps.size(); ++i)
+   {
+      const CheckProp& p = m_checkProps[i];
+      VARIANT v;
+      VariantInit(&v);
+      DISPPARAMS none = {};
+      w.clear();
+      const HRESULT hr = p.disp->Invoke(p.id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &none, &v, nullptr, nullptr);
+      if (FAILED(hr))
+      {
+         w.u8(0xFF);
+         w.u32((uint32_t)hr);
+      }
+      else if (!EncodeVariant(w, v)) // an object: only that it is one
+      {
+         w.clear();
+         w.u8(0xFE);
+         w.u16(V_VT(&v));
+      }
+      VariantClear(&v);
+      out[i] = w.vec();
+   }
+}
+
+void MatchSession::CompareFingerprint()
+{
+   std::vector<std::vector<uint8_t>> after;
+   Fingerprint(after);
+   size_t differ = 0, approx = 0;
+   for (size_t i = 0; i < after.size() && i < m_checkBefore.size(); ++i)
+   {
+      if (after[i] == m_checkBefore[i])
+         continue;
+      VARIANT a, b;
+      VariantInit(&a);
+      VariantInit(&b);
+      ByteReader ra(m_checkBefore[i].data(), m_checkBefore[i].size()), rb(after[i].data(), after[i].size());
+      const bool decoded = !m_checkBefore[i].empty() && !after[i].empty() && m_checkBefore[i][0] < 0xFE && after[i][0] < 0xFE && DecodeVariant(ra, a) && DecodeVariant(rb, b);
+      if (decoded && SameValue(a, b, 1e-4))
+         ++approx; // a float through a getter and a setter
+      else
+      {
+         ++differ;
+         if (differ <= 40)
+            m_log.Warn("match check: DIFFERENT " + CallName(m_checkProps[i].obj, m_checkProps[i].id) + ": before " + (decoded ? VarText(a) : std::string("(unreadable)")) + ", after "
+               + (decoded ? VarText(b) : std::string("(unreadable)")));
+      }
+      VariantClear(&a);
+      VariantClear(&b);
+   }
+   m_log.Info(Fmt("match check: %zu properties compared, %zu differ, %zu equal within 0.01 %% only", after.size(), differ, approx));
+   m_checkBefore.clear();
+}
+
 } // namespace
 
 Session* Session::Create(Player* const player)
 {
    const std::string mode = GetEnv("CASTCADE_STREAM");
+   if (mode == "match")
+      return new MatchSession(player);
    if (mode != "play" && mode != "watch")
       return nullptr;
    return new SessionImpl(player, mode == "watch");
@@ -2538,6 +3682,12 @@ void OnScriptCall(IDispatch* obj, DISPID dispid, WORD flags, const DISPPARAMS* p
 {
    if (g_session)
       g_session->Record(obj, dispid, flags, params);
+}
+
+void OnScriptPutBefore(IDispatch* obj, DISPID dispid, const DISPPARAMS* params)
+{
+   if (g_session)
+      g_session->BaselineBefore(obj, dispid, params);
 }
 
 }

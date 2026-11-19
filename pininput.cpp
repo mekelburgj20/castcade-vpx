@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include <cfgmgr32.h>
 #include <SetupAPI.h>
+#include "castcade/CastcadeStream.h"
 
 // from dinput.h, modernized to please clang
 #undef DIJOFS_X
@@ -1125,6 +1126,11 @@ void PinInput::FireKeyEvent(const int dispid, int keycode)
       // Mixer volume only
       m_mixerKeyDown = (keycode == g_pplayer->m_rgKeys[eVolumeDown] && dispid == DISPID_GameEvents_KeyDown);
       m_mixerKeyUp   = (keycode == g_pplayer->m_rgKeys[eVolumeUp]   && dispid == DISPID_GameEvents_KeyDown);
+
+      // Castcade match role: while another player's table is shown here, the script is not told about keys (the
+      // session tells it what changed once its own table is back)
+      if (g_pplayer->m_castcade && g_pplayer->m_castcade->OnKeyEvent(dispid, keycode))
+         return;
 
       g_pplayer->m_ptable->FireKeyEvent(dispid, keycode);
    }
