@@ -158,7 +158,8 @@ if (Test-Path -LiteralPath $Root) {
         try {
             foreach ($e in @(Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json)) {
                 $pr = Get-Process -Id $e.pid -ErrorAction SilentlyContinue
-                if ($pr -and $pr.StartTime.ToString('o') -eq $e.start) { Fail "an earlier run still has a live process: PID $($e.pid) ($($_.FullName))" }
+                # (a PID of an old run can belong to another process by now, even one whose start time cannot be read)
+                if ($pr -and $pr.StartTime -and $pr.StartTime.ToString('o') -eq $e.start) { Fail "an earlier run still has a live process: PID $($e.pid) ($($_.FullName))" }
             }
         } catch [System.Management.Automation.RuntimeException] { throw } catch {}
     }

@@ -82,8 +82,9 @@ through.
   swap: the match role's stream is the play role's, and stands still while A watches.
 
 `-Check` sets `CASTCADE_TEST_MATCHCHECK=1`: before each watch phase and after it the instance reads every property of
-every part that takes no argument (about 4000 on Nudge Test, 22000 on Attack from Mars) and logs each one that differs;
-the summary counts them. Every instance also logs, always, whether its physics state after the watch (the bytes a
+every part that takes no argument and returns no object (3913 on Nudge Test, 19916 on Attack from Mars, 49263 on
+Monster Bash) and logs each one that differs; the summary counts them. A getter that faults is named in the log and
+left out (stock VPX: `Light.FilamentTemperature` of a light whose intensity is 0, six of them on Monster Bash). Every instance also logs, always, whether its physics state after the watch (the bytes a
 watcher of it is sent: moving parts, balls, nudge, game clock) is identical to the one before. `-Rom` names the
 VPinMAME roms whose `nvram\<rom>.nv` and `cfg\<rom>.cfg` are copied before the run and put back after it (two
 instances write them when they close). `-StaticRefresh` sets `CASTCADE_STREAM_STATICREFRESH=1`. `-NoFrameLog` runs

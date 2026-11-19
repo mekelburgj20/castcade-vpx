@@ -2953,7 +2953,7 @@ private:
 
    // CASTCADE_TEST_MATCHCHECK
    void BuildCheckProps();
-   void Fingerprint(std::vector<std::vector<uint8_t>>& out) const;
+   void Fingerprint(std::vector<std::vector<uint8_t>>& out);
    void CompareFingerprint();
 
    Player* const m_player;
@@ -3014,6 +3014,7 @@ private:
    // CASTCADE_TEST_MATCHCHECK
    std::vector<CheckProp> m_checkProps;
    bool m_checkBuilt = false;
+   bool m_checkPruned = false;
    std::vector<std::vector<uint8_t>> m_checkBefore;
 };
 
@@ -3658,8 +3659,52 @@ void MatchSession::BuildCheckProps()
    add(ID_TABLE, m_tableDisp);
 }
 
-void MatchSession::Fingerprint(std::vector<std::vector<uint8_t>>& out) const
+// A getter of the test's check, with a fault in it caught: on Monster Bash (VPW) 6 of the 49269 fault (Light's
+// FilamentTemperature on lights whose intensity is 0). No C++ object lives in this function (structured exception
+// handling).
+static HRESULT GetGuarded(IDispatch* const disp, const DISPID id, VARIANT* const out, bool* const faulted)
 {
+   DISPPARAMS none = {};
+   __try
+   {
+      return disp->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &none, out, nullptr, nullptr);
+   }
+   __except (EXCEPTION_EXECUTE_HANDLER)
+   {
+      *faulted = true;
+      return E_UNEXPECTED;
+   }
+}
+
+void MatchSession::Fingerprint(std::vector<std::vector<uint8_t>>& out)
+{
+   // First use: the getters that fault are found once and left out from then on (before and after must read the same list)
+   if (!m_checkPruned)
+   {
+      m_checkPruned = true;
+      std::vector<CheckProp> ok;
+      ok.reserve(m_checkProps.size());
+      size_t faults = 0;
+      for (const CheckProp& p : m_checkProps)
+      {
+         VARIANT v;
+         VariantInit(&v);
+         bool faulted = false;
+         GetGuarded(p.disp, p.id, &v, &faulted);
+         if (faulted)
+         {
+            if (++faults <= 20)
+               m_log.Warn("match check: reading " + CallName(p.obj, p.id) + " faults (an access violation inside the getter); left out of the check");
+         }
+         else
+         {
+            VariantClear(&v);
+            ok.push_back(p);
+         }
+      }
+      m_checkProps.swap(ok);
+      m_log.Info(Fmt("match check: %zu properties will be compared, %zu left out because their getter faults", m_checkProps.size(), faults));
+   }
    out.resize(m_checkProps.size());
    ByteWriter w;
    for (size_t i = 0; i < m_checkProps.size(); ++i)
@@ -3667,9 +3712,9 @@ void MatchSession::Fingerprint(std::vector<std::vector<uint8_t>>& out) const
       const CheckProp& p = m_checkProps[i];
       VARIANT v;
       VariantInit(&v);
-      DISPPARAMS none = {};
+      bool faulted = false;
       w.clear();
-      const HRESULT hr = p.disp->Invoke(p.id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &none, &v, nullptr, nullptr);
+      const HRESULT hr = GetGuarded(p.disp, p.id, &v, &faulted);
       if (FAILED(hr))
       {
          w.u8(0xFF);
