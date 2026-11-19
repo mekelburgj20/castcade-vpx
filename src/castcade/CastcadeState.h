@@ -123,6 +123,27 @@ std::string DescribeOwnBalls(const OwnPlayer& own);
 // The local time (Player::m_time_msec) and the local balls, for the test log (CASTCADE_TEST_BALLLOG)
 std::string DescribeLiveBalls(Player* player);
 
+// Whether the local table had music (a PlayMusic stream) when the watch phase began
+bool OwnMusicPresent(const OwnPlayer& own);
+// 0 = the local table has no music now, 1 = it has a stream that is not playing (paused or ended), 2 = it plays
+int MusicNow(Player* player);
+
+// Whether two CaptureState blobs hold the same state, the live accelerometer reading aside (a rig with analog nudge
+// never reads the same value twice; it is input, not state)
+bool SameStateWithoutInput(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b);
+
+// The test's deep check (CASTCADE_TEST_MATCHCHECK): the table's internal state, named part by part: the fields no
+// property shows (a lamp's stored state beside its play state, sequencer locks, animation and blink phases and
+// their stamps, the movers, which hit objects collide, when each timer fires next, the balls, the game clock).
+struct DeepEntry
+{
+   std::string name;
+   std::vector<uint8_t> bytes;
+};
+void CaptureDeepState(Player* player, std::vector<DeepEntry>& out);
+// "targets moving 1, sequences playing 0, ..." on the local table now, for the log line of a watch that begins
+std::string DescribeOwnActivity(Player* player);
+
 // PinTable::GetMaterial(name): the material a replayed UpdateMaterial / MaterialColor is about to change, copied; and
 // the copy written back. An unknown name gives nullptr.
 struct SavedMaterial;

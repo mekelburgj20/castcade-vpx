@@ -737,6 +737,12 @@ bool VPinball::ParseCommand(const size_t code, const bool notify)
    case IDM_CLOSE:
    case SC_CLOSE:
    {
+      // Castcade (I11.11.1): not while a game runs. A click on the table view's close "x" at the right of the menu bar
+      // arrives here as WM_COMMAND / SC_CLOSE; closing the editor's table released it under the running player, and
+      // the next ToolbarDialog::EnableButtons read a null table. The game ends first (its own window, Esc, the
+      // menu); then the table closes as it always did.
+      if (g_pplayer)
+         return true;
       CComObject<PinTable> *const ptCur = GetActiveTable();
       if (ptCur)
          CloseTable(ptCur);

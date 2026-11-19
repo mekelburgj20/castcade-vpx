@@ -2,7 +2,7 @@
 
 class Ball;
 
-namespace castcade { extern bool g_holdEvents; } // Castcade match role: src/castcade/CastcadeDispatch.h
+namespace castcade { extern bool g_holdEvents; void OnHeldEvent(DISPID dispid, const DISPPARAMS* params); } // Castcade match role: src/castcade/CastcadeDispatch.h
 
 class EventProxyBase
 {
@@ -80,8 +80,12 @@ public:
    HRESULT FireDispID(const DISPID dispid, DISPPARAMS * const pdispparams) override
    {
       // Castcade match role: while another player's table is shown here, the local script gets no event at all
+      // (the session counts what it keeps, and passes a table option event on to the script afterwards)
       if (castcade::g_holdEvents)
+      {
+         castcade::OnHeldEvent(dispid, pdispparams);
          return S_OK;
+      }
       T* const pT = (T*)this;
       pT->Lock();
       IUnknown** pp = IConnectionPointImpl<T, psrcid, CComDynamicUnkArray>::m_vec.begin();

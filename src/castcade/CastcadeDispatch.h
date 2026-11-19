@@ -23,8 +23,10 @@ namespace castcade
    void OnScriptPutBefore(IDispatch* obj, DISPID dispid, const DISPPARAMS* params);
 
    // Match role only, while this VPX shows another player's table: no event reaches the script (eventproxy.h),
-   // the local game sleeps. One bool test per fired event otherwise.
+   // the local game sleeps. One bool test per fired event otherwise. Each event kept is reported to the session
+   // (OnHeldEvent), which counts them and passes a table option event on once the game is back.
    extern bool g_holdEvents;
+   void OnHeldEvent(DISPID dispid, const DISPPARAMS* params);
 
    // Befriended by the part classes: gives CastcadeState.cpp access to their physics-driven members.
    struct StateAccess;

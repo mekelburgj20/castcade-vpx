@@ -19,8 +19,10 @@
 //                             drawn, and its own watchers see its table stand still. A watcher that connects to it
 //                             while it is not playing is accepted and held, with nothing sent, until it plays again
 //                             (10 s at most, then closed). It shows no notifications.
-//   CASTCADE_STREAM_CONTROL   match: connect:127.0.0.1:<port> (this PC only), retried every 2 s. Text lines, UTF-8,
-//                             each ended by \n. Without a connection the table plays.
+//   CASTCADE_STREAM_CONTROL   match: connect:127.0.0.1:<port>, retried every 2 s. This PC only: the address must be
+//                             127.x.y.z or the word localhost, as text; nothing is looked up. Text lines, UTF-8,
+//                             each ended by \n, 2048 bytes at most (a longer one closes the connection). Without a
+//                             connection the table plays.
 //                               this VPX sends:
 //                                 hello 1 <build> <editables> <table hash> <stream port>   once per connection; 1 is
 //                                                           this protocol's version; build has no spaces; editables
@@ -37,17 +39,28 @@
 //                                                           (no stream within 4 s of the command), stalled (a stream
 //                                                           that was shown delivered no frame for 3 s), lost (it
 //                                                           ended and did not come back within 3 s), closed (the
-//                                                           watched player closed its table), badaddress
+//                                                           watched player closed its table), badaddress (no
+//                                                           <127.x.y.z or localhost>:<port> in the command),
+//                                                           overflow (the stream put more properties than this
+//                                                           table has: not this table's stream)
 //                               this VPX reads:
-//                                 watch <host>:<port>       watch the stream at that address (it connects there). A
+//                                 watch <host>:<port>       watch the stream at that address (it connects there; the
+//                                                           host must be this PC, as for the control connection). A
 //                                                           watch while watching re-aims: the stream is dropped and
 //                                                           the connection made again, also to the same address,
 //                                                           with no state playing in between. Every watch is
 //                                                           answered within 5 s: state watching or state failed
-//                                 play                      come back to the own table; always answered state playing
+//                                 play                      come back to the own table; answered state playing
 //                               hello and the first state playing are sent as soon as the connection exists. Every
 //                               token is printable ASCII without spaces; no line is longer than 200 bytes.
-//                             Anything else, and a control connection that ends, also brings the own table back.
+//                               Of several commands read in one go only the last is acted on and answered (the others
+//                               name states that were superseded before this table could reach them). Any other
+//                               line, an empty one too, is ignored: no answer, and a watch goes on (a newer
+//                               companion may say more than this build knows).
+//                             A control connection that ends brings the own table back.
+//                             From the watch command until the other player's keyframe the own table is paused as
+//                             VPX pauses one (nothing moves, the clock stands, no event is due); a watch that ends
+//                             before its keyframe was a pause of that length and nothing else.
 //   CASTCADE_STREAM_STATICREFRESH  match: 1 = rebuild the desktop static pre-render after a keyframe and after the
 //                             return, as a plain watcher does after a keyframe (two frames of well over 100 ms).
 //                             Default 0: a match table's pre-render was made after its own script's start, as the
@@ -72,7 +85,9 @@
 // Test switches (CASTCADE_TEST_NOPAUSE, CASTCADE_TEST_INPUT) work with or without a session: CastcadeTest.h.
 // The frame-hitch probe (CASTCADE_FRAMELOG) too: CastcadeProbe.h. Match role only: CASTCADE_TEST_MATCHCHECK=1 reads
 // every property of every part before a watch phase and after it and logs each that differs (thousands of calls at
-// each turn: a test's check); CASTCADE_TEST_BALLLOG=<ms> logs the local balls every <ms> while the table plays;
+// each turn: a test's check), and compares the parts' internal state the same way (CaptureDeepState: a lamp's stored
+// state beside its play state, sequencer locks, animation phases, which hit objects collide, the timers, the game
+// clock); CASTCADE_TEST_BALLLOG=<ms> logs the local balls every <ms> while the table plays;
 // CASTCADE_TEST_MATCHNOUNDO=1 leaves the properties and the runtime state of a watch phase in place on purpose, to
 // show that the check and the pictures see a table that did not come back.
 //
@@ -100,6 +115,11 @@ public:
 
    // A watcher, or a player with CASTCADE_TEST_NOPAUSE=1, keeps running when its window loses the focus
    virtual bool NeverPauses() const = 0;
+
+   // Player::RecomputePauseState, last word: the player stays paused whatever the focus says. A match session
+   // answers true from a "watch" command until the other player's keyframe is here: its own table stands still, as
+   // under VPX's own pause, and a watch that never shows anything was a pause and nothing else.
+   virtual bool HoldsPause() const { return false; }
 
    // Player::CreateBall / Player::DestroyBall. The play role numbers the balls it streams; a watcher's balls
    // are created by its StateApplier, so it ignores these.

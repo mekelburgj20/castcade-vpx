@@ -267,8 +267,13 @@ std::unique_ptr<TcpListener> ListenTcp(uint16_t port, std::string& err, const ch
 
 // Starts a connection to host:port (an IPv4 literal or a name; the name lookup itself may block for a
 // moment). The returned peer is Alive() and not yet Connected(); Poll() completes or fails it. Returns
-// nullptr and sets err if the address cannot be resolved or the socket cannot be created.
-std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, uint16_t port, std::string& err);
+// nullptr and sets err if the address cannot be resolved or the socket cannot be created. numericOnly: host must be an
+// IPv4 literal and no name service is asked (AI_NUMERICHOST).
+std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, uint16_t port, std::string& err, bool numericOnly = false);
+
+// Whether host names this PC and nothing else: the literal "localhost", or four decimal numbers 0..255 of which the
+// first is 127 (127.0.0.0/8). Decided by reading the text, with no lookup. numeric gets the address to connect to.
+bool LoopbackAddress(const std::string& host, std::string& numeric);
 
 // One TCP connection that carries text lines (UTF-8, each ended by '\n'; a '\r' before it is dropped): the match
 // role's control connection to the companion (CastcadeStream.h). Non-blocking like TcpPeer, and made the same way.
@@ -281,8 +286,8 @@ public:
    virtual bool Send(const std::string& line) = 0;
 
    // Completes a pending connect, flushes, reads what is available and appends each complete line to out. Returns
-   // false once the connection is closed or failed (also when a line grows past 4096 bytes); lines read before that
-   // are still delivered. Never blocks.
+   // false once the connection is closed or failed (also when a line, complete or not, is longer than 2048 bytes);
+   // lines read before that are still delivered. Never blocks, and reads 64 KB a call at most.
    virtual bool Poll(std::vector<std::string>& out) = 0;
 
    virtual bool Connected() const = 0; // false while connecting and after the close
@@ -290,7 +295,7 @@ public:
    virtual void Close() = 0;
 };
 
-// Starts a connection to host:port, as ConnectTcp does
+// Starts a connection to host:port, as ConnectTcp does with numericOnly: host is an IPv4 literal
 std::unique_ptr<LinePeer> ConnectLines(const std::string& host, uint16_t port, std::string& err);
 
 // ---------------------------------------------------------------------------------------------------------

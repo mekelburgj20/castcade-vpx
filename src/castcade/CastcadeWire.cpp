@@ -1041,9 +1041,10 @@ namespace
 {
 
 // A non-blocking socket with a connect to host:port under way, or INVALID_SOCKET with err set
-SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err);
+SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err, const bool numericOnly);
 
-constexpr size_t MAX_LINE = 4096;
+constexpr size_t MAX_LINE = 2048;      // bytes of one line without its end; a longer one closes the connection
+constexpr int MAX_READS_PER_POLL = 16; // 64 KB a call at most: a sender that never stops cannot hold the caller
 
 class LineSocket final : public LinePeer
 {
@@ -1099,7 +1100,7 @@ public:
 
       bool closing = false;
       char buf[4096];
-      for (;;)
+      for (int reads = 0; reads < MAX_READS_PER_POLL; ++reads)
       {
          const int n = recv(m_sock, buf, (int)sizeof(buf), 0);
          if (n > 0)
@@ -1120,11 +1121,16 @@ public:
          std::string line = m_in.substr(pos, nl - pos);
          if (!line.empty() && line.back() == '\r')
             line.pop_back();
+         if (line.size() > MAX_LINE) // a whole line too: what came before it is delivered, nothing after it
+         {
+            closing = true;
+            break;
+         }
          out.push_back(std::move(line));
          pos = nl + 1;
       }
       m_in.erase(0, pos);
-      if (m_in.size() > MAX_LINE)
+      if (m_in.size() > MAX_LINE + 1) // (a '\r' may still be on its way out)
          closing = true;
       if (closing)
       {
@@ -1183,17 +1189,54 @@ private:
 
 } // namespace
 
+bool LoopbackAddress(const std::string& host, std::string& numeric)
+{
+   if (host == "localhost")
+   {
+      numeric = "127.0.0.1";
+      return true;
+   }
+   // Four decimal numbers 0..255, the first 127: read here, never looked up ("127.example.com" is a name)
+   int parts = 0, value = -1, digits = 0, first = -1;
+   for (const char c : host + '.')
+   {
+      if (c == '.')
+      {
+         if (value < 0 || ++parts > 4)
+            return false;
+         if (parts == 1)
+            first = value;
+         value = -1;
+         digits = 0;
+      }
+      else if (c >= '0' && c <= '9')
+      {
+         if (++digits > 3)
+            return false;
+         value = (value < 0 ? 0 : value * 10) + (c - '0');
+         if (value > 255)
+            return false;
+      }
+      else
+         return false;
+   }
+   if (parts != 4 || first != 127)
+      return false;
+   numeric = host;
+   return true;
+}
+
 std::unique_ptr<LinePeer> ConnectLines(const std::string& host, const uint16_t port, std::string& err)
 {
-   const SOCKET s = StartConnect(host, port, err);
+   const SOCKET s = StartConnect(host, port, err, true);
    if (s == INVALID_SOCKET)
       return nullptr;
    return std::make_unique<LineSocket>(s);
 }
 
-std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port, std::string& err)
+std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port, std::string& err, const bool numericOnly)
 {
-   const SOCKET s = StartConnect(host, port, err);
+   const SOCKET s = StartConnect(host, port, err, numericOnly);
    if (s == INVALID_SOCKET)
       return nullptr;
    return std::make_unique<SocketPeer>(s, true, host + ":" + std::to_string(port));
@@ -1202,12 +1245,14 @@ std::unique_ptr<TcpPeer> ConnectTcp(const std::string& host, const uint16_t port
 namespace
 {
 
-SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err)
+SOCKET StartConnect(const std::string& host, const uint16_t port, std::string& err, const bool numericOnly)
 {
    addrinfo hints = {};
    hints.ai_family = AF_INET;
    hints.ai_socktype = SOCK_STREAM;
    hints.ai_protocol = IPPROTO_TCP;
+   if (numericOnly)
+      hints.ai_flags = AI_NUMERICHOST; // an address as written, no name service asked
    addrinfo* res = nullptr;
    const int rc = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
    if (rc != 0 || !res)

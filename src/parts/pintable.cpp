@@ -225,7 +225,8 @@ STDMETHODIMP ScriptGlobalTable::EndMusic()
 
 STDMETHODIMP ScriptGlobalTable::put_MusicVolume(float volume)
 {
-	if (g_pplayer && g_pplayer->m_PlayMusic)
+	// (m_audio: null until the script's first PlayMusic, and while a Castcade match session has the music set aside)
+	if (g_pplayer && g_pplayer->m_PlayMusic && g_pplayer->m_audio)
 	{
 		const float MusicVolume = max(min((float)g_pplayer->m_MusicVolume*m_pt->m_TableMusicVolume*volume, 100.0f), 0.0f) * (float)(1.0/100.0);
 		g_pplayer->m_audio->MusicVolume(MusicVolume);
@@ -10726,6 +10727,11 @@ int PinTableMDI::OnCreate(CREATESTRUCT &cs)
 
 void PinTableMDI::OnClose()
 {
+    // Castcade (I11.11.1): a close that reaches the table's window directly while a game runs is not acted on (see
+    // VPinball::ParseCommand), unless the whole application is closing, which ends the game itself. Not in
+    // VPinball::CloseTable: VPinball::CanClose loops on that until no table is left.
+    if (g_pplayer && !m_vpinball->IsClosing())
+        return;
     if(m_vpinball->IsClosing() || CanClose())
     {
         if(g_pvp->GetNotesDocker() != nullptr)

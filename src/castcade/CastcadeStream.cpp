@@ -648,7 +648,8 @@ struct ReplayObserver
 {
    virtual ~ReplayObserver() = default;
    virtual void BeforeKeyframe(const RxFrame& kf) = 0;
-   virtual void BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) = 0;
+   // False: the call is not made (the match session has given this watch up)
+   virtual bool BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) = 0;
 };
 
 // Match role: the watch session of one watch phase gets its address and its log from the match session
@@ -664,6 +665,7 @@ struct InnerWatch
 class SessionImpl;
 class MatchSession;
 SessionImpl* g_session = nullptr;
+MatchSession* g_match = nullptr;
 
 class SessionImpl final : public Session
 {
@@ -758,6 +760,7 @@ private:
    uint64_t m_frozenStamp = 0;
    // Match role, the play part: the table file's value of every property this table's script has put
    std::unordered_map<std::string, Baseline> m_baseline;
+   std::vector<std::string> m_baselineOrder; // its keys in the order the script first put them
    std::unordered_set<uint64_t> m_baselineSeen; // (object id << 32 | DISPID) of the puts without index arguments
    bool m_inBaseline = false;
    uint64_t m_baselineUnreadable = 0;
@@ -1004,7 +1007,7 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
       m_applier = std::make_unique<StateApplier>(m_player);
    // A watcher's window is rarely focused (a VR watcher's almost never): it must not start paused either
    // (Player::RecomputePauseState keeps it unpaused from here on)
-   if (m_neverPauses)
+   if (m_neverPauses && !m_inner) // (a match session's watch phase: the match session holds the pause until the keyframe)
       m_player->m_pause = false;
 
    if (record)
@@ -1013,7 +1016,7 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
          m_log.Info("recording only: CASTCADE_STREAM_ADDR is not set, so no socket is opened");
       OpenRecording(recordSpec);
    }
-   else if (watch && !recordSpec.empty())
+   else if (watch && !recordSpec.empty() && !m_inner) // (a match session's play part records)
       m_log.Warn("CASTCADE_STREAM_RECORD is ignored on a watcher: the player records");
 
    if (m_configOk)
@@ -1423,6 +1426,7 @@ void SessionImpl::BaselineBefore(IDispatch* const obj, const DISPID dispid, cons
                   ++m_baselineUnreadable;
                }
                m_baseline.emplace(m_key, std::move(b));
+               m_baselineOrder.push_back(m_key);
             }
          }
          if (plain)
@@ -2169,8 +2173,8 @@ void SessionImpl::Replay(RxFrame& f)
          continue;
       }
       // Match role: the value about to be replaced is read first, so that this table's own can be put back
-      if (m_observer)
-         m_observer->BeforeCall(c, c.argc ? &f.args[c.argStart] : nullptr, cls, target);
+      if (m_observer && !m_observer->BeforeCall(c, c.argc ? &f.args[c.argStart] : nullptr, cls, target))
+         continue;
       DISPPARAMS dp;
       dp.rgvarg = c.argc ? &f.args[c.argStart] : nullptr;
       dp.cArgs = c.argc;
@@ -2630,7 +2634,8 @@ void SessionImpl::WatchFrame(const uint64_t now)
             Note("Castcade: connecting to " + m_connectText);
          }
          std::string err;
-         std::unique_ptr<TcpPeer> t = ConnectTcp(m_connectHost, m_port, err);
+         // (a match session's watch phase: the address was checked to be a loopback literal; nothing is looked up)
+         std::unique_ptr<TcpPeer> t = ConnectTcp(m_connectHost, m_port, err, m_inner);
          if (t)
          {
             Peer p;
@@ -2895,6 +2900,9 @@ public:
 
    bool IsWatcher() const override { return m_watching; }
    bool NeverPauses() const override { return m_watching || m_play.NeverPauses(); }
+   // From the "watch" command to the other player's keyframe the local table is paused as VPX pauses one
+   bool HoldsPause() const override { return m_watching && !m_disturbed; }
+   void HeldEvent(const DISPID dispid, const DISPPARAMS* const params);
    // While watching, the balls that come and go are the watch session's
    void OnBallCreated(Ball* const ball) override
    {
@@ -2934,10 +2942,12 @@ private:
 
    // ReplayObserver
    void BeforeKeyframe(const RxFrame& kf) override;
-   void BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) override;
+   bool BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target) override;
 
    void ServiceControl(const uint64_t now);
    void Command(const std::string& line, const uint64_t now);
+   void DeepCompare();
+   size_t UndoLimit();
    void Send(const std::string& line);
    void EnterWatch(const std::string& host, const uint16_t port, const uint64_t now);
    void StartInner(const std::string& host, const uint16_t port);
@@ -2970,6 +2980,8 @@ private:
    bool m_staticRefresh = false;
    bool m_check = false;
    bool m_testNoUndo = false; // CASTCADE_TEST_MATCHNOUNDO=1: leave the undo list and the runtime state unapplied
+   std::wstring m_testMusic;  // CASTCADE_TEST_MUSIC
+   uint64_t m_testMusicAt = 0;
    uint64_t m_ballLogUsec = 0, m_nextBallLog = 0;
 
    // The control connection
@@ -3000,6 +3012,16 @@ private:
    std::shared_ptr<const OwnPhysics> m_ownPhysics;
    std::shared_ptr<const TableRuntime> m_ownRuntime;
    std::shared_ptr<OwnPlayer> m_own;
+   // Events the gate kept from the script in this phase: how many before the keyframe (there must be none: the table
+   // is paused then), how many after it (the watched table's own animation events, which are not this game's), and
+   // the option events of the tweak menu, which are this player's and reach the script at the return
+   uint64_t m_heldBeforeKeyframe = 0, m_heldWhileShown = 0;
+   std::vector<int> m_heldOptions;
+   bool m_overflow = false;    // the stream put more properties than this table has: the watch is given up
+   size_t m_undoLimit = 0;
+   bool m_pauseHandlerChecked = false;
+   uint64_t m_lastUnknownLog = 0, m_unknownLines = 0;
+   std::vector<DeepEntry> m_deepBefore;
    std::vector<Undo> m_undo;
    std::unordered_map<std::string, size_t> m_undoIndex;
    std::unordered_map<std::wstring, std::shared_ptr<const SavedMaterial>> m_materials;
@@ -3050,16 +3072,22 @@ MatchSession::MatchSession(Player* const player)
    if (m_testNoUndo)
       m_log.Warn("TEST: CASTCADE_TEST_MATCHNOUNDO=1, properties and runtime state are NOT put back after a watch phase (shows that the checks see it)");
    m_ballLogUsec = (uint64_t)std::clamp(atoi(GetEnv("CASTCADE_TEST_BALLLOG").c_str()), 0, 60000) * 1000;
+   // Test: CASTCADE_TEST_MUSIC=<file> calls the table's own PlayMusic with that file 5 s into the session, as a line
+   // of its script would (the tables that play music on the test PC all need PinUP Player beside them)
+   m_testMusic = GetEnvW(L"CASTCADE_TEST_MUSIC");
+   m_testMusicAt = NowUsec() + 5000000;
 
-   // connect:<loopback host>:<port>, nothing else: the companion listens on this PC
+   // connect:<loopback address>:<port>, nothing else: the companion listens on this PC. The address is read as
+   // text (127.x.y.z or the word localhost) and never looked up.
    const std::string ctl = GetEnv("CASTCADE_STREAM_CONTROL");
    bool listen = true;
-   if (ctl.rfind("connect:", 0) == 0 && ParseAddr(ctl, listen, m_ctlHost, m_ctlPort) && !listen
-      && (m_ctlHost == "localhost" || m_ctlHost.rfind("127.", 0) == 0))
+   std::string host;
+   if (ctl.rfind("connect:", 0) == 0 && ParseAddr(ctl, listen, host, m_ctlPort) && !listen && LoopbackAddress(host, m_ctlHost))
    {
       m_wsa = WireStartup();
       m_ctlOk = m_wsa;
    }
+   g_match = this;
    if (m_ctlOk)
       m_log.Info(Fmt("role match: control connection to %s:%u (retried every 2 s); playing until told to watch; static pre-render after a keyframe %s%s",
          m_ctlHost.c_str(), m_ctlPort, m_staticRefresh ? "rebuilt (CASTCADE_STREAM_STATICREFRESH=1)" : "kept", m_check ? "; TEST: every property compared after each watch phase" : ""));
@@ -3074,6 +3102,7 @@ MatchSession::~MatchSession()
    if (m_watching)
       LeaveWatch("this table closes", nullptr);
    g_holdEvents = false;
+   g_match = nullptr;
    if (m_ctl)
    {
       m_lines.clear();
@@ -3101,6 +3130,29 @@ void MatchSession::OnFrame()
          return;
       m_play.OnFrame(); // this table's own watchers: its state as it was, under a stamp that stands still
       return;
+   }
+   if (!m_testMusic.empty() && now >= m_testMusicAt)
+   {
+      LPOLESTR name = const_cast<LPOLESTR>(L"PlayMusic");
+      DISPID id = DISPID_UNKNOWN;
+      HRESULT hr = m_globalDisp->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &id);
+      if (SUCCEEDED(hr))
+      {
+         VARIANT a[2]; // in reverse: the volume, the file
+         VariantInit(&a[0]);
+         VariantInit(&a[1]);
+         V_VT(&a[0]) = VT_R4;
+         V_R4(&a[0]) = 1.f;
+         V_VT(&a[1]) = VT_BSTR;
+         V_BSTR(&a[1]) = SysAllocString(m_testMusic.c_str());
+         DISPPARAMS dp = { a, nullptr, 2, 0 };
+         hr = m_globalDisp->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &dp, nullptr, nullptr, nullptr);
+         VariantClear(&a[1]);
+      }
+      const int music = MusicNow(m_player);
+      m_log.Info(Fmt("TEST: PlayMusic \"%s\" called as the script would (HRESULT 0x%08lx); own music now: %s", Narrow(m_testMusic.c_str()).c_str(), (unsigned long)hr,
+         music == 2 ? "playing" : music == 1 ? "a stream that is not playing" : "none (PlayMusic = 0 in the settings?)"));
+      m_testMusic.clear();
    }
    m_play.OnFrame(); // first: the calls of this frame belong to this table's stream, whatever the control connection says next
    if (m_ballLogUsec && now >= m_nextBallLog)
@@ -3148,11 +3200,33 @@ void MatchSession::ServiceControl(const uint64_t now)
          m_play.m_listener ? (unsigned)m_play.m_listener->Port() : 0u));
       Send("state playing"); // true whenever a control connection begins: without one this table plays
    }
-   // A line may end the connection's use (LeaveWatch sends on it), never the connection itself
+   // Of the commands read in one go only the last decides: "play" and "watch" each name the state asked for, and a
+   // state that was superseded before this table could reach it is not gone through (no pause, save and restore per
+   // pair, and no answer for it). A line that is neither is ignored: a newer companion may say more than this build
+   // knows, and that must not end a watch.
    const std::vector<std::string> lines = std::move(m_lines);
    m_lines.clear();
-   for (const std::string& line : lines)
-      Command(line, now);
+   size_t last = SIZE_MAX;
+   for (size_t i = 0; i < lines.size(); ++i)
+   {
+      if (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0)
+         last = i;
+      else
+      {
+         ++m_unknownLines;
+         if (m_lastUnknownLog == 0 || now - m_lastUnknownLog >= CONNECT_FAIL_LOG_USEC)
+         {
+            m_lastUnknownLog = now;
+            m_log.Info(Fmt("control < (ignored, %llu such lines so far) %s", (unsigned long long)m_unknownLines,
+               lines[i].empty() ? "an empty line" : ("'" + Token(lines[i].substr(0, 60)) + "'").c_str()));
+         }
+      }
+   }
+   for (size_t i = 0; i < lines.size(); ++i)
+      if (i != last && (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0))
+         m_log.Info("control < " + Token(lines[i].substr(0, 80)) + "   (superseded by a later command in the same read: not acted on, not answered)");
+   if (last != SIZE_MAX)
+      Command(lines[last], now);
    if (alive)
       return;
    if (m_ctlUp)
@@ -3182,17 +3256,20 @@ void MatchSession::Command(const std::string& line, const uint64_t now)
    }
    if (line.rfind("watch ", 0) == 0)
    {
+      // watch <address>:<port>: the address must be this PC's (the companion's tunnel listens on 127.0.0.1), read as
+      // text and never looked up
       const std::string addr = line.substr(6);
       const size_t colon = addr.rfind(':');
       uint16_t port = 0;
-      if (colon != std::string::npos && colon > 0 && addr.find(' ') == std::string::npos && ParsePort(addr.substr(colon + 1), port))
+      std::string host;
+      if (colon != std::string::npos && colon > 0 && ParsePort(addr.substr(colon + 1), port) && LoopbackAddress(addr.substr(0, colon), host))
       {
-         EnterWatch(addr.substr(0, colon), port, now);
+         EnterWatch(host, port, now);
          return;
       }
-      m_log.Warn("control: '" + line + "' is not watch <host>:<port>");
+      m_log.Warn("control: '" + Token(line.substr(0, 120)) + "' is not watch <127.x.y.z or localhost>:<port>");
       if (m_watching)
-         LeaveWatch("a watch command without an address", "badaddress");
+         LeaveWatch("a watch command without a usable address", "badaddress");
       else
       {
          Send("state failed badaddress");
@@ -3200,11 +3277,53 @@ void MatchSession::Command(const std::string& line, const uint64_t now)
       }
       return;
    }
-   m_log.Warn("control: unknown command '" + line + "': playing");
-   if (m_watching)
-      LeaveWatch("an unknown command", nullptr);
+}
+
+// Called for every event the gate keeps from the script (eventproxy.h), while g_holdEvents is set
+void MatchSession::HeldEvent(const DISPID dispid, const DISPPARAMS* const params)
+{
+   // A table option changed in the tweak menu, the options reset, the menu closed: the player did that to this
+   // table, and its script must hear of it. Kept, and fired at the return (LeaveWatch), once per kind.
+   if (dispid == DISPID_GameEvents_OptionEvent)
+   {
+      if (params && params->cArgs == 1 && V_VT(&params->rgvarg[0]) == VT_I4)
+      {
+         const int what = V_I4(&params->rgvarg[0]);
+         if (std::find(m_heldOptions.begin(), m_heldOptions.end(), what) == m_heldOptions.end() && m_heldOptions.size() < 8)
+            m_heldOptions.push_back(what);
+      }
+      return;
+   }
+   // Everything else is dropped. Before the keyframe there must be none (the table is paused); after it they are
+   // the animation events of the parts as the other player's stream moves them, which are not this game's.
+   if (m_disturbed)
+      ++m_heldWhileShown;
    else
-      Send("state playing");
+      ++m_heldBeforeKeyframe;
+}
+
+// CASTCADE_TEST_MATCHCHECK: the internal state part by part (CaptureDeepState), as it was when the watch began and as
+// it is now that the table is back
+void MatchSession::DeepCompare()
+{
+   std::vector<DeepEntry> now;
+   CaptureDeepState(m_player, now);
+   size_t differ = 0;
+   if (now.size() != m_deepBefore.size())
+      differ = 1;
+   for (size_t i = 0; i < now.size() && i < m_deepBefore.size(); ++i)
+      if (now[i].bytes != m_deepBefore[i].bytes)
+      {
+         if (++differ <= 40)
+         {
+            size_t at = 0;
+            while (at < now[i].bytes.size() && at < m_deepBefore[i].bytes.size() && now[i].bytes[at] == m_deepBefore[i].bytes[at])
+               ++at;
+            m_log.Warn(Fmt("match check: INTERNAL STATE DIFFERENT: %s (first differing byte %zu of %zu)", now[i].name.c_str(), at, now[i].bytes.size()));
+         }
+      }
+   m_log.Info(Fmt("match check: internal state of %zu parts and lists compared, %zu differ", now.size(), differ));
+   m_deepBefore.clear();
 }
 
 bool MatchSession::OnKeyEvent(const int dispid, const int keycode)
@@ -3253,19 +3372,49 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    }
 
    const uint64_t t0 = NowUsec();
+   if (!m_pauseHandlerChecked)
+   {
+      // The Paused event is all that tells a table's script that its game stands still. A ROM table's handler (its
+      // own, or the one core.vbs builds) pauses VPinMAME in it; a script without one leaves whatever it drives
+      // outside VPX running through the watch. One line, so that a log can tell which kind of table this was.
+      m_pauseHandlerChecked = true;
+      bool has = false;
+      IDispatch* sd = nullptr;
+      CodeViewer* const pcv = m_player->m_ptable->m_pcv;
+      const std::wstring name = std::wstring(m_player->m_ptable->m_wzName) + L"_Paused";
+      if (pcv && pcv->m_pScript && SUCCEEDED(pcv->m_pScript->GetScriptDispatch(nullptr, &sd)) && sd)
+      {
+         LPOLESTR n = const_cast<LPOLESTR>(name.c_str());
+         DISPID id = DISPID_UNKNOWN;
+         has = SUCCEEDED(sd->GetIDsOfNames(IID_NULL, &n, 1, LOCALE_USER_DEFAULT, &id));
+         sd->Release();
+      }
+      if (has)
+         m_log.Info("this table's script has a " + Narrow(name.c_str()) + " handler: it is told of every watch (a ROM table pauses VPinMAME there)");
+      else
+         m_log.Warn("this table's script has NO " + Narrow(name.c_str()) + " handler: nothing pauses VPinMAME, or anything else the script drives outside VPX, while this table "
+            "watches; VPX's own physics, timers and events are held all the same");
+   }
+   const std::string activity = DescribeOwnActivity(m_player);
+   const int music = MusicNow(m_player);
    // The pause a real pause is: the script hears Paused (a ROM table stops VPinMAME in it), the music pauses
    m_player->PauseMusic();
    g_holdEvents = true;
+   m_heldBeforeKeyframe = m_heldWhileShown = 0;
+   m_heldOptions.clear();
+   m_overflow = false;
    m_play.Freeze();
    m_ownPhysics = SaveOwnPhysics(m_player);
    m_ownRuntime = SaveTableRuntime(m_player);
-   m_own = BeginWatchPhase(m_player);
    if (m_check)
    {
       if (!m_checkBuilt)
          BuildCheckProps();
       Fingerprint(m_checkBefore);
+      CaptureDeepState(m_player, m_deepBefore);
    }
+   // The music is set aside and the table paused, as VPX pauses one, until the other player's keyframe is here
+   m_own = BeginWatchPhase(m_player);
    m_keysNow = m_keysTold;
    m_watching = true;
    m_disturbed = false;
@@ -3275,13 +3424,18 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    m_watchAddr = addr;
    ++m_phases;
    StartInner(host, port);
-   m_log.Info(Fmt("entering watch %llu of %s: own balls %s; own game paused in %.2f ms", (unsigned long long)m_phases, addr.c_str(), DescribeOwnBalls(*m_own).c_str(),
-      (double)(NowUsec() - t0) / 1000.));
+   m_log.Info(Fmt("entering watch %llu of %s: own balls %s; own table: %s; own music: %s; own game paused in %.2f ms", (unsigned long long)m_phases, addr.c_str(),
+      DescribeOwnBalls(*m_own).c_str(), activity.c_str(), music == 2 ? "playing" : music == 1 ? "a stream that is not playing" : "none", (double)(NowUsec() - t0) / 1000.));
 }
 
 void MatchSession::CheckWatch(const uint64_t now)
 {
    SessionImpl& w = *m_watch;
+   if (m_overflow)
+   {
+      LeaveWatch("the stream put more properties than this table has", "overflow");
+      return;
+   }
    if (w.m_refused)
    {
       LeaveWatch("the stream was refused (not the same table)", "refused");
@@ -3414,10 +3568,59 @@ void MatchSession::Capture(const std::string& key, const uint32_t obj, const DIS
    m_undo.push_back(std::move(u));
 }
 
-void MatchSession::BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target)
+// How many properties this table has that a script can put: no stream of this table can ask for more undo entries
+// than that (plus some room for indexed ones). A stream that does is not this table's, or not sane.
+size_t MatchSession::UndoLimit()
 {
+   if (m_undoLimit)
+      return m_undoLimit;
+   const auto puts = [](IDispatch* const disp) -> size_t
+   {
+      size_t n = 0;
+      ITypeInfo* ti = nullptr;
+      if (disp && SUCCEEDED(disp->GetTypeInfo(0, LOCALE_USER_DEFAULT, &ti)) && ti)
+      {
+         TYPEATTR* ta = nullptr;
+         if (SUCCEEDED(ti->GetTypeAttr(&ta)) && ta)
+         {
+            for (UINT f = 0; f < ta->cFuncs; ++f)
+            {
+               FUNCDESC* fd = nullptr;
+               if (SUCCEEDED(ti->GetFuncDesc(f, &fd)) && fd)
+               {
+                  n += (fd->invkind & (INVOKE_PROPERTYPUT | INVOKE_PROPERTYPUTREF)) ? 1 : 0;
+                  ti->ReleaseFuncDesc(fd);
+               }
+            }
+            ti->ReleaseTypeAttr(ta);
+         }
+         ti->Release();
+      }
+      return n ? n : 64;
+   };
+   std::unordered_map<int, size_t> perType;
+   size_t total = puts(m_tableDisp) + puts(m_globalDisp);
+   PinTable* const table = m_player->m_ptable;
+   for (size_t i = 0; i < m_ownDisp.size() && i < table->m_vedit.size(); ++i)
+   {
+      if (!m_ownDisp[i])
+         continue;
+      const int type = (int)table->m_vedit[i]->GetItemType();
+      auto it = perType.find(type);
+      if (it == perType.end())
+         it = perType.emplace(type, puts(m_ownDisp[i])).first;
+      total += it->second;
+   }
+   m_undoLimit = total + 256;
+   return m_undoLimit;
+}
+
+bool MatchSession::BeforeCall(const RxCall& c, const VARIANT* const args, const KindClass cls, IDispatch* const target)
+{
+   if (m_overflow) // given up: nothing more of this stream reaches the table (CheckWatch leaves in this same frame)
+      return false;
    if (cls == KC_BALL) // the watch session's own balls: gone with it
-      return;
+      return true;
    if (c.kind == CALL_METHOD)
    {
       // What the other methods change is in the TableRuntime and the physics state saved when the phase began
@@ -3431,11 +3634,18 @@ void MatchSession::BeforeCall(const RxCall& c, const VARIANT* const args, const 
             if (std::shared_ptr<const SavedMaterial> s = SaveMaterial(m_player, name))
                m_materials.emplace(name, std::move(s));
       }
-      return;
+      return true;
    }
    if (!MakeKey(c.obj, c.dispid, args, c.argc, m_keyBuf) || m_undoIndex.count(m_keyBuf))
-      return;
+      return true;
+   if (m_undo.size() >= UndoLimit())
+   {
+      m_overflow = true;
+      m_log.Error(Fmt("the stream puts more properties than this table has (%zu): not this table's stream; the watch is given up", UndoLimit()));
+      return false;
+   }
    Capture(m_keyBuf, c.obj, c.dispid, c.kind, args, c.argc, target);
+   return true;
 }
 
 // The keyframe's pre-pass for one property: to the value the table file gave it. False when the put failed.
@@ -3463,37 +3673,39 @@ void MatchSession::BeforeKeyframe(const RxFrame& kf)
       m_disturbed = true;
       HideOwnTable(m_player, *m_own);
    }
-   // What no property returns: as before any script ran (the stamps of blinkers and reels start from now)
-   RestoreTableRuntime(m_player, *m_fileRuntime, true);
-
    m_kfKeys.clear();
    for (const RxCall& c : kf.calls)
       if (c.kind != CALL_METHOD && !(c.obj & ID_BALL) && MakeKey(c.obj, c.dispid, &kf.args[c.argStart], c.argc, m_keyBuf))
          m_kfKeys.insert(m_keyBuf);
 
    // Every property this table's script has put, or an earlier stream of this phase has, that this keyframe does not
-   // put: to the table file's value
+   // put: to the table file's value, in the order this table's script first put them
    size_t puts = 0, failed = 0, unreadable = 0;
-   for (const auto& kv : m_play.m_baseline)
+   for (const std::string& key : m_play.m_baselineOrder)
    {
-      if (m_kfKeys.count(kv.first))
+      const auto found = m_play.m_baseline.find(key);
+      if (found == m_play.m_baseline.end() || m_kfKeys.count(key))
          continue;
-      if (!kv.second.readable)
+      const Baseline& base = found->second;
+      if (!base.readable)
       {
          ++unreadable;
          continue;
       }
       ++puts;
-      if (!PutFileValue(kv.first, kv.second.obj, kv.second.dispid, kv.second.args))
+      if (!PutFileValue(key, base.obj, base.dispid, base.args))
       {
          ++failed;
          if (m_warned < MAX_LOGGED)
          {
             ++m_warned;
-            m_log.Warn("keyframe pre-pass: could not put the file's value of " + CallName(kv.second.obj, kv.second.dispid));
+            m_log.Warn("keyframe pre-pass: could not put the file's value of " + CallName(base.obj, base.dispid));
          }
       }
    }
+   // What no property returns: as before any script ran (the stamps of blinkers and reels start from now). After
+   // the puts above, which read this table's own values first: a lamp's State is read from its play state.
+   RestoreTableRuntime(m_player, *m_fileRuntime, true);
    for (size_t i = 0; i < m_undo.size(); ++i)
    {
       const Undo& u = m_undo[i];
@@ -3520,13 +3732,26 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
 
    size_t undone = 0, fromStore = 0, putFailed = 0, lost = 0;
    const size_t materials = m_materials.size();
-   if (m_disturbed)
+   // Whether or not a keyframe ever came. Without one nothing below has anything to do (the table was paused from the
+   // "watch" on: no part moved, the undo list is empty); it is run all the same, so that the way back does not
+   // depend on that being so.
    {
       // The movers first: a put's own side effect (a gate told to open or close) must see this table's angles
       RestoreOwnPhysics(m_player, *m_ownPhysics);
-      for (size_t i = m_undo.size(); i-- > 0;)
+      // The order of the puts. Setters write each other's state (a gate's Open takes the collidable flag along), so
+      // the properties this table's script has put go back in the order of its own last puts, which is the order
+      // that made the state; before them, newest first, those it never put (their values are what was read).
+      std::vector<std::pair<uint64_t, size_t>> order;
+      order.reserve(m_undo.size());
+      for (size_t i = 0; i < m_undo.size(); ++i)
       {
-         const Undo& u = m_undo[i];
+         const auto st = m_play.m_stored.find(m_undo[i].key);
+         order.emplace_back(st == m_play.m_stored.end() ? (uint64_t)(m_undo.size() - 1 - i) : (1ull << 62) + st->second.seq, i);
+      }
+      std::sort(order.begin(), order.end());
+      for (const auto& next : order)
+      {
+         const Undo& u = m_undo[next.second];
          IDispatch* const target = ResolveOwn(u.obj);
          if (m_testNoUndo)
             continue;
@@ -3556,24 +3781,34 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
       }
       for (const auto& kv : m_materials)
          RestoreMaterial(m_player, *kv.second);
+      // What no property returns, a lamp's stored state included (the puts above went through Light::put_State with
+      // values read from the play state), and the physics once more, the collide flags of every hit object included
       if (!m_testNoUndo)
          RestoreTableRuntime(m_player, *m_ownRuntime, false);
       RestoreOwnPhysics(m_player, *m_ownPhysics);
-      if (m_staticRefresh)
+      if (m_disturbed && m_staticRefresh)
          MarkStaticPrepassDirty(m_player);
    }
    // The balls shown again, the ball id counter, the music, and the game clock back to where this game stood
+   const bool hadMusic = OwnMusicPresent(*m_own);
    const unsigned int clockBack = EndWatchPhase(m_player, *m_own);
 
-   // The same bytes a watcher of this table was sent when the phase began?
+   // The state a watcher of this table was sent when the phase began? (Without the accelerometer's reading, which is
+   // input and never the same twice on a rig that has one.)
    ByteWriter after;
    CaptureState(m_player, m_play.m_ballIds, after);
-   const bool samePhysics = after.vec() == m_play.m_frozenState;
+   const bool samePhysics = SameStateWithoutInput(after.vec(), m_play.m_frozenState);
    if (m_check)
+   {
       CompareFingerprint();
+      DeepCompare();
+   }
 
    const size_t undoSize = m_undo.size();
    const bool disturbed = m_disturbed;
+   const uint64_t heldBefore = m_heldBeforeKeyframe, heldShown = m_heldWhileShown;
+   const std::vector<int> options = std::move(m_heldOptions);
+   m_heldOptions.clear();
    m_undo.clear();
    m_undoIndex.clear();
    m_materials.clear();
@@ -3587,6 +3822,10 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
    m_player->RecomputePauseState();
    g_holdEvents = false;
    m_player->UnpauseMusic(); // UnPaused: a ROM table lets VPinMAME run again
+   const int music = MusicNow(m_player);
+   // What the player changed in the tweak menu while watching: the script hears it now
+   for (const int what : options)
+      m_player->m_ptable->FireKeyEvent(DISPID_GameEvents_OptionEvent, what);
    // Keys that changed while the script was not told: it hears the difference now (a flipper button let go)
    const std::unordered_map<int, bool> now = std::move(m_keysNow);
    m_keysNow.clear();
@@ -3603,12 +3842,20 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
    }
 
    m_log.Info(Fmt("back to playing (%s) after %.2f s of watch %llu: %s; %zu of %zu properties put back (%zu with this table's own stored value, %zu failed, %zu lost), "
-                  "%zu materials; own physics state %s (balls %s); game clock set back %u ms; %zu key events passed on; %.2f ms",
+                  "%zu materials; own physics state %s (balls %s); game clock set back %u ms; %zu key events passed on; %.2f ms; own music %s; events kept from the script: "
+                  "%llu before the keyframe, %llu while the other table was shown; %zu option events passed on",
       why, (double)(t0 - m_watchSince) / 1e6, (unsigned long long)m_phases, disturbed ? "the table had shown the other player's" : "the table was never touched", undone,
       undoSize, fromStore, putFailed, lost, materials, samePhysics ? "identical" : "DIFFERENT", DescribeOwnBalls(*m_own).c_str(), clockBack, keys,
-      (double)(NowUsec() - t0) / 1000.));
+      (double)(NowUsec() - t0) / 1000.,
+      !hadMusic ? (music == 0 ? "none" : "none before, a stream now") : music == 2 ? "kept, playing" : music == 1 ? "kept, not playing" : "LOST",
+      (unsigned long long)heldBefore, (unsigned long long)heldShown, options.size()));
    if (!samePhysics)
       m_log.Error("the local physics state after the watch is not the one before it");
+   if (hadMusic && music == 0)
+      m_log.Error("the local table's music did not survive the watch");
+   if (heldBefore)
+      m_log.Error(Fmt("%llu events were kept from the script before the keyframe, while the table should have stood still", (unsigned long long)heldBefore));
+   m_log.Info("own table now: " + DescribeOwnActivity(m_player));
    m_own.reset();
 
    if (failed)
@@ -3788,6 +4035,12 @@ void OnScriptPutBefore(IDispatch* obj, DISPID dispid, const DISPPARAMS* params)
 {
    if (g_session)
       g_session->BaselineBefore(obj, dispid, params);
+}
+
+void OnHeldEvent(DISPID dispid, const DISPPARAMS* params)
+{
+   if (g_match)
+      g_match->HeldEvent(dispid, params);
 }
 
 }

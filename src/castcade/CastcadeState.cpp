@@ -553,6 +553,10 @@ struct StateAccess
       int duration;
       U32 timeNextBlink, timerDurationEndTime, blinkFrame;
       bool lockedByLS;
+      // m_d.m_state: what the script last put. Light::get_State returns the play state instead while the lamp is not
+      // locked by a sequencer, so no read of the property ever shows this field, and LightSeq::StopPlay puts it back
+      // into play when a sequence ends: it has to travel with the rest.
+      float state;
    };
    struct SeqRt
    {
@@ -634,6 +638,8 @@ struct StateAccess
    static void HideOwn(Player* const player, OwnPlayer& own);
    static unsigned int EndWatch(Player* const player, OwnPlayer& own);
    static std::string LiveBalls(Player* const player);
+   static void Deep(Player* const player, std::vector<DeepEntry>& out);
+   static std::string Activity(Player* const player);
 };
 
 struct TableRuntime
@@ -655,6 +661,10 @@ struct OwnPhysics
    std::vector<StateAccess::TargetPh> targets;
    std::vector<StateAccess::TriggerPh> triggers;
    std::vector<StateAccess::SlingPh> slings; // every segment of every slingshot wall, in order
+   // HitObject::m_enabled of every static hit object (Player::m_vho), in order: what Collidable, IsDropped, Enabled and
+   // a gate's Open leave in the physics. Their setters write each other's flags (Gate.Open = False takes the
+   // collidable flag from the stored value), so the flags are put back as they were, whatever order the puts ran in.
+   std::vector<uint8_t> hitEnabled;
 };
 
 struct OwnPlayer
@@ -674,6 +684,7 @@ struct OwnPlayer
    Ball* activeBC = nullptr;
    unsigned int nextBallId = 0;
    AudioPlayer* audio = nullptr;
+   bool hadMusic = false;
    bool hidden = false;
 };
 
@@ -693,7 +704,7 @@ void StateAccess::SaveRuntime(Player* const player, TableRuntime& out)
       {
          const Light* const p = static_cast<Light*>(pe);
          out.lights.push_back(LightRt { p->m_inPlayState, p->m_currentIntensity, p->m_finalLightState, p->m_currentFilamentTemperature, p->m_duration, p->m_timenextblink,
-            p->m_timerDurationEndTime, p->m_iblinkframe, p->m_lockedByLS });
+            p->m_timerDurationEndTime, p->m_iblinkframe, p->m_lockedByLS, p->m_d.m_state });
          break;
       }
       case eItemLightSeq:
@@ -744,6 +755,7 @@ void StateAccess::RestoreRuntime(Player* const player, const TableRuntime& in, c
          const LightRt& s = in.lights[il++];
          Light* const p = static_cast<Light*>(pe);
          p->m_inPlayState = s.inPlayState;
+         p->m_d.m_state = s.state;
          p->m_currentIntensity = s.currentIntensity;
          p->m_finalLightState = s.finalLightState;
          p->m_currentFilamentTemperature = s.filamentTemperature;
@@ -827,6 +839,9 @@ void StateAccess::RestoreRuntime(Player* const player, const TableRuntime& in, c
 
 void StateAccess::SavePhysics(Player* const player, OwnPhysics& out)
 {
+   out.hitEnabled.reserve(player->m_vho.size());
+   for (const HitObject* const ho : player->m_vho)
+      out.hitEnabled.push_back(ho->m_enabled ? 1 : 0);
    ForEachPart(player->m_ptable, [&](const PartClass c, IEditable* const pe)
    {
       switch (c)
@@ -924,6 +939,9 @@ void StateAccess::SavePhysics(Player* const player, OwnPhysics& out)
 
 void StateAccess::RestorePhysics(Player* const player, const OwnPhysics& in)
 {
+   if (in.hitEnabled.size() == player->m_vho.size()) // the static hit objects of a table being played do not change
+      for (size_t k = 0; k < in.hitEnabled.size(); ++k)
+         player->m_vho[k]->m_enabled = in.hitEnabled[k] != 0;
    size_t i[PC_Count] = {};
    size_t sling = 0;
    ForEachPart(player->m_ptable, [&](const PartClass c, IEditable* const pe)
@@ -1093,8 +1111,18 @@ void StateAccess::BeginWatch(Player* const player, OwnPlayer& own)
    own.activeDebug = player->m_pactiveballDebug;
    own.activeBC = player->m_pactiveballBC;
    own.nextBallId = Ball::ballID;
-   // As a watcher: its window is rarely the focused one, and the stream must go on being shown
-   player->m_pause = false;
+   // The music is paused already (Player::PauseMusic), and a paused stream is not "active": left in place,
+   // Player::FinishFrame would take it for a piece that has ended, delete it and fire MusicDone, in the first frame in
+   // which the player is not paused. Set aside from the first moment, nothing ends it: not FinishFrame, not a replayed
+   // PlayMusic or EndMusic.
+   own.audio = player->m_audio;
+   own.hadMusic = own.audio != nullptr;
+   player->m_audio = nullptr;
+   // Until the other player's keyframe arrives this table is paused as VPX itself pauses one: no physics, no key
+   // handling, no animation step, the game clock stands (the main loop and PrepareFrame test m_pause), frames go on
+   // being drawn. A watch that ends before its keyframe is then a pause of that length and nothing else: no part
+   // has moved, no event was due. Player::RecomputePauseState keeps it so (Session::HoldsPause).
+   player->m_pause = true;
 }
 
 void StateAccess::HideOwn(Player* const player, OwnPlayer& own)
@@ -1104,20 +1132,22 @@ void StateAccess::HideOwn(Player* const player, OwnPlayer& own)
    own.hidden = true;
    for (const OwnPlayer::OwnBall& b : own.balls)
       b.ball->m_visible = false;
-   // The music is paused already (Player::PauseMusic). Set aside, a replayed PlayMusic or EndMusic cannot end it.
-   own.audio = player->m_audio;
-   player->m_audio = nullptr;
+   // The watch begins: as a watcher this table runs (its clock too, for the watched table's fades and blinkers)
+   // whether or not its window has the focus. m_noTimeCorrect: the clock goes on from where the pause held it.
+   player->m_pause = false;
+   player->m_noTimeCorrect = true;
 }
 
 unsigned int StateAccess::EndWatch(Player* const player, OwnPlayer& own)
 {
+   delete player->m_audio; // music the watched player's stream started here (none unless its sound is replayed)
+   player->m_audio = own.audio;
+   own.audio = nullptr;
    if (own.hidden)
    {
       for (const OwnPlayer::OwnBall& b : own.balls)
          if (std::find(player->m_vball.begin(), player->m_vball.end(), b.ball) != player->m_vball.end())
             b.ball->m_visible = b.visible;
-      delete player->m_audio; // music the watched player's stream started here
-      player->m_audio = own.audio;
       own.hidden = false;
       // The screen offset of the watched player's nudges, back to this table's own
       const int gainX = player->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "AnalogNudgeGainX"s, 100);
@@ -1154,6 +1184,391 @@ std::string StateAccess::LiveBalls(Player* const player)
       s += buf;
    }
    return s;
+}
+
+// The test's deep check (CASTCADE_TEST_MATCHCHECK): the internal state of the table, read field by field and on purpose
+// not through the lists above that the restore uses, and wider than them: a field the restore forgets shows here.
+void StateAccess::Deep(Player* const player, std::vector<DeepEntry>& out)
+{
+   out.clear();
+   const auto begin = [&out](const std::string& name) -> std::vector<uint8_t>&
+   {
+      out.push_back(DeepEntry { name, {} });
+      return out.back().bytes;
+   };
+   const auto put = [](std::vector<uint8_t>& b, const void* const p, const size_t n) { b.insert(b.end(), (const uint8_t*)p, (const uint8_t*)p + n); };
+#define DEEP(b, field) put(b, &(field), sizeof(field))
+   const auto narrow = [](const WCHAR* const w)
+   {
+      char sz[256];
+      WideCharToMultiByteNull(CP_UTF8, 0, w ? w : L"", -1, sz, sizeof(sz), nullptr, nullptr);
+      return std::string(sz);
+   };
+   for (IEditable* const pe : player->m_ptable->m_vedit)
+   {
+      IScriptable* const ps = pe->GetScriptable();
+      const std::string name = ps ? narrow(ps->m_wzName) : std::string("?");
+      switch (pe->GetItemType())
+      {
+      case eItemLight:
+      {
+         const Light* const p = static_cast<Light*>(pe);
+         std::vector<uint8_t>& b = begin("light " + name);
+         DEEP(b, p->m_d.m_state);
+         DEEP(b, p->m_inPlayState);
+         DEEP(b, p->m_lockedByLS);
+         DEEP(b, p->m_currentIntensity);
+         DEEP(b, p->m_currentFilamentTemperature);
+         DEEP(b, p->m_duration);
+         DEEP(b, p->m_finalLightState);
+         DEEP(b, p->m_timenextblink);
+         DEEP(b, p->m_timerDurationEndTime);
+         DEEP(b, p->m_iblinkframe);
+         DEEP(b, p->m_d.m_intensity);
+         DEEP(b, p->m_d.m_intensity_scale);
+         DEEP(b, p->m_d.m_visible);
+         DEEP(b, p->m_d.m_blinkinterval);
+         put(b, p->m_d.m_rgblinkpattern.data(), p->m_d.m_rgblinkpattern.size());
+         break;
+      }
+      case eItemFlasher:
+      {
+         const Flasher* const p = static_cast<Flasher*>(pe);
+         std::vector<uint8_t>& b = begin("flasher " + name);
+         DEEP(b, p->m_lockedByLS);
+         DEEP(b, p->m_inPlayState);
+         DEEP(b, p->m_d.m_isVisible);
+         break;
+      }
+      case eItemPrimitive:
+      {
+         const Primitive* const p = static_cast<Primitive*>(pe);
+         std::vector<uint8_t>& b = begin("primitive " + name);
+         DEEP(b, p->m_lockedByLS);
+         DEEP(b, p->m_inPlayState);
+         DEEP(b, p->m_d.m_visible);
+         DEEP(b, p->m_currentFrame);
+         DEEP(b, p->m_speed);
+         DEEP(b, p->m_doAnimation);
+         DEEP(b, p->m_endless);
+         break;
+      }
+      case eItemLightSeq:
+      {
+         const LightSeq* const p = static_cast<LightSeq*>(pe);
+         std::vector<uint8_t>& b = begin("light sequencer " + name);
+         DEEP(b, p->m_timeNextUpdate);
+         DEEP(b, p->m_blinkSequence);
+         DEEP(b, p->m_th1);
+         DEEP(b, p->m_th2);
+         DEEP(b, p->m_tt1);
+         DEEP(b, p->m_tt2);
+         DEEP(b, p->m_queue);
+         DEEP(b, p->m_playAnimation);
+         DEEP(b, p->m_tailLength);
+         DEEP(b, p->m_pauseValue);
+         DEEP(b, p->m_replayCount);
+         DEEP(b, p->m_updateRate);
+         DEEP(b, p->m_playInProgress);
+         DEEP(b, p->m_pauseInProgress);
+         break;
+      }
+      case eItemDispReel:
+      {
+         const DispReel* const p = static_cast<DispReel*>(pe);
+         std::vector<uint8_t>& b = begin("reel " + name);
+         for (const DispReel::ReelInfo& r : p->m_reelInfo) // field by field: the struct has padding
+         {
+            DEEP(b, r.currentValue);
+            DEEP(b, r.motorPulses);
+            DEEP(b, r.motorStepCount);
+            DEEP(b, r.motorCalcStep);
+            DEEP(b, r.motorOffset);
+         }
+         DEEP(b, p->m_timeNextUpdate);
+         break;
+      }
+      case eItemHitTarget:
+      {
+         const HitTarget* const p = static_cast<HitTarget*>(pe);
+         std::vector<uint8_t>& b = begin("target " + name);
+         DEEP(b, p->m_d.m_isDropped);
+         DEEP(b, p->m_moveAnimation);
+         DEEP(b, p->m_moveDown);
+         DEEP(b, p->m_moveAnimationOffset);
+         DEEP(b, p->m_timeStamp);
+         DEEP(b, p->m_hitEvent);
+         break;
+      }
+      case eItemSurface:
+      {
+         const Surface* const p = static_cast<Surface*>(pe);
+         std::vector<uint8_t>& b = begin("wall " + name);
+         DEEP(b, p->m_isDropped);
+         DEEP(b, p->m_disabled);
+         for (const LineSegSlingshot* const ls : p->m_vlinesling)
+         {
+            DEEP(b, ls->m_EventTimeReset);
+            DEEP(b, ls->m_TimeReset);
+            DEEP(b, ls->m_doHitEvent);
+            DEEP(b, ls->m_iframe);
+         }
+         break;
+      }
+      case eItemGate:
+      {
+         const Gate* const p = static_cast<Gate*>(pe);
+         std::vector<uint8_t>& b = begin("gate " + name);
+         if (p->m_phitgate)
+         {
+            const GateMoverObject& m = p->m_phitgate->m_gateMover;
+            DEEP(b, m.m_anglespeed);
+            DEEP(b, m.m_angle);
+            DEEP(b, m.m_angleMin);
+            DEEP(b, m.m_angleMax);
+            DEEP(b, m.m_open);
+            DEEP(b, m.m_forcedMove);
+            DEEP(b, m.m_hitDirection);
+            DEEP(b, p->m_phitgate->m_enabled);
+         }
+         break;
+      }
+      case eItemSpinner:
+      {
+         const Spinner* const p = static_cast<Spinner*>(pe);
+         std::vector<uint8_t>& b = begin("spinner " + name);
+         if (p->m_phitspinner)
+         {
+            DEEP(b, p->m_phitspinner->m_spinnerMover.m_anglespeed);
+            DEEP(b, p->m_phitspinner->m_spinnerMover.m_angle);
+         }
+         break;
+      }
+      case eItemFlipper:
+      {
+         const Flipper* const p = static_cast<Flipper*>(pe);
+         std::vector<uint8_t>& b = begin("flipper " + name);
+         if (p->m_phitflipper)
+         {
+            const FlipperMoverObject& m = p->m_phitflipper->m_flipperMover;
+            DEEP(b, m.m_angularMomentum);
+            DEEP(b, m.m_angularAcceleration);
+            DEEP(b, m.m_angleSpeed);
+            DEEP(b, m.m_angleCur);
+            DEEP(b, m.m_curTorque);
+            DEEP(b, m.m_contactTorque);
+            DEEP(b, m.m_angleStart);
+            DEEP(b, m.m_angleEnd);
+            DEEP(b, m.m_enableRotateEvent);
+            DEEP(b, m.m_direction);
+            DEEP(b, m.m_solState);
+            DEEP(b, m.m_isInContact);
+            DEEP(b, m.m_enabled);
+            DEEP(b, m.m_visible);
+            DEEP(b, m.m_lastHitFace);
+         }
+         break;
+      }
+      case eItemPlunger:
+      {
+         const Plunger* const p = static_cast<Plunger*>(pe);
+         std::vector<uint8_t>& b = begin("plunger " + name);
+         if (p->m_phitplunger)
+         {
+            const PlungerMoverObject& m = p->m_phitplunger->m_plungerMover;
+            DEEP(b, m.m_pos);
+            DEEP(b, m.m_speed);
+            DEEP(b, m.m_travelLimit);
+            DEEP(b, m.m_pullForce);
+            DEEP(b, m.m_reverseImpulse);
+            DEEP(b, m.m_fireTimer);
+            DEEP(b, m.m_fireSpeed);
+            DEEP(b, m.m_autoFireTimer);
+            DEEP(b, m.m_fireBounce);
+            DEEP(b, m.m_strokeEventsArmed);
+            DEEP(b, m.m_retractWaitLoop);
+            DEEP(b, m.m_addRetractMotion);
+            DEEP(b, m.m_retractMotion);
+         }
+         break;
+      }
+      case eItemBumper:
+      {
+         const Bumper* const p = static_cast<Bumper*>(pe);
+         std::vector<uint8_t>& b = begin("bumper " + name);
+         DEEP(b, p->m_rotx);
+         DEEP(b, p->m_roty);
+         DEEP(b, p->m_skirtCounter);
+         DEEP(b, p->m_updateSkirt);
+         DEEP(b, p->m_doSkirtAnimation);
+         DEEP(b, p->m_ringDown);
+         DEEP(b, p->m_ringAnimate);
+         if (p->m_pbumperhitcircle)
+         {
+            DEEP(b, p->m_pbumperhitcircle->m_bumperanim_ringAnimOffset);
+            DEEP(b, p->m_pbumperhitcircle->m_bumperanim_hitEvent);
+         }
+         break;
+      }
+      case eItemTrigger:
+      {
+         const Trigger* const p = static_cast<Trigger*>(pe);
+         std::vector<uint8_t>& b = begin("trigger " + name);
+         DEEP(b, p->m_animHeightOffset);
+         DEEP(b, p->m_hitEvent);
+         DEEP(b, p->m_unhitEvent);
+         DEEP(b, p->m_doAnimation);
+         DEEP(b, p->m_moveDown);
+         DEEP(b, p->m_d.m_enabled);
+         break;
+      }
+      case eItemKicker:
+      {
+         const Kicker* const p = static_cast<Kicker*>(pe);
+         std::vector<uint8_t>& b = begin("kicker " + name);
+         DEEP(b, p->m_d.m_enabled);
+         if (p->m_phitkickercircle)
+         {
+            DEEP(b, p->m_phitkickercircle->m_enabled);
+            DEEP(b, p->m_phitkickercircle->m_pball);
+         }
+         break;
+      }
+      default: break;
+      }
+   }
+   {
+      std::vector<uint8_t>& b = begin("hit objects (which of them collide)");
+      for (const HitObject* const ho : player->m_vho)
+         b.push_back(ho->m_enabled ? 1 : 0);
+   }
+   {
+      std::vector<uint8_t>& b = begin("timers (which run, and when each fires next)");
+      for (const HitTimer* const t : player->m_vht)
+      {
+         DEEP(b, t);
+         DEEP(b, t->m_interval);
+         DEEP(b, t->m_nextfire);
+      }
+      const size_t pending = player->m_changed_vht.size();
+      DEEP(b, pending);
+   }
+   {
+      std::vector<uint8_t>& b = begin("balls");
+      for (const Ball* const ball : player->m_vball)
+      {
+         DEEP(b, ball);
+         DEEP(b, ball->m_id);
+         DEEP(b, ball->m_d.m_pos);
+         DEEP(b, ball->m_d.m_vel);
+         DEEP(b, ball->m_angularmomentum);
+         DEEP(b, ball->m_orientation.m_d);
+         DEEP(b, ball->m_d.m_radius);
+         DEEP(b, ball->m_d.m_lockedInKicker);
+         DEEP(b, ball->m_visible);
+      }
+   }
+   {
+      std::vector<uint8_t>& b = begin("player (game clock, ball id counter, active balls, music, pause count, nudge)");
+      const U64 elapsed = player->m_curPhysicsFrameTime - player->m_StartTime_usec;
+      const bool music = player->m_audio != nullptr;
+      DEEP(b, player->m_time_msec);
+      DEEP(b, player->m_last_frame_time_msec);
+      DEEP(b, elapsed);
+      DEEP(b, Ball::ballID);
+      DEEP(b, player->m_pactiveball);
+      DEEP(b, player->m_pactiveballDebug);
+      DEEP(b, player->m_pactiveballBC);
+      DEEP(b, music);
+      DEEP(b, player->m_pauseRefCount);
+      DEEP(b, player->m_tableDisplacement);
+      DEEP(b, player->m_tableVel);
+   }
+#undef DEEP
+}
+
+// What on the local table is in motion by itself right now (the test's log: a watch that begins at such a moment)
+std::string StateAccess::Activity(Player* const player)
+{
+   int targets = 0, seqs = 0, durations = 0, blinking = 0, reels = 0, prims = 0;
+   for (IEditable* const pe : player->m_ptable->m_vedit)
+   {
+      switch (pe->GetItemType())
+      {
+      case eItemHitTarget: targets += static_cast<HitTarget*>(pe)->m_moveAnimation ? 1 : 0; break;
+      case eItemLightSeq: seqs += static_cast<LightSeq*>(pe)->m_playInProgress ? 1 : 0; break;
+      case eItemLight:
+      {
+         const Light* const p = static_cast<Light*>(pe);
+         durations += p->m_duration > 0 ? 1 : 0;
+         blinking += p->m_inPlayState == (float)LightStateBlinking ? 1 : 0;
+         break;
+      }
+      case eItemDispReel:
+      {
+         const DispReel* const p = static_cast<DispReel*>(pe);
+         bool turning = false;
+         for (const DispReel::ReelInfo& r : p->m_reelInfo)
+            turning |= r.motorPulses != 0 || r.motorStepCount != 0;
+         reels += turning ? 1 : 0;
+         break;
+      }
+      case eItemPrimitive: prims += static_cast<Primitive*>(pe)->m_doAnimation ? 1 : 0; break;
+      default: break;
+      }
+   }
+   char buf[260];
+   snprintf(buf, sizeof(buf), "targets moving %d, sequences playing %d, lights under Duration %d, lights blinking %d, reels turning %d, primitives animating %d, window %s, %s",
+      targets, seqs, durations, blinking, reels, prims, player->m_gameWindowActive ? "active" : "not active", player->m_pause ? "paused by VPX" : "not paused");
+   return buf;
+}
+
+void CaptureDeepState(Player* const player, std::vector<DeepEntry>& out)
+{
+   StateAccess::Deep(player, out);
+}
+
+std::string DescribeOwnActivity(Player* const player)
+{
+   return StateAccess::Activity(player);
+}
+
+bool OwnMusicPresent(const OwnPlayer& own)
+{
+   return own.hadMusic;
+}
+
+int MusicNow(Player* const player)
+{
+   if (!player->m_audio)
+      return 0;
+   return player->m_audio->MusicActive() ? 2 : 1;
+}
+
+bool SameStateWithoutInput(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b)
+{
+   ByteReader ra(a.data(), a.size()), rb(b.data(), b.size());
+   const std::shared_ptr<const StateSnapshot> x = ParseState(ra), y = ParseState(rb);
+   if (!x || !y)
+      return a == b;
+   if (x->timeMsec != y->timeMsec || memcmp(x->counts, y->counts, sizeof(x->counts)) != 0)
+      return false;
+   for (int c = 0; c < PC_Count; ++c)
+      if (x->values[c] != y->values[c] || x->flags[c] != y->flags[c])
+         return false;
+   // nudge[0], nudge[1]: the table's displacement, which the physics moves. nudge[2], nudge[3]: the accelerometer as
+   // it reads this instant, on a rig that has one: live input, never the same twice, and no part of the game's state.
+   if (memcmp(&x->nudge[0], &y->nudge[0], 2 * sizeof(float)) != 0 || x->balls.size() != y->balls.size())
+      return false;
+   for (size_t i = 0; i < x->balls.size(); ++i)
+   {
+      const BallState& p = x->balls[i];
+      const BallState& q = y->balls[i];
+      if (p.id != q.id || memcmp(&p.pos, &q.pos, sizeof(p.pos)) != 0 || memcmp(&p.vel, &q.vel, sizeof(p.vel)) != 0
+         || memcmp(p.orientation, q.orientation, sizeof(p.orientation)) != 0 || p.radius != q.radius || p.lockedInKicker != q.lockedInKicker)
+         return false;
+   }
+   return true;
 }
 
 std::shared_ptr<const TableRuntime> SaveTableRuntime(Player* const player)

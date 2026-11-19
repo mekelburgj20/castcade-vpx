@@ -16,12 +16,35 @@ param(
     # contract: what the companion's control client counts on (order of the first lines, the tokens of hello, every
     #   watch answered within 5 s, play while playing, play and watch in one go, the same watch twice, an unknown command,
     #   the watched player closing its table).                      streamlost: B watches A and A is killed (this script's own PID).
-    [ValidateSet('swap', 'visit', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost', 'stalled')][string]$Scenario = 'swap',
+    # deadwatch: B, in the middle of its game, is told to watch a port where nothing listens and called back at once, -Swaps
+    #   times, and every 10th time left to its timeout: a watch that never shows anything must leave the game untouched.
+    # closewhile: B watches A and B's table is closed (the way out through the session's destructor).
+    # longwatch: B watches A for -LongMinutes; memory and handles of B before and after. focus: no CASTCADE_TEST_NOPAUSE:
+    #   the instance whose window does not have the focus is paused by VPX, and is sent to watch and called back all the same.
+    [ValidateSet('swap', 'visit', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost', 'stalled', 'deadwatch', 'closewhile', 'longwatch', 'focus')][string]$Scenario = 'swap',
     [string]$OtherTable,
     [string]$Exe = 'C:\code\repos\castcade-vpx-wt-handoff\build\Release\VPinballX_GL64.exe',
     # The instances run from a copy of the exe under this name, beside it: the installed Castcade companion takes any
     # running VPinballX*.exe that loads a table for a game of its own
-    [string]$RunAs = 'ccmatch_GL64.exe',
+    [string]$RunAs = 'cchand_GL64.exe',
+    # Another test's instances on this PC: the run waits (looking once a minute, 45 minutes at most) while a process of
+    # one of these names exists, and never starts beside one
+    [string[]]$YieldTo = @('ccmatch_GL64'),
+    [switch]$Sound,                  # ini: PlaySound = 1 and PlayMusic = 1, both at volume 0 (the sound and music code runs, nothing is heard)
+    [switch]$StreamSound,            # CASTCADE_STREAM_SOUND=1: the watched stream's sound calls are replayed (a match runs with 0)
+    # With -Sound: a piece of music (copied into the run folder) that each match instance plays through the table's own
+    # PlayMusic 5 s after its start (CASTCADE_TEST_MUSIC), longer than the run. The tables on this PC that call PlayMusic
+    # themselves all need PinUP Player.
+    [string]$MusicFile = 'C:\Users\mekel\Documents\Emulators\VPX\VisualPinballX\music\TNA\TNA10.mp3',
+    # A patched table, as real match tables are: the table's sidecar script (the owner's <table>.vbs, which loads the
+    # hook) and the hook library castcade.vbs. Each instance then plays its own copy "cchand-<x> <table>.vpx" with both
+    # beside it, and writes its own journal %LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl, removed at the end.
+    [string]$Sidecar,
+    [string]$HookLib = 'C:\Users\mekel\Documents\Emulators\VPX\VisualPinballX\scripts\castcade.vbs',
+    [int]$PlayOutSeconds = 0,        # after the scenario: both tables play on this long with no flipper pressed (the games end)
+    # The castcade repo's journal reader (read, never changed): rebuilds the NVRAM from a journal and reports ball ends and game ends
+    [string]$JournalTool = 'C:\code\repos\castcade\.claude\worktrees\lively-tinkering-crescent\vpx-hook\spike\tail-journal.py',
+    [double]$LongMinutes = 10,
     [int]$Swaps = 50,
     [double]$WatchSeconds = 2.5,
     [double]$PlaySeconds = 2.5,
@@ -125,6 +148,15 @@ $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $Table = (Resolve-Path -LiteralPath $Table).Path; $OtherTable = (Resolve-Path -LiteralPath $OtherTable).Path
 if ($BasePort -lt 48100 -or $BasePort + 20 -gt 48199) { Fail 'ports must stay within 48100-48199' }
 if ($RunAs -match '^VPinballX') { Fail "-RunAs must not start with VPinballX (the installed Castcade would take the instances for games)" }
+if ($YieldTo -contains [IO.Path]::GetFileNameWithoutExtension($RunAs)) { Fail "-RunAs $RunAs is the name of another test's instances (-YieldTo)" }
+if ($Sidecar) { foreach ($p in @($Sidecar, $HookLib)) { if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Fail "missing file: $p" } } }
+# Not beside another test: wait for its instances to be gone
+$waited = 0
+while ($YieldTo.Count -and (Get-Process -Name $YieldTo -ErrorAction SilentlyContinue)) {
+    if ($waited -ge 45) { Write-Host "match-test.ps1: another test's instances ($($YieldTo -join ', ')) are still running after 45 minutes; going ahead"; break }
+    if ($waited -eq 0) { Write-Host "match-test.ps1: waiting for another test's instances ($($YieldTo -join ', ')) to end, looking once a minute" }
+    Start-Sleep -Seconds 60; $waited++
+}
 $RunExe = Join-Path (Split-Path -Parent $Exe) $RunAs
 if (-not (Test-Path -LiteralPath $RunExe) -or (Get-FileHash -LiteralPath $RunExe).Hash -ne (Get-FileHash -LiteralPath $Exe).Hash) {
     Copy-Item -LiteralPath $Exe -Destination $RunExe -Force
@@ -133,7 +165,7 @@ if (-not (Test-Path -LiteralPath $RunExe) -or (Get-FileHash -LiteralPath $RunExe
 # instances of this scenario: name, role, table
 $Names = @(switch ($Scenario) {
     'swap' { 'a', 'b' } 'visit' { 'a', 'b' } 'stalled' { 'a', 'b' } 'nolistener' { 'a' } 'controllost' { 'a', 'b' } 'mismatch' { 'a', 'b' } 'reaim' { 'a', 'b', 'c' } 'plainwatch' { 'a', 'b', 'w' }
-    'contract' { 'a', 'b' } 'streamlost' { 'a', 'b' }
+    'contract' { 'a', 'b' } 'streamlost' { 'a', 'b' } 'deadwatch' { 'a', 'b' } 'closewhile' { 'a', 'b' } 'longwatch' { 'a', 'b' } 'focus' { 'a', 'b' }
 })
 $I = [ordered]@{}
 $ix = 0
@@ -167,6 +199,28 @@ if (Test-Path -LiteralPath $Root) {
 New-Item -ItemType Directory -Force (@($Run, "$Run\shots", "$Run\regbackup", "$Run\vpm") + @($Names | ForEach-Object { $I[$_].Dir })) | Out-Null
 $LogFile = Join-Path $Run 'match.log'
 $RegDir = Join-Path $Run 'regbackup'
+
+# ---------------------------------------------------------------- a patched table (-Sidecar): one copy per instance, under a name of this test's own
+$JournalDir = Join-Path $env:LOCALAPPDATA 'Castcade\journal'
+function Get-Journal($inst) { if (Test-Path -LiteralPath $JournalDir) { Get-ChildItem -LiteralPath $JournalDir -Filter "cchand-$($inst.Name)_*.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1 } }
+# (the hook holds its journal open: the size is read through a handle of our own, not from the folder's entry)
+function JSize($inst) {
+    $j = Get-Journal $inst; if (-not $j) { return 0 }
+    try { $fs = [IO.File]::Open($j.FullName, 'Open', 'Read', 'ReadWrite'); try { $fs.Length } finally { $fs.Dispose() } } catch { -1 }
+}
+$JournalGrew = 0; $JournalQuiet = 0
+if ($Sidecar) {
+    foreach ($n in $Names) {
+        $x = $I[$n]; if ($x.Role -ne 'match') { continue }
+        $old = Get-Journal $x; if ($old) { Remove-Item -LiteralPath $old.FullName -Force }   # a journal of this test's own name, left by a run that did not end
+        $tdir = Join-Path $x.Dir 'table'; New-Item -ItemType Directory -Force $tdir | Out-Null
+        $base = "cchand-$n " + [IO.Path]::GetFileNameWithoutExtension($x.Table)
+        Copy-Item -LiteralPath $x.Table -Destination (Join-Path $tdir "$base.vpx")
+        Copy-Item -LiteralPath $Sidecar -Destination (Join-Path $tdir "$base.vbs")
+        Copy-Item -LiteralPath $HookLib -Destination (Join-Path $tdir 'castcade.vbs')
+        $x.Table = Join-Path $tdir "$base.vpx"; $x.Patched = $true
+    }
+}
 
 # ---------------------------------------------------------------- state backup (as pair.ps1), plus VPinMAME's files of -Rom
 $RegKeys = [ordered]@{
@@ -250,10 +304,11 @@ $Keys = [ordered]@{ StartGameKey = 2; AddCreditKey = 6; PlungerKey = 28; LFlipKe
 function New-Ini([string]$dest, [int]$posX, [int]$posY) {
     $set = [ordered]@{
         'Player'   = [ordered]@{ FullScreen = '0'; Width = "$Width"; Height = "$Height"; Display = '-1'; WindowPosX = "$posX"; WindowPosY = "$posY";
-                                 PlaySound = '0'; PlayMusic = '0'; CacheMode = '0' }
+                                 PlaySound = $(if ($Sound) { '1' } else { '0' }); PlayMusic = $(if ($Sound) { '1' } else { '0' }); CacheMode = '0' }
         'PlayerVR' = [ordered]@{ AskToTurnOn = '2' }
         'Editor'   = [ordered]@{ EnableLog = '1' }
     }
+    if ($Sound) { $set['Player']['SoundVolume'] = '0'; $set['Player']['MusicVolume'] = '0' }
     foreach ($k in $Keys.Keys) { $set['Player'][$k] = "$($Keys[$k])" }
     $out = New-Object System.Collections.Generic.List[string]; $sec = ''; $done = @{}
     $flush = { param($s) if ($set.Contains($s)) { foreach ($k in $set[$s].Keys) { if (-not $done.ContainsKey("$s/$k")) { $out.Add("$k = $($set[$s][$k])"); $done["$s/$k"] = 1 } } } }
@@ -274,25 +329,31 @@ foreach ($n in $Names) { New-Ini $I[$n].Ini $I[$n].PosX $I[$n].PosY }
 # The schedule of pair.ps1 (with more presses of start and of the plunger at the beginning: a ROM that is still
 # booting at 9 s ignores the first), one seed per instance, long enough for the whole run. Keys that fall into a watch
 # phase never reach the script (that is the match role's rule), so each game is played in the gaps.
-$TotalSeconds = $WarmupSeconds + [int]([math]::Ceiling($Swaps * ($WatchSeconds + $PlaySeconds + 3.5))) + 60
+$perTurn = switch ($Scenario) { 'swap' { $WatchSeconds + 1.0 } 'deadwatch' { 1.2 } default { $WatchSeconds + $PlaySeconds + 3.5 } }
+$TotalSeconds = $WarmupSeconds + [int]([math]::Ceiling($Swaps * $perTurn)) + 60 + $(if ($Scenario -eq 'longwatch') { [int]($LongMinutes * 60) + 30 } else { 0 })
+# With -PlayOutSeconds the flippers stop at $FlipEndSeconds (ms on each instance's own clock, from its first frame) and only
+# the plunger is pressed after that: the balls drain and the game ends. One press of start then, at 20 s: one game of one player.
+$FlipEndSeconds = if ($PlayOutSeconds -gt 0) { $WarmupSeconds + [int]([math]::Ceiling($Swaps * $perTurn)) + 15 } else { $TotalSeconds }
 function Write-Input([string]$file, [int]$seed) {
     $ev = New-Object System.Collections.Generic.List[object]
-    $end = $TotalSeconds * 1000
+    $end = $FlipEndSeconds * 1000
+    $last = ($FlipEndSeconds + $PlayOutSeconds) * 1000
     $tap = { param([int]$t, [string]$key, [int]$hold)
-        if ($t + $hold -le $end) { $ev.Add([pscustomobject]@{ t = $t; o = 1; line = "$t down $key" }); $ev.Add([pscustomobject]@{ t = $t + $hold; o = 0; line = "$($t + $hold) up $key" }) } }
+        if ($t + $hold -le $last) { $ev.Add([pscustomobject]@{ t = $t; o = 1; line = "$t down $key" }); $ev.Add([pscustomobject]@{ t = $t + $hold; o = 0; line = "$($t + $hold) up $key" }) } }
     $rng = [Random]::new($seed)
-    & $tap 8000 'credit' 150; & $tap 8600 'credit' 150; & $tap 9200 'start' 150
-    & $tap 12350 'plunger' 1200
-    & $tap 15200 'start' 150; & $tap 18350 'plunger' 1200; & $tap 21200 'start' 150
-    $t = 14000; $alt = 0; $nextPlunge = 24350; $nextStart = 54200
+    & $tap 8000 'credit' 150; & $tap 8600 'credit' 150
+    if ($PlayOutSeconds -gt 0) { & $tap 20000 'start' 150; & $tap 23350 'plunger' 1200 }
+    else { & $tap 9200 'start' 150; & $tap 12350 'plunger' 1200; & $tap 15200 'start' 150; & $tap 18350 'plunger' 1200; & $tap 21200 'start' 150 }
+    $t = $(if ($PlayOutSeconds -gt 0) { 26000 } else { 14000 }); $alt = 0; $nextPlunge = $(if ($PlayOutSeconds -gt 0) { 30350 } else { 24350 }); $nextStart = 54200
     while ($t -lt $end) {
         $hold = 120 + $rng.Next(0, 181)
         if ($rng.Next(0, 5) -eq 0) { & $tap $t 'lflip' $hold; & $tap $t 'rflip' $hold }
         else { & $tap $t $(if ($alt % 2 -eq 0) { 'lflip' } else { 'rflip' }) $hold; $alt++ }
         $t += 700 + $rng.Next(0, 901)
         while ($nextPlunge -le $t) { & $tap $nextPlunge 'plunger' 1200; $nextPlunge += 12000 }
-        while ($nextStart -le $t) { & $tap $nextStart 'start' 150; $nextStart += 45000 }
+        while ($PlayOutSeconds -le 0 -and $nextStart -le $t) { & $tap $nextStart 'start' 150; $nextStart += 45000 }
     }
+    for ($t = $end + 2000; $t -lt $last; $t += 6000) { & $tap $t 'plunger' 1200 }   # the play-out: a ball in the lane is sent up, nothing keeps it alive
     $sorted = @($ev | Sort-Object t, o)
     [IO.File]::WriteAllLines($file, @("# generated by match-test.ps1 (seed $seed): <ms from first rendered frame> <down|up> <key>") + @($sorted | ForEach-Object { $_.line }), (New-Object System.Text.UTF8Encoding($false)))
     $sorted.Count
@@ -310,9 +371,13 @@ function Start-Instance($inst) {
         $psi.Environment['CASTCADE_STREAM'] = 'match'
         $psi.Environment['CASTCADE_STREAM_ADDR'] = "listen:127.0.0.1:$($inst.Stream)"
         $psi.Environment['CASTCADE_STREAM_CONTROL'] = "connect:127.0.0.1:$($inst.Ctl)"
-        $psi.Environment['CASTCADE_STREAM_SOUND'] = '0'
+        $psi.Environment['CASTCADE_STREAM_SOUND'] = $(if ($StreamSound) { '1' } else { '0' })
         $psi.Environment['CASTCADE_TEST_BALLLOG'] = '250'
         if ($Check) { $psi.Environment['CASTCADE_TEST_MATCHCHECK'] = '1' }
+        if ($Sound -and $MusicFile -and (Test-Path -LiteralPath $MusicFile -PathType Leaf)) {
+            $mf = Join-Path $inst.Dir ('test-music' + [IO.Path]::GetExtension($MusicFile)); Copy-Item -LiteralPath $MusicFile -Destination $mf -Force
+            $psi.Environment['CASTCADE_TEST_MUSIC'] = $mf
+        }
         if ($StaticRefresh) { $psi.Environment['CASTCADE_STREAM_STATICREFRESH'] = '1' }
         if ($Drive -eq 'game') {
             $n = Write-Input (Join-Path $inst.Dir 'input.txt') ($Seed + [array]::IndexOf($Names, $inst.Name))
@@ -324,7 +389,7 @@ function Start-Instance($inst) {
         $psi.Environment['CASTCADE_STREAM_ADDR'] = "connect:127.0.0.1:$($I['a'].Stream)"
     }
     $psi.Environment['CASTCADE_STREAM_DELAY_MS'] = "$DelayMs"
-    $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1'
+    if ($Scenario -eq 'focus' -and $inst.Name -eq 'b') { $psi.Environment['CASTCADE_TEST_PAUSE'] = '14,3600' } else { $psi.Environment['CASTCADE_TEST_NOPAUSE'] = '1' }
     $psi.Environment['CASTCADE_STREAM_LOG'] = (Join-Path $inst.Dir 'castcade.log')
     if (-not $NoFrameLog) { $psi.Environment['CASTCADE_FRAMELOG'] = (Join-Path $inst.Dir 'frames.log') }
     foreach ($k in $ExtraEnv.Keys) { $psi.Environment[$k] = "$($ExtraEnv[$k])" }
@@ -347,7 +412,8 @@ function Poll-Window($inst) {
 # The companion's side of one control connection: accept (again after a loss), read lines, send lines
 function Poll-Control($inst) {
     if ($inst.Role -ne 'match') { return }
-    if (-not $inst.Client -and $inst.Listener -and $inst.Listener.Pending()) {
+    if ($inst.Listener -and $inst.Listener.Pending()) {
+        if ($inst.Client) { try { $inst.Client.Close() } catch {} }   # the instance dropped the old connection and came again
         $inst.Client = $inst.Listener.AcceptTcpClient(); $inst.Client.NoDelay = $true
         $inst.Stream0 = $inst.Client.GetStream(); $inst.Buf = ''
         Log "$($inst.Name): control connection accepted"
@@ -522,6 +588,8 @@ try {
                 $row = [ordered]@{ swap = $s; watcher = $Y.Name; player = $X.Name; order = @('both at once', 'watch first', 'play first')[$mode]; result = ''; watching_ms = $null; playing_ms = $null;
                     noise = $null; before_after = $null; before_mid = $null; mid_vs_player = $null; t_watch = $null; t_play = $null }
                 $y0 = Shot $Y 'before0'; Pump 0.12; $y1 = Shot $Y 'before'
+                # a patched table: the hook's journal of the table that has been watching must not have grown meanwhile
+                if ($X.Patched -and $null -ne $X.JAtWatch) { $jn = JSize $X; if ($jn -ne $X.JAtWatch) { $script:JournalGrew++; $notes.Add("swap ${s}: $($X.Name)'s journal grew by $($jn - $X.JAtWatch) bytes while it watched") } else { $script:JournalQuiet++ } }
                 $fromX = $X.Lines.Count; $fromY = $Y.Lines.Count
                 $row.t_watch = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'); $row.t_play = $row.t_watch
                 $watchCmd = "watch 127.0.0.1:$($X.Stream)"
@@ -536,6 +604,7 @@ try {
                 $row.result = if (-not $px -or $px.line -ne 'state playing') { "$($X.Name) called back: $(if ($px) { $px.line } else { 'no answer' })" }
                               elseif (-not $wy -or $wy.line -ne 'state watching') { "$($Y.Name) sent to watch: $(if ($wy) { $wy.line } else { 'no answer' })" } else { 'ok' }
                 $mid = $null; $midP = $null
+                if ($Y.Patched) { $Y.JAtWatch = if ($wy -and $wy.line -eq 'state watching') { Pump 0.3; JSize $Y } else { $null } }
                 if ($row.result -eq 'ok') { Pump ($WatchSeconds / 2); $midP = Shot $X 'mid-player'; Pump (($DelayMs + 20) / 1000.0); $mid = Shot $Y 'mid'; Pump ($WatchSeconds / 2) }
                 $row.noise = D $y0 $y1; $row.before_after = D $kept[$X.Name] $xa; $row.before_mid = D $y1 $mid; $row.mid_vs_player = D $mid $midP
                 $r = [pscustomobject]$row; $rows.Add($r)
@@ -575,7 +644,7 @@ try {
             $from = $I.a.Lines.Count; Send-Control $I.a 'play'
             if (-not (Wait-Line $I.a '^state playing$' 3 $from)) { $notes.Add('no answer to a play after the failed watch') }
             $from = $I.a.Lines.Count; Send-Control $I.a 'dance'
-            if (-not (Wait-Line $I.a '^state playing$' 3 $from)) { $notes.Add('no "state playing" after an unknown command') }
+            if (Wait-Line $I.a '^state ' 1.5 $from) { $notes.Add('an unknown command was answered (it must be ignored)') }
             $from = $I.a.Lines.Count; Send-Control $I.a 'watch nowhere'
             if (-not (Wait-Line $I.a '^state failed badaddress$' 3 $from)) { $notes.Add('no "state failed badaddress" after a watch without an address') }
             Pump 2
@@ -643,14 +712,23 @@ try {
             & $say 'play' (Ask $b 'play' '^state ' 3) '^state playing$' 2000
             & $say 'watch right after state playing' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
             Pump 1.5
-            # 5 again: play and watch in one write; both answers, in order
-            $from = $b.Lines.Count; $t0 = $SW.Elapsed.TotalSeconds
-            Send-Control $b "play`nwatch $aAddr"
-            $p1 = Wait-Line $b '^state playing$' 3 $from
-            $w1 = if ($p1) { Wait-Line $b '^state (watching|failed .*)$' 8 ($b.Lines.IndexOf($p1) + 1) }
-            & $say 'play and watch in one write: the play' $(if ($p1) { [pscustomobject]@{ line = $p1.line; ms = [math]::Round(($p1.t - $t0) * 1000) } }) '^state playing$' 2000
-            & $say 'play and watch in one write: the watch' $(if ($w1) { [pscustomobject]@{ line = $w1.line; ms = [math]::Round(($w1.t - $t0) * 1000) } }) '^state watching$' 5000
-            Pump 1.5
+            # A burst in one write: only the last state asked for takes effect and is answered. play + watch while watching
+            # is a re-aim (one fresh state watching, no state playing: this table never played in between) ...
+            $from = $b.Lines.Count
+            & $say 'play and watch in one write, while watching' (Ask $b "play`nwatch $aAddr" '^state ' 8) '^state watching$' 5000
+            Pump 0.5
+            if (@($b.Lines | Select-Object -Skip $from | Where-Object { $_.line -eq 'state playing' }).Count) { $notes.Add('contract: play + watch in one write: a state playing was sent for the superseded play') }
+            # ... watch + play is a play: one state playing, and the watch phase before it ends once
+            $from = $b.Lines.Count
+            & $say 'watch and play in one write, while watching' (Ask $b "watch $aAddr`nplay" '^state ' 3) '^state playing$' 2000
+            Pump 0.5
+            if (@($b.Lines | Select-Object -Skip $from | Where-Object { $_.line -ne 'state playing' }).Count -or @($b.Lines | Select-Object -Skip $from).Count -ne 1) { $notes.Add("contract: watch + play in one write gave: $((@($b.Lines | Select-Object -Skip $from | ForEach-Object line)) -join ' | ')") }
+            # ... and five pairs in one write, while playing, end watching with one answer
+            $from = $b.Lines.Count
+            & $say 'five play/watch pairs in one write' (Ask $b ((1..5 | ForEach-Object { "play`nwatch $aAddr" }) -join "`n") '^state ' 8) '^state watching$' 5000
+            Pump 0.5
+            if (@($b.Lines | Select-Object -Skip $from).Count -ne 1) { $notes.Add("contract: five pairs in one write gave $(@($b.Lines | Select-Object -Skip $from).Count) answers, expected 1") }
+            Pump 1
             # 2 and 11: the same watch again is a re-aim: the stream is dropped and connected again (the fork's log says so),
             # a fresh state watching answers it, and no state playing comes in between
             $from = $b.Lines.Count
@@ -682,9 +760,29 @@ try {
             # back to watching for what follows
             & $say 'watch a' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
             Pump 1
-            # an unknown command brings the own table back
-            & $say 'an unknown command while watching' (Ask $b 'dance' '^state ' 3) '^state playing$' 2000
-            & $say 'a watch without an address' (Ask $b 'watch nowhere' '^state ' 3) '^state failed badaddress$' 2000
+            # An unknown line and an empty one are ignored: no answer, and the watch goes on (a newer companion may say more)
+            $from = $b.Lines.Count
+            Send-Control $b 'dance 12 now'; Send-Control $b ''; Send-Control $b 'state watching'
+            Pump 1.5
+            $got = @($b.Lines | Select-Object -Skip $from | ForEach-Object line)
+            Log "contract: an unknown line, an empty line and a line of the other direction, while watching: $(if ($got.Count) { "answered '$($got -join ' | ')'" } else { 'no answer' })"
+            if ($got.Count) { $notes.Add("contract: unknown lines were answered: $($got -join ' | ')") }
+            # ... still watching: the play that follows finds a watch to end (the fork's log says "back to playing (play)")
+            & $say 'play after the unknown lines' (Ask $b 'play' '^state ' 3) '^state playing$' 2000
+            # A watch whose address is not this PC's, or is none: state failed badaddress, state playing; nothing is looked up
+            foreach ($bad in 'watch nowhere', 'watch 127.example.com:48111', 'watch 192.168.1.20:48111', 'watch 127.0.0.1', 'watch 127.0.0.1:0', 'watch') {
+                $x = Ask $b $bad '^state ' 3
+                if ($bad -eq 'watch') { if ($x) { $notes.Add("contract: a bare 'watch' was answered '$($x.line)' (it is an unknown line: no answer)") }; continue }
+                & $say "'$bad'" $x '^state failed badaddress$' 2000
+                if ($x -and -not (Wait-Line $b '^state playing$' 2 ($x.index + 1))) { $notes.Add("contract: no state playing after '$bad'") }
+            }
+            # a line of more than 2048 bytes closes the connection; b connects again and says hello
+            $from = $b.Lines.Count
+            Send-Control $b ('x' * 3000)
+            $re = Wait-Line $b '^hello 1 ' 8 $from
+            Log "contract: a line of 3000 bytes: $(if ($re) { 'the connection was closed and made again (a new hello)' } else { 'NO new hello within 8 s' })"
+            if (-not $re) { $notes.Add('contract: a line of 3000 bytes did not close the control connection') }
+            elseif (-not (Wait-Line $b '^state playing$' 3 ($b.Lines.IndexOf($re) + 1))) { $notes.Add('contract: no state playing after the hello of the new connection') }
             Pump 1
             # 6: the watched player closes its table: state failed, then state playing, with no play sent
             & $say 'watch a' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
@@ -743,6 +841,78 @@ try {
             if ($r.result -ne 'ok') { $notes.Add("stalled: the watch after the stall: $($r.result)") }
             Pump 1
         }
+        'deadwatch' {
+            # A watch that never shows anything. B is in the middle of its game (targets drop, sequences run, lamps blink);
+            # it is told to watch a port where nothing listens and is called back 150 ms later, -Swaps times, 0.8 s of play
+            # in between; every 10th time it is left alone until its own 4 s timeout. With -Check each of these must leave
+            # every property and the internal state of every part as they were, with no event kept from the script.
+            $b = $I.b
+            for ($s = 1; $s -le $Swaps; $s++) {
+                $from = $b.Lines.Count; $t0 = $SW.Elapsed.TotalSeconds
+                Send-Control $b "watch 127.0.0.1:$DeadPort"
+                if ($s % 10 -eq 0) {
+                    $f1 = Wait-Line $b '^state failed .*$' 8 $from
+                    $p2 = if ($f1) { Wait-Line $b '^state playing$' 2 ($b.Lines.IndexOf($f1) + 1) }
+                    $res = if ($f1 -and $f1.line -eq 'state failed timeout' -and $p2) { 'ok' } else { "left to its timeout: $(if ($f1) { $f1.line } else { 'no answer' })" }
+                } else {
+                    Pump 0.15
+                    Send-Control $b 'play'
+                    $p2 = Wait-Line $b '^state playing$' 3 $from
+                    $res = if ($p2) { 'ok' } else { 'no state playing after the play' }
+                }
+                $rows.Add([pscustomobject][ordered]@{ swap = $s; watcher = 'b'; player = ''; result = $res; watching_ms = $null; playing_ms = $(if ($p2 -and ($s % 10)) { [math]::Round(($p2.t - $t0 - 0.15) * 1000) }); noise = $null; before_after = $null; before_mid = $null; mid_vs_player = $null; t_watch = $null; t_play = $null })
+                if ($res -ne 'ok') { Log "dead watch ${s}: $res" }
+                Pump 0.8
+            }
+            Log "dead watches: $(@($rows | Where-Object result -eq 'ok').Count) of $Swaps ended as expected"
+        }
+        'closewhile' {
+            $b = $I.b
+            $x = Ask $b "watch 127.0.0.1:$($I.a.Stream)" '^state ' 8
+            Log "close while watching: $(if ($x) { "'$($x.line)' after $($x.ms) ms" } else { 'no answer' })"
+            if (-not $x -or $x.line -ne 'state watching') { $notes.Add("close while watching: the watch was answered '$($x.line)'") }
+            Pump 2.5
+            Log "closing b's table (WM_CLOSE to its player window) while it watches a"
+            $b.Gone = $true
+            $pl = [MatchWin]::ForPid($b.Pid) | Where-Object { $_.Title -eq 'Visual Pinball Player' } | Select-Object -First 1
+            [void][MatchWin]::PostMessage($pl.H, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            if (-not $b.Proc.WaitForExit(30000)) { $notes.Add('close while watching: b did not exit within 30 s') }
+            else { Log "b exited, code $($b.Proc.ExitCode)"; if ($b.Proc.ExitCode -ne 0) { $notes.Add("close while watching: b's exit code is $($b.Proc.ExitCode)") } }
+            Pump 2
+        }
+        'longwatch' {
+            $b = $I.b
+            $mem = { $b.Proc.Refresh(); [pscustomobject]@{ private_mb = [math]::Round($b.Proc.PrivateMemorySize64 / 1MB, 1); working_mb = [math]::Round($b.Proc.WorkingSet64 / 1MB, 1); handles = $b.Proc.HandleCount; threads = $b.Proc.Threads.Count } }
+            $m0 = & $mem; Log "long watch: b before: private $($m0.private_mb) MB, working set $($m0.working_mb) MB, handles $($m0.handles), threads $($m0.threads)"
+            $x = Ask $b "watch 127.0.0.1:$($I.a.Stream)" '^state ' 8
+            if (-not $x -or $x.line -ne 'state watching') { throw "the long watch was answered '$($x.line)'" }
+            Pump 20
+            $m1 = & $mem; Log "long watch: b 20 s into the watch: private $($m1.private_mb) MB, working set $($m1.working_mb) MB, handles $($m1.handles), threads $($m1.threads)"
+            $until = $SW.Elapsed.TotalSeconds + $LongMinutes * 60 - 20; $unexpected = 0; $from = $b.Lines.Count
+            while ($SW.Elapsed.TotalSeconds -lt $until) { Pump 10; if ($b.Lines.Count -gt $from) { $unexpected = $b.Lines.Count - $from } }
+            $m2 = & $mem; Log "long watch: b after $LongMinutes minutes of watching: private $($m2.private_mb) MB, working set $($m2.working_mb) MB, handles $($m2.handles), threads $($m2.threads)"
+            if ($unexpected) { $notes.Add("long watch: b said $unexpected lines by itself during the watch: $((@($b.Lines | Select-Object -Skip $from | ForEach-Object line)) -join ' | ')") }
+            $y = Ask $b 'play' '^state ' 5
+            if (-not $y -or $y.line -ne 'state playing') { $notes.Add("long watch: the play was answered '$($y.line)'") }
+            Pump 10
+            $m3 = & $mem; Log "long watch: b 10 s after its return: private $($m3.private_mb) MB, working set $($m3.working_mb) MB, handles $($m3.handles), threads $($m3.threads)"
+            $script:LongWatch = [ordered]@{ before = $m0; watch_20s = $m1; watch_end = $m2; after = $m3 }
+            Log ("long watch: during the watch (20 s in to the end): private {0:+0.0;-0.0} MB, handles {1:+0;-0}; back on its own table against before: private {2:+0.0;-0.0} MB, handles {3:+0;-0}" -f ($m2.private_mb - $m1.private_mb), ($m2.handles - $m1.handles), ($m3.private_mb - $m0.private_mb), ($m3.handles - $m0.handles))
+            if (($m2.private_mb - $m1.private_mb) -gt 50 -or ($m2.handles - $m1.handles) -gt 200) { $notes.Add("long watch: b grew by $($m2.private_mb - $m1.private_mb) MB and $($m2.handles - $m1.handles) handles while watching") }
+        }
+        'focus' {
+            # A table whose window does not have the focus (in VR another window often has it). The harness changes no
+            # foreground window, and both test windows count as active to VPX, so B is given what losing the focus gives
+            # it: no CASTCADE_TEST_NOPAUSE, and CASTCADE_TEST_PAUSE=14,3600, which 14 s in marks its window inactive and
+            # pauses it exactly as WM_ACTIVATE does (CastcadeTest.h), for the rest of the run. Paused like that it is sent
+            # to watch A and called back, six times: it must show A's table live, and be paused again on its own afterwards.
+            for ($s = 1; $s -le 6; $s++) {
+                $w = $I.b; $p = $I.a
+                $r = Watch-Phase $w $p.Stream $p $s 'play'
+                $rows.Add($r); Log ("focus {0}: {1} watched {2}: {3}; watching after {4} ms, playing after {5} ms, picture before/after {6}" -f $s, $w.Name, $p.Name, $r.result, $r.watching_ms, $r.playing_ms, $r.before_after)
+                Pump 2
+            }
+        }
         'plainwatch' {
             # W, a plain watch build, watches A the whole time. A and B swap; while A watches B, W must see A's own table, standing still.
             for ($s = 1; $s -le [math]::Max(2, [math]::Min($Swaps, 10)); $s++) {
@@ -760,6 +930,13 @@ try {
         }
     }
     Pump 1.5
+    if ($PlayOutSeconds -gt 0) {
+        # the games play out: no flipper is pressed from $FlipEndSeconds of each instance's own clock on
+        $t0min = ($Names | ForEach-Object { $I[$_].WinAt } | Measure-Object -Maximum).Maximum
+        $wait = [math]::Max(0, ($t0min + $FlipEndSeconds + $PlayOutSeconds + 3) - $SW.Elapsed.TotalSeconds)
+        Log ("play-out: both tables play on for {0:N0} s with no flipper pressed" -f $wait)
+        Pump $wait
+    }
 } catch {
     $fail = "$_"; Log ("at: " + $_.ScriptStackTrace)
     Log "FAILED: $fail"
@@ -795,6 +972,33 @@ try {
     try { $vpmOk = Restore-Vpm } catch { $vpmOk = $false; Log "VPinMAME restore error: $_" }
 }
 
+# ---------------------------------------------------------------- the journals of a patched table: kept in the run folder, removed from Castcade's
+$Journals = [ordered]@{}
+if ($Sidecar) {
+    foreach ($n in $Names) {
+        $x = $I[$n]; if (-not $x.Patched) { continue }
+        $j = Get-Journal $x
+        $info = [ordered]@{ file = $null; lines = 0; table_loaded = 0; nvram_deltas = 0; lock_lines = 0; ball_ends = ''; game_ends = 0; gate = ''; script_errors = 0 }
+        if ($j) {
+            $copy = Join-Path $Run "journal-$n.jsonl"
+            Copy-Item -LiteralPath $j.FullName -Destination $copy -Force; Remove-Item -LiteralPath $j.FullName -Force
+            $info.file = $copy
+            foreach ($l in [IO.File]::ReadLines($copy)) { $info.lines++; if ($l -like '*"event":"table_loaded"*') { $info.table_loaded++ } elseif ($l -like '*"event":"nvram_delta"*') { $info.nvram_deltas++ } elseif ($l -match '"event":"(lock|key_blocked)') { $info.lock_lines++ } }
+            if ((Test-Path -LiteralPath $JournalTool) -and (Get-Command python -ErrorAction SilentlyContinue)) {
+                $out = & python $JournalTool $copy --quiet-scores 2>&1 | ForEach-Object { "$_" }
+                $out | Set-Content -LiteralPath (Join-Path $Run "journal-$n.decoded.txt")
+                foreach ($l in $out) {
+                    if ($l -match 'balls seen ending: (.*?)\s+max ball') { $info.ball_ends = $Matches[1] }
+                    if ($l -match '0a live NVRAM\s*: (\S+) \(.*ball_end=(\d+) game_end=(\d+)') { $info.gate = $Matches[1]; $info.game_ends = [int]$Matches[3] }
+                }
+            }
+        }
+        $vl = Join-Path $x.Dir 'vpinball.log'
+        if (Test-Path -LiteralPath $vl) { $info.script_errors = @(Select-String -LiteralPath $vl -Pattern 'script error|runtime error|compile error' -ErrorAction SilentlyContinue).Count }
+        $Journals[$n] = $info
+    }
+}
+
 # ---------------------------------------------------------------- what the instances logged
 function Stamp([string]$line) { if ($line -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})') { [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss.fff', $null) } else { $null } }
 $Ana = [ordered]@{}   # per instance
@@ -804,7 +1008,10 @@ foreach ($n in $Names) {
         prepass_puts = 0; prepass_failed = 0; undo_max = 0; keyframes = 0; keyframe_calls_failed = 0; replay_failed = 0; replay_unresolved = 0; check_runs = 0; check_differ = 0; check_approx = 0;
         warnings = 0; errors = 0; leave_ms_max = 0.0; enter_ms_max = 0.0; prepass_ms_max = 0.0; keys_passed = 0; reasons = @{}; switch_times = (New-Object System.Collections.Generic.List[datetime]);
         frames_over_25 = 0; frames_over_100 = 0; frame_max_ms = 0.0; switch_frame_max_ms = 0.0; switch_frames_over = 0; ball_episodes = 0; ball_episodes_after_first_watch = 0; ball_log_lines = 0;
-        entered_with_moving_ball = 0; first_watch_gametime = $null; held = 0; held_served = 0; held_closed = 0; held_ms_max = 0.0; first_bad = (New-Object System.Collections.Generic.List[string]) }
+        entered_with_moving_ball = 0; first_watch_gametime = $null; held = 0; held_served = 0; held_closed = 0; held_ms_max = 0.0;
+        began_target_moving = 0; began_sequence_playing = 0; began_duration = 0; began_blinking = 0; began_reel_turning = 0; began_primitive_animating = 0; began_window_inactive = 0; began_paused = 0;
+        began_music_playing = 0; began_music_silent = 0; music_kept_playing = 0; music_kept_silent = 0; music_lost = 0; events_before_keyframe = 0; events_while_shown = 0; options_passed = 0;
+        deep_runs = 0; deep_parts = 0; deep_differ = 0; no_pause_handler = $false; paused_after_return = 0; journal = $null; first_bad = (New-Object System.Collections.Generic.List[string]) }
     $cl = Join-Path $x.Dir 'castcade.log'
     $balls = New-Object System.Collections.Generic.List[object]; $lastBallT = 0
     if (Test-Path -LiteralPath $cl) {
@@ -817,6 +1024,19 @@ foreach ($n in $Names) {
             if ($null -eq $a.first_watch_gametime -and $line -match 'entering watch 1 of ') { $a.first_watch_gametime = $lastBallT }
             if ($line -match '\] WARNING ') { $a.warnings++; if ($a.first_bad.Count -lt 12) { $a.first_bad.Add($line) } }
             if ($line -match '\] ERROR ') { $a.errors++; if ($a.first_bad.Count -lt 12) { $a.first_bad.Add($line) } }
+            if ($line -match 'own table: targets moving (\d+), sequences playing (\d+), lights under Duration (\d+), lights blinking (\d+), reels turning (\d+), primitives animating (\d+), window (active|not active), (paused by VPX|not paused); own music: (playing|a stream that is not playing|none)') {
+                if ([int]$Matches[1]) { $a.began_target_moving++ }; if ([int]$Matches[2]) { $a.began_sequence_playing++ }; if ([int]$Matches[3]) { $a.began_duration++ }
+                if ([int]$Matches[4]) { $a.began_blinking++ }; if ([int]$Matches[5]) { $a.began_reel_turning++ }; if ([int]$Matches[6]) { $a.began_primitive_animating++ }
+                if ($Matches[7] -eq 'not active') { $a.began_window_inactive++ }; if ($Matches[8] -eq 'paused by VPX') { $a.began_paused++ }
+                if ($Matches[9] -eq 'playing') { $a.began_music_playing++ } elseif ($Matches[9] -ne 'none') { $a.began_music_silent++ }
+            }
+            if ($line -match 'own music (none before, a stream now|none|kept, playing|kept, not playing|LOST); events kept from the script: (\d+) before the keyframe, (\d+) while the other table was shown; (\d+) option events passed on') {
+                switch ($Matches[1]) { 'kept, playing' { $a.music_kept_playing++ } 'kept, not playing' { $a.music_kept_silent++ } 'LOST' { $a.music_lost++ } }
+                $a.events_before_keyframe += [int]$Matches[2]; $a.events_while_shown += [int]$Matches[3]; $a.options_passed += [int]$Matches[4]
+            }
+            if ($line -match 'match check: internal state of (\d+) parts and lists compared, (\d+) differ') { $a.deep_runs++; $a.deep_parts = [int]$Matches[1]; $a.deep_differ += [int]$Matches[2] }
+            if ($line -match 'script has NO \S+ handler') { $a.no_pause_handler = $true }
+            if ($line -match 'own table now: .*window (active|not active), (paused by VPX|not paused)') { if ($Matches[2] -eq 'paused by VPX') { $a.paused_after_return++ } }
             if ($line -match 'entering watch \d+ of .*own game paused in ([\d.]+) ms') {
                 $a.phases++; $a.enter_ms_max = [math]::Max($a.enter_ms_max, [double]$Matches[1]); $s = Stamp $line; if ($s) { $a.switch_times.Add($s) }
                 # a ball of its own in motion when the watch began (speed over 1 VP unit per 10 ms)
@@ -891,7 +1111,14 @@ foreach ($n in $Names) {
         Log ("   watch phases {0} (table shown the other player's in {1}, never touched in {2}); ended by: {3}" -f $a.phases, $a.touched, $a.never_touched, (($a.reasons.Keys | ForEach-Object { "$_ x$($a.reasons[$_])" }) -join ', '))
         Log ("   own physics state after the watch: identical {0}, DIFFERENT {1}; properties put back {2} (largest undo list {3}; {4} with the own stored value), failed {5}, lost {6}" -f $a.physics_identical, $a.physics_different, $a.put_back, $a.undo_max, $a.put_back_own_value, $a.put_back_failed, $a.put_back_lost)
         Log ("   keyframes {0}, their calls failed {1}; pre-pass puts to the file's value {2}, failed {3}; replayed calls failed {4}, unresolved {5} (stats lines)" -f $a.keyframes, $a.keyframe_calls_failed, $a.prepass_puts, $a.prepass_failed, $a.replay_failed, $a.replay_unresolved)
-        if ($Check) { Log ("   property check: {0} runs, {1} properties differ, {2} equal within 0.01 % only" -f $a.check_runs, $a.check_differ, $a.check_approx) }
+        if ($Check) { Log ("   property check: {0} runs, {1} properties differ, {2} equal within 0.01 % only; internal state ({3} parts and lists): {4} runs, {5} differ" -f $a.check_runs, $a.check_differ, $a.check_approx, $a.deep_parts, $a.deep_runs, $a.deep_differ) }
+        Log ("   watch phases that began with: a target moving {0}, a light sequence playing {1}, a lamp under Duration {2}, lamps blinking {3}, a reel turning {4}, a primitive animating {5}; window not active {6}, paused by VPX {7} (paused again after the return: {8})" -f $a.began_target_moving, $a.began_sequence_playing, $a.began_duration, $a.began_blinking, $a.began_reel_turning, $a.began_primitive_animating, $a.began_window_inactive, $a.began_paused, $a.paused_after_return)
+        Log ("   events kept from its script: {0} before a keyframe (must be 0), {1} while the other table was shown; option events passed on {2}; its script has a Paused handler: {3}" -f $a.events_before_keyframe, $a.events_while_shown, $a.options_passed, $(if ($a.no_pause_handler) { 'NO' } else { 'yes' }))
+        Log ("   music of its own when a watch began: playing {0}, a stream not playing {1}; after the return: kept and playing {2}, kept and not playing {3}, LOST {4}" -f $a.began_music_playing, $a.began_music_silent, $a.music_kept_playing, $a.music_kept_silent, $a.music_lost)
+        if ($a.events_before_keyframe) { $problems.Add("${n}: $($a.events_before_keyframe) events were kept from the script before a keyframe") }
+        if ($a.music_lost -or ($a.began_music_playing -ne $a.music_kept_playing)) { $problems.Add("${n}: music playing when a watch began $($a.began_music_playing) times, playing again after it $($a.music_kept_playing) times, lost $($a.music_lost)") }
+        if ($Check -and $a.deep_differ) { $problems.Add("${n}: the internal state differed after $($a.deep_differ) part comparisons") }
+        if ($Check -and $a.deep_runs -ne $a.phases) { $problems.Add("${n}: the internal state was compared $($a.deep_runs) times for $($a.phases) watch phases") }
         Log ("   longest: entering {0} ms, keyframe pre-pass {1} ms, leaving {2} ms; key events passed on at returns {3}" -f $a.enter_ms_max, $a.prepass_ms_max, $a.leave_ms_max, $a.keys_passed)
         Log ("   watchers that reached it while it was not playing: held {0}, served once it played {1} (longest hold {2} ms), closed after 10 s {3}" -f $a.held, $a.held_served, $a.held_ms_max, $a.held_closed)
         Log ("   balls put in play on its game clock: {0}, of which {1} after its first watch phase; watch phases that began with a ball of its own in motion: {2}" -f $a.ball_episodes, $a.ball_episodes_after_first_watch, $a.entered_with_moving_ball)
@@ -910,6 +1137,18 @@ foreach ($n in $Names) {
     foreach ($l in $a.first_bad) { Log "      $l" }
     if (($null -eq $x.Exit -or $x.Exit -ne 0 -or $x.Killed) -and -not ($Scenario -eq 'streamlost' -and $n -eq 'a')) { $problems.Add("${n}: did not exit cleanly (exit code $($x.Exit))") }
 }
+if ($Sidecar) {
+    Log ("patched table (the hook's journal): watch phases during which the watcher's journal stood still: {0}; grew: {1}" -f $JournalQuiet, $JournalGrew)
+    foreach ($n in $Journals.Keys) {
+        $j = $Journals[$n]
+        Log ("   {0}: journal {1} lines (table_loaded {2}, nvram_delta {3}, lock or key_blocked {4}); balls seen ending: {5}; game_end: {6}; the reader's verdict: {7}; script errors in vpinball.log: {8}" -f $n, $j.lines, $j.table_loaded, $j.nvram_deltas, $j.lock_lines, $j.ball_ends, $j.game_ends, $j.gate, $j.script_errors)
+        if (-not $j.file -or $j.table_loaded -lt 1) { $problems.Add("${n}: the hook wrote no journal (is the sidecar the table's?)") }
+        if ($j.script_errors) { $problems.Add("${n}: $($j.script_errors) script error lines in vpinball.log") }
+        if ($PlayOutSeconds -gt 0 -and $j.game_ends -lt 1) { $problems.Add("${n}: the journal shows no game_end after the play-out (balls seen ending: $($j.ball_ends))") }
+    }
+    if ($JournalGrew) { $problems.Add("the journal of a watching table grew during $JournalGrew watch phases") }
+}
+if ($Scenario -eq 'longwatch' -and $script:LongWatch) { Log "long watch, memory and handles of b: $(($script:LongWatch | ConvertTo-Json -Compress))" }
 $overPic = @($rows | Where-Object { $null -ne $_.before_after -and -not [double]::IsNaN([double]$_.before_after) -and [double]$_.before_after -gt $MaxPictureDiff })
 if ($overPic.Count) { $problems.Add("$($overPic.Count) watch phases left a picture more than $MaxPictureDiff from the one before (swaps $((($overPic | ForEach-Object swap) | Select-Object -First 10) -join ','))") }
 # Over a run of swaps the picture after a watch must be as near the one before it as two pictures of the running game
@@ -930,6 +1169,13 @@ switch ($Scenario) {
     'mismatch' { if ($Ana.b.never_touched -ne 1) { $problems.Add('b''s table was touched by a refused stream') } }
     'nolistener' { if ($Ana.a.never_touched -lt 1) { $problems.Add('a''s table was touched although nothing answered') } }
     'reaim' { if ($okRows.Count -ne $rows.Count) { $problems.Add('a re-aim did not complete') } }
+    'deadwatch' { if ($okRows.Count -ne $Swaps) { $problems.Add("$($okRows.Count) of $Swaps dead watches ended as expected") }; if ($Ana.b.touched) { $problems.Add("b's table was shown another player's in $($Ana.b.touched) dead watches") } }
+    'closewhile' { if (-not $Ana.b.reasons.ContainsKey('this table closes')) { $problems.Add('b did not log its return to its own table when it closed') } }
+    'focus' {
+        if ($okRows.Count -ne $rows.Count) { $problems.Add('a watch phase did not complete') }
+        if ($Ana.b.began_window_inactive -ne $rows.Count -or $Ana.b.began_paused -ne $rows.Count) { $problems.Add("b began $($Ana.b.began_window_inactive) of $($rows.Count) watch phases with its window not active and $($Ana.b.began_paused) paused by VPX: the scenario did not test what it is for") }
+        if ($Ana.b.paused_after_return -ne $rows.Count) { $problems.Add("b was paused again after $($Ana.b.paused_after_return) of $($rows.Count) returns (its window never got the focus back)") }
+    }
     'plainwatch' { if ($okRows.Count -ne $rows.Count) { $problems.Add('a swap did not complete') } }
 }
 foreach ($m in $notes) { $problems.Add($m) }

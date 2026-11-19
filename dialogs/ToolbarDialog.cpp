@@ -215,7 +215,8 @@ void ToolbarDialog::EnableButtons()
     if (!IsWindow())
         return;
     CComObject<PinTable> * const ptCur = g_pvp->GetActiveTable();
-    if (ptCur == nullptr && !g_pplayer)
+    // Castcade (I11.11.1): no table is no table, with or without a game running (the branch below reads ptCur)
+    if (ptCur == nullptr)
     {
         m_magnifyButton.EnableWindow(FALSE);
         m_selectButton.EnableWindow(FALSE);

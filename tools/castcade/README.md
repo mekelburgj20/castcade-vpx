@@ -45,10 +45,11 @@ loopback only). Ports: control `BasePort+1..3`, streams `BasePort+11..13`, withi
 
     pwsh -NoProfile -File match-test.ps1 -Table "<table.vpx>" [-Rom <rom>] [-Swaps 50] [-Check] [-Scenario swap]
 
-The instances run from a copy of `-Exe` named `-RunAs` (`ccmatch_GL64.exe`) beside it: the installed Castcade
-companion takes any `VPinballX*.exe` that loads a table for a game of its own. Do not build while a test runs: the
-compiler takes the cores, and the frame probe then shows frames of 200 ms and more that the frame limiter slept
-through.
+The instances run from a copy of `-Exe` named `-RunAs` (`cchand_GL64.exe`) beside it: the installed Castcade
+companion takes any `VPinballX*.exe` that loads a table for a game of its own. `-YieldTo` (default `ccmatch_GL64`)
+names another test's instances on the same PC: the run waits, looking once a minute for 45 minutes at most, while
+one exists. Do not build while a test runs: the compiler takes the cores, and the frame probe then shows frames of
+200 ms and more that the frame limiter slept through.
 
 `-Scenario`:
 
@@ -68,10 +69,27 @@ through.
   in the castcade repo): the first two lines of a connection (`hello`, `state playing`, before anything is sent), the
   five tokens of `hello`, its stream port, and one identity for one table file; a `play` while playing; a `watch` of a
   port where nothing listens (`state failed timeout` within 5 s, then `state playing` by itself); a `watch` right
-  after `state playing`; `play` and `watch` in one write; the same `watch` again (a re-aim to the same address: a new
-  `state watching`, no `state playing` in between); a raw connection to the stream port of an instance that is
-  watching (not a byte until it plays, then its HELLO; and closed, still silent, after 10 s if it does not); an unknown
-  command; a `watch` without an address; and the watched player closing its table (`state failed closed`).
+  after `state playing`; bursts in one write, of which only the last command is acted on and answered (`play` +
+  `watch` while watching is a re-aim with one `state watching` and no `state playing`; `watch` + `play` is one
+  `state playing`; five pairs give one answer); the same `watch` again (a re-aim to the same address: a new `state
+  watching`, no `state playing` in between); a raw connection to the stream port of an instance that is watching (not
+  a byte until it plays, then its HELLO; and closed, still silent, after 10 s if it does not); an unknown line, an
+  empty line and a line of the other direction while watching (ignored: no answer, and the watch goes on); `watch`
+  with an address that is none or not this PC's (`nowhere`, `127.example.com`, `192.168.1.20`, no port, port 0:
+  `state failed badaddress`, `state playing`); a line of 3000 bytes (the connection is closed and made again); and the
+  watched player closing its table (`state failed closed`).
+- `deadwatch`: a watch that never shows anything, in the middle of a game: B is told to watch a port where nothing
+  listens and called back 150 ms later, `-Swaps` times with 0.8 s of play in between, and every 10th time left to its
+  own 4 s timeout. Each must leave B's game as a pause of that length would: with `-Check` no property and no
+  internal field differs, and no event was kept from its script. The summary says how many of them began with a
+  drop target moving, a light sequence playing, a lamp under `Duration`, lamps blinking, a reel turning.
+- `closewhile`: B watches A and B's table is closed: B must be back on its own game before its script ends (the log
+  line `back to playing (this table closes)`) and exit with code 0. `longwatch`: B watches A for `-LongMinutes` (10);
+  B's private bytes, working set, handles and threads before, 20 s in, at the end and 10 s after its return.
+- `focus`: a table whose window does not have the focus. The harness never changes the foreground window and VPX
+  counts both test windows as active, so B runs without `CASTCADE_TEST_NOPAUSE` and with `CASTCADE_TEST_PAUSE=14,3600`,
+  which marks its window inactive and pauses it as `WM_ACTIVATE` does. Paused like that it is sent to watch A and
+  called back six times: it must show A's table, and be paused again by VPX after each return.
 - `nolistener`: one instance, told to watch a port where nothing listens. `streamlost`: B watches A and A is killed
   (the script's own PID): `state failed lost` after 3 s. `stalled`: B watches A and A is suspended (its sockets stay
   open and deliver nothing): `state failed stalled` after 3 s; A is resumed and watched again. `controllost`: B
@@ -84,11 +102,37 @@ through.
 `-Check` sets `CASTCADE_TEST_MATCHCHECK=1`: before each watch phase and after it the instance reads every property of
 every part that takes no argument and returns no object (3913 on Nudge Test, 19916 on Attack from Mars, 49263 on
 Monster Bash) and logs each one that differs; the summary counts them. A getter that faults is named in the log and
-left out (stock VPX: `Light.FilamentTemperature` of a light whose intensity is 0, six of them on Monster Bash). Every instance also logs, always, whether its physics state after the watch (the bytes a
-watcher of it is sent: moving parts, balls, nudge, game clock) is identical to the one before. `-Rom` names the
+left out (stock VPX: `Light.FilamentTemperature` of a light whose intensity is 0, six of them on Monster Bash). It
+also compares, part by part, the internal state no property shows (`CaptureDeepState`: a lamp's stored state beside
+its play state, sequencer locks, blink and animation phases and their time stamps, the movers, which hit objects
+collide, when each timer fires next, the balls, the game clock, the ball id counter, the music): 434 parts and lists
+on Attack from Mars. Every instance also logs, always, whether its physics state after the watch (what a watcher of
+it is sent: moving parts, balls, the table's displacement, game clock; not the accelerometer's reading) is identical
+to the one before, how many events were kept from its script before the keyframe (there must be none) and after it,
+and what became of its music. `-Rom` names the
 VPinMAME roms whose `nvram\<rom>.nv` and `cfg\<rom>.cfg` are copied before the run and put back after it, bytes and
-time stamp, together with `cfg\default.cfg` (two instances write them when they close). `-StaticRefresh` sets `CASTCADE_STREAM_STATICREFRESH=1`. `-NoFrameLog` runs
-without the frame probe. `-ExtraEnv @{...}` adds environment variables to every instance.
+time stamp, together with `cfg\default.cfg` (two instances write them when they close). `-StaticRefresh` sets
+`CASTCADE_STREAM_STATICREFRESH=1`. `-NoFrameLog` runs without the frame probe. `-ExtraEnv @{...}` adds environment
+variables to every instance (through `pwsh -Command "& match-test.ps1 ... -ExtraEnv @{...}"`: `-File` cannot pass a
+hashtable).
+
+`-Sound` writes `PlaySound = 1` and `PlayMusic = 1` into the ini, both at volume 0, and has each match instance call
+the table's own `PlayMusic` with a copy of `-MusicFile` 5 s after its start (`CASTCADE_TEST_MUSIC`; the two tables on
+the test PC whose scripts call `PlayMusic` both need PinUP Player beside them). The summary then says how often a
+watch began with the table's music playing and how often it was playing again after the return. `-StreamSound` sets
+`CASTCADE_STREAM_SOUND=1` (a match runs with 0). Limit of that mode: a watcher stops every sound when a stream begins
+and ends, so a looping sound the own table had started (`PlaySound` with a loop count of -1) is stopped by the first
+watch and stays off until the script starts it again; with `CASTCADE_STREAM_SOUND=0` no sound of the own table is
+touched.
+
+`-Sidecar <table>.vbs` (and `-HookLib`, default the owner's `scripts\castcade.vbs`) runs a patched table, as match
+tables are: each instance gets its own copy `cchand-<x> <table>.vpx` in its run folder with the sidecar under the same
+name and the hook library beside it, and the hook writes `%LOCALAPPDATA%\Castcade\journal\cchand-<x>_....jsonl`. In
+the `swap` scenario the journal of the table that watches must not grow during the watch. At the end both journals
+are copied into the run folder (`journal-<x>.jsonl`), removed from Castcade's folder, and read by `-JournalTool` (the
+castcade repo's `vpx-hook/spike/tail-journal.py`): balls seen ending, `game_end`. `-PlayOutSeconds <n>` lets both
+tables play on for n seconds after the scenario with no flipper pressed (and starts one game of one player only), so
+that the games end.
 
 Output under `C:\code\repos\castcade-vpx-deps\run\match\<yyyyMMdd-HHmmss>-<label>\`: `match.log`, `swaps.csv` (one row
 per watch phase: the milliseconds to `state watching` and to `state playing`, the four picture differences),
@@ -112,6 +156,16 @@ began with a ball of its own in motion.
 
 Like `replay-test.ps1` it puts back what it found of the type-library registration, which can be another test build's
 value: import `run\regbackup\hkcu-typelib-before.reg` once after the last run.
+
+# tools/castcade/editor-close-test.ps1
+
+The editor-close crash (I11.11.1). Starts one VPX on a table (`-Exe`, not a `VPinballX*` name; `-Table`), lets it
+play 6 s, posts `WM_COMMAND` with wParam `0xF060` (`SC_CLOSE`) to the editor frame, which is what a click on the table
+view's close "x" at the right of the menu bar posts, and waits 8 s. Exit code 1 and `RESULT: the process ended ...,
+exit code -1073741819` on a build without the fix; exit code 0 and `RESULT: the game went on; closed normally
+afterwards, exit code 0` with it (it then closes the player window, and VPX must end by itself).
+
+    pwsh -NoProfile -File editor-close-test.ps1 -Exe <cchand_GL64.exe> -Table "<table.vpx>"
 
 # tools/castcade/replay-test.ps1
 

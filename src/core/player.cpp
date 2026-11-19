@@ -999,6 +999,9 @@ void Player::RecomputePauseState()
    // (also a player under test, CASTCADE_TEST_NOPAUSE)
    if ((m_castcade && m_castcade->NeverPauses()) || (m_castcadeTest && m_castcadeTest->NeverPauses()))
       m_pause = false;
+   // Castcade match role: paused from a "watch" command until the other player's keyframe arrives
+   if (m_castcade && m_castcade->HoldsPause())
+      m_pause = true;
 }
 
 void Player::RecomputePseudoPauseState()
