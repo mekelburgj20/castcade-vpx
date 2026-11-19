@@ -36,6 +36,11 @@ param(
     # CASTCADE_TEST_OPTIONEVENT=1: every match instance fires the tweak menu's "table option changed" event once in each
     # watch phase, while the other table is shown; each must be kept from the script and fired at the return
     [switch]$OptionEvent,
+    # CASTCADE_TEST_HOLDKEYS=1: every match instance puts key events of its own (F13, F14) into VPX's key queue, where the
+    # keyboard read puts a real key: F13 held while it plays and let go in the first frame after a watch command, F14
+    # tapped once a frame until the keyframe and three times after it. After every watch phase, also one that never
+    # showed a table, its script must have been told the key-up of F13 and nothing else.
+    [switch]$HoldKeys,
     # Every key of the scripted game comes this much later: the tables stay in their attract mode that long (an original
     # table plays its light sequences there), the first watch phases happen in it, and the game then starts
     [int]$AttractSeconds = 0,
@@ -397,6 +402,7 @@ function Start-Instance($inst) {
         $psi.Environment['CASTCADE_STREAM_CONTROL'] = "connect:127.0.0.1:$($inst.Ctl)"
         $psi.Environment['CASTCADE_STREAM_SOUND'] = $(if ($StreamSound) { '1' } else { '0' })
         if ($OptionEvent) { $psi.Environment['CASTCADE_TEST_OPTIONEVENT'] = '1' }
+        if ($HoldKeys) { $psi.Environment['CASTCADE_TEST_HOLDKEYS'] = '1' }
         $psi.Environment['CASTCADE_TEST_BALLLOG'] = '250'
         if ($Check) { $psi.Environment['CASTCADE_TEST_MATCHCHECK'] = '1' }
         if ($Sound -and $MusicFile -and (Test-Path -LiteralPath $MusicFile -PathType Leaf)) {
@@ -1045,6 +1051,7 @@ foreach ($n in $Names) {
         entered_with_moving_ball = 0; first_watch_gametime = $null; held = 0; held_served = 0; held_closed = 0; held_ms_max = 0.0;
         began_target_moving = 0; began_sequence_playing = 0; began_duration = 0; began_blinking = 0; began_reel_turning = 0; began_primitive_animating = 0; began_window_inactive = 0; began_paused = 0;
         began_music_playing = 0; began_music_silent = 0; music_kept_playing = 0; music_kept_silent = 0; music_lost = 0; events_before_keyframe = 0; events_while_shown = 0; options_passed = 0;
+        holdkeys = [ordered]@{ ok_hold_only = 0; ok_shown = 0; not_armed = 0; wrong = 0; taps_hold = 0; taps_shown = 0; keyups_told = 0; leaked = 0 };
         deep_runs = 0; deep_parts = 0; deep_differ = 0; no_pause_handler = $false; paused_after_return = 0; journal = $null; first_bad = (New-Object System.Collections.Generic.List[string]) }
     $cl = Join-Path $x.Dir 'castcade.log'
     $balls = New-Object System.Collections.Generic.List[object]; $lastBallT = 0
@@ -1067,6 +1074,12 @@ foreach ($n in $Names) {
             if ($line -match 'own music (none before, a stream now|none|kept, playing|kept, not playing|LOST); events kept from the script: (\d+) before the keyframe, (\d+) while the other table was shown; (\d+) option events passed on') {
                 switch ($Matches[1]) { 'kept, playing' { $a.music_kept_playing++ } 'kept, not playing' { $a.music_kept_silent++ } 'LOST' { $a.music_lost++ } }
                 $a.events_before_keyframe += [int]$Matches[2]; $a.events_while_shown += [int]$Matches[3]; $a.options_passed += [int]$Matches[4]
+            }
+            if ($line -match 'TEST hold keys: watch \d+ \((shown|never shown)\): the held key was (down|not down).*its key-up (\d), taps before the keyframe (\d+), taps after it (\d+); at the return the script was told of them: \[([^\]]*)\], expected \[[^\]]*\]: (ok|WRONG); their events that reached the script through the queue so far: (\d+)') {
+                $hk = $a.holdkeys; $shown = $Matches[1] -eq 'shown'
+                if ($Matches[7] -eq 'WRONG') { $hk.wrong++ } elseif ($Matches[3] -eq '1') { if ($shown) { $hk.ok_shown++ } else { $hk.ok_hold_only++ } } else { $hk.not_armed++ }
+                $hk.taps_hold += [int]$Matches[4]; $hk.taps_shown += [int]$Matches[5]; $hk.leaked = [int]$Matches[8]
+                if ($Matches[6] -match 'up 0x64') { $hk.keyups_told++ }
             }
             if ($line -match 'match check: internal state of (\d+) parts and lists compared, (\d+) differ') { $a.deep_runs++; $a.deep_parts = [int]$Matches[1]; $a.deep_differ += [int]$Matches[2] }
             if ($line -match 'script has NO \S+ handler') { $a.no_pause_handler = $true }
@@ -1148,6 +1161,13 @@ foreach ($n in $Names) {
         if ($Check) { Log ("   property check: {0} runs, {1} properties differ, {2} equal within 0.01 % only; internal state ({3} parts and lists): {4} runs, {5} differ" -f $a.check_runs, $a.check_differ, $a.check_approx, $a.deep_parts, $a.deep_runs, $a.deep_differ) }
         Log ("   watch phases that began with: a target moving {0}, a light sequence playing {1}, a lamp under Duration {2}, lamps blinking {3}, a reel turning {4}, a primitive animating {5}; window not active {6}, paused by VPX {7} (paused again after the return: {8})" -f $a.began_target_moving, $a.began_sequence_playing, $a.began_duration, $a.began_blinking, $a.began_reel_turning, $a.began_primitive_animating, $a.began_window_inactive, $a.began_paused, $a.paused_after_return)
         Log ("   events kept from its script: {0} before a keyframe (must be 0), {1} while the other table was shown; option events passed on {2}; its script has a Paused handler: {3}" -f $a.events_before_keyframe, $a.events_while_shown, $a.options_passed, $(if ($a.no_pause_handler) { 'NO' } elseif ($a.phases -lt 1) { 'not looked at (it never watched)' } else { 'yes' }))
+        if ($HoldKeys -and $a.phases -gt 0) {
+            $hk = $a.holdkeys
+            Log ("   keys put into the key queue while it was told to watch (-HoldKeys): {0} taps before a keyframe, {1} after one; watch phases after which the script was told the held key's key-up and nothing else: {2} that never showed a table, {3} that did; told something else: {4}; not counted (the held key was not down yet): {5}; key events of them that reached the script through the queue: {6}" -f $hk.taps_hold, $hk.taps_shown, $hk.ok_hold_only, $hk.ok_shown, $hk.wrong, $hk.not_armed, $hk.leaked)
+            if ($hk.wrong) { $problems.Add("${n}: after $($hk.wrong) watch phases the script was not told exactly the held key's key-up") }
+            if ($hk.leaked) { $problems.Add("${n}: $($hk.leaked) key events put into the queue while the table watched reached its script afterwards") }
+            if (($hk.ok_hold_only + $hk.ok_shown) -lt 1) { $problems.Add("${n}: -HoldKeys tested nothing (no watch phase began with the held key down)") }
+        }
         if ($OptionEvent -and $a.options_passed -ne $a.touched) { $problems.Add("${n}: $($a.options_passed) option events were passed on to the script after $($a.touched) watch phases in which one was fired") }
         Log ("   music of its own when a watch began: playing {0}, a stream not playing {1}; after the return: kept and playing {2}, kept and not playing {3}, LOST {4}" -f $a.began_music_playing, $a.began_music_silent, $a.music_kept_playing, $a.music_kept_silent, $a.music_lost)
         if ($a.events_before_keyframe) { $problems.Add("${n}: $($a.events_before_keyframe) events were kept from the script before a keyframe") }

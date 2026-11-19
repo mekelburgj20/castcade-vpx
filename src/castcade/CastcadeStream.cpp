@@ -2982,6 +2982,20 @@ private:
    bool m_testNoUndo = false; // CASTCADE_TEST_MATCHNOUNDO=1: leave the undo list and the runtime state unapplied
    bool m_testOption = false; // CASTCADE_TEST_OPTIONEVENT=1: one OptionEvent in every watch phase, after its keyframe
    bool m_testOptionFired = false;
+   // CASTCADE_TEST_HOLDKEYS=1: key events put into PinInput's queue (where the device read puts a real key) around every
+   // watch phase. While the table plays one key (F13) is held down; in the first frame after a watch command it is let
+   // go, and another key (F14) is tapped once a frame until the keyframe (30 times at most) and three times after it.
+   // At the return the script must be told one thing of them, the first key's key-up; no F14 event and no F13 key-up may
+   // ever reach it through the queue.
+   static constexpr int TEST_KEY_HELD = 0x64, TEST_KEY_TAP = 0x65; // DIK_F13, DIK_F14: no table, no VPX hotkey uses them
+   bool m_testHoldKeys = false;
+   bool m_testKeyArmed = false;      // when this watch began the script had been told that the held key is down
+   bool m_testKeyUpPushed = false;
+   bool m_testKeyDownPushed = false; // while playing: the held key's key-down is in the queue
+   int m_testTaps = 0, m_testTapsShown = 0;
+   uint64_t m_testKeyDownAt = 0;
+   uint64_t m_testKeysLeaked = 0;
+   void TestPushKey(int code, bool down);
    std::wstring m_testMusic;  // CASTCADE_TEST_MUSIC
    uint64_t m_testMusicAt = 0;
    uint64_t m_ballLogUsec = 0, m_nextBallLog = 0;
@@ -3077,6 +3091,10 @@ MatchSession::MatchSession(Player* const player)
    // Test: CASTCADE_TEST_MUSIC=<file> calls the table's own PlayMusic with that file 5 s into the session, as a line
    // of its script would (the tables that play music on the test PC all need PinUP Player beside them)
    m_testOption = GetEnv("CASTCADE_TEST_OPTIONEVENT") == "1";
+   m_testHoldKeys = GetEnv("CASTCADE_TEST_HOLDKEYS") == "1";
+   m_testKeyDownAt = NowUsec() + 3000000;
+   if (m_testHoldKeys)
+      m_log.Warn("TEST: CASTCADE_TEST_HOLDKEYS=1, key events of F13 and F14 are put into the key queue around every watch phase");
    m_testMusic = GetEnvW(L"CASTCADE_TEST_MUSIC");
    m_testMusicAt = NowUsec() + 5000000;
 
@@ -3124,6 +3142,28 @@ void MatchSession::OnFrame()
    {
       // Player calls a watcher before the frame's script timers: a "play" puts this table back before they run, and
       // Player then calls again after them, as it calls a player
+      if (m_testHoldKeys && m_testKeyArmed && !m_disturbed)
+      {
+         if (!m_testKeyUpPushed)
+         {
+            m_testKeyUpPushed = true;
+            TestPushKey(TEST_KEY_HELD, false);
+         }
+         if (m_testTaps < 30)
+         {
+            ++m_testTaps;
+            TestPushKey(TEST_KEY_TAP, true);
+            TestPushKey(TEST_KEY_TAP, false);
+         }
+      }
+      // From the watch command to the keyframe the table is paused (HoldsPause), and Player reads no keys while it
+      // is: they would wait in the device's buffer and in PinInput's queue (32 events each, more are lost) and be
+      // handed to this table's script by the first ProcessKeys after a watch that ends without a keyframe, as if
+      // pressed in its own turn. So the keys are read here, once a frame, before the control lines that may end the
+      // watch: the same call Player makes once the other table is shown (key events only), and every key goes the
+      // same way, to OnKeyEvent, which keeps it from the script; LeaveWatch tells the script what changed.
+      if (HoldsPause())
+         m_player->m_pininput.ProcessKeys(-(int)msec());
       ServiceControl(now);
       if (!m_watching)
          return;
@@ -3131,6 +3171,13 @@ void MatchSession::OnFrame()
       CheckWatch(now);
       if (!m_watching)
          return;
+      if (m_testHoldKeys && m_testKeyArmed && m_disturbed && m_testTapsShown < 3)
+      {
+         // (after the frame's control lines: Player reads the queue again before this session is next asked)
+         ++m_testTapsShown;
+         TestPushKey(TEST_KEY_TAP, true);
+         TestPushKey(TEST_KEY_TAP, false);
+      }
       if (m_testOption && m_disturbed && !m_testOptionFired)
       {
          m_testOptionFired = true;
@@ -3139,6 +3186,13 @@ void MatchSession::OnFrame()
       }
       m_play.OnFrame(); // this table's own watchers: its state as it was, under a stamp that stands still
       return;
+   }
+   if (m_testHoldKeys && !m_testKeyDownPushed && now >= m_testKeyDownAt)
+   {
+      m_testKeyDownPushed = true;
+      const auto told = m_keysTold.find(TEST_KEY_HELD);
+      if (told == m_keysTold.end() || !told->second)
+         TestPushKey(TEST_KEY_HELD, true);
    }
    if (!m_testMusic.empty() && now >= m_testMusicAt)
    {
@@ -3345,8 +3399,25 @@ bool MatchSession::OnKeyEvent(const int dispid, const int keycode)
       m_keysNow[keycode] = down; // not this player's turn: the script is told at the end, if it still matters
       return true;
    }
+   if (m_testHoldKeys && (keycode == TEST_KEY_TAP || (keycode == TEST_KEY_HELD && !down)))
+   {
+      // the test puts these into the queue only while this table is told to watch
+      ++m_testKeysLeaked;
+      m_log.Error(Fmt("TEST hold keys: key-%s of 0x%02x, put into the key queue while this table watched, reaches the script while it plays (%llu so far)", down ? "down" : "up",
+         keycode, (unsigned long long)m_testKeysLeaked));
+   }
    m_keysTold[keycode] = down;
    return false;
+}
+
+void MatchSession::TestPushKey(const int code, const bool down)
+{
+   // as CastcadeTest.cpp queues a scripted key: the queue GetInputDeviceData fills from the keyboard
+   DIDEVICEOBJECTDATA d = {};
+   d.dwOfs = (DWORD)code;
+   d.dwData = down ? 0x80 : 0;
+   d.dwTimeStamp = msec();
+   m_player->m_pininput.PushQueue(&d, APP_KEYBOARD);
 }
 
 void MatchSession::StartInner(const std::string& host, const uint16_t port)
@@ -3426,6 +3497,12 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    // The music is set aside and the table paused, as VPX pauses one, until the other player's keyframe is here
    m_own = BeginWatchPhase(m_player);
    m_keysNow = m_keysTold;
+   {
+      const auto told = m_keysTold.find(TEST_KEY_HELD);
+      m_testKeyArmed = m_testHoldKeys && told != m_keysTold.end() && told->second;
+      m_testKeyUpPushed = false;
+      m_testTaps = m_testTapsShown = 0;
+   }
    m_watching = true;
    m_disturbed = false;
    m_watchSince = now;
@@ -3847,6 +3924,7 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
    const std::unordered_map<int, bool> now = std::move(m_keysNow);
    m_keysNow.clear();
    size_t keys = 0;
+   std::string testTold;
    for (const auto& kv : now)
    {
       const auto told = m_keysTold.find(kv.first);
@@ -3854,8 +3932,24 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
       {
          ++keys;
          m_keysTold[kv.first] = kv.second;
+         if (kv.first == TEST_KEY_HELD || kv.first == TEST_KEY_TAP)
+            testTold += Fmt("%s%s 0x%02x", testTold.empty() ? "" : ", ", kv.second ? "down" : "up", kv.first);
          m_player->m_ptable->FireKeyEvent(kv.second ? DISPID_GameEvents_KeyDown : DISPID_GameEvents_KeyUp, kv.first);
       }
+   }
+   if (m_testHoldKeys)
+   {
+      const std::string expected = m_testKeyUpPushed ? Fmt("up 0x%02x", TEST_KEY_HELD) : std::string();
+      const std::string line = Fmt("TEST hold keys: watch %llu (%s): the held key was %s when it began; put into the key queue: its key-up %d, taps before the keyframe %d, taps after it %d; "
+                                   "at the return the script was told of them: [%s], expected [%s]: %s; their events that reached the script through the queue so far: %llu",
+         (unsigned long long)m_phases, disturbed ? "shown" : "never shown", m_testKeyArmed ? "down, and the script knew" : "not down for the script (nothing is put in)",
+         m_testKeyUpPushed ? 1 : 0, m_testTaps, m_testTapsShown, testTold.c_str(), expected.c_str(), testTold == expected ? "ok" : "WRONG", (unsigned long long)m_testKeysLeaked);
+      if (testTold == expected)
+         m_log.Info(line);
+      else
+         m_log.Error(line);
+      m_testKeyDownPushed = false;
+      m_testKeyDownAt = NowUsec() + 300000; // held again 0.3 s into the play phase
    }
 
    m_log.Info(Fmt("back to playing (%s) after %.2f s of watch %llu: %s; %zu of %zu properties put back (%zu with this table's own stored value, %zu failed, %zu lost), "

@@ -60,7 +60,11 @@
 //                             A control connection that ends brings the own table back.
 //                             From the watch command until the other player's keyframe the own table is paused as
 //                             VPX pauses one (nothing moves, the clock stands, no event is due); a watch that ends
-//                             before its keyframe was a pause of that length and nothing else.
+//                             before its keyframe was a pause of that length and nothing else. Keys are read all
+//                             the same, every frame from the watch command on, and kept from the script as they are
+//                             while the other table is shown: at the return it hears only what changed (a key that
+//                             was down before and has been let go: its key-up; a key pressed and let go meanwhile:
+//                             nothing; a key that is down now and was not: its key-down).
 //   CASTCADE_STREAM_STATICREFRESH  match: 1 = rebuild the desktop static pre-render after a keyframe and after the
 //                             return, as a plain watcher does after a keyframe (two frames of well over 100 ms).
 //                             Default 0: a match table's pre-render was made after its own script's start, as the
@@ -93,7 +97,9 @@
 // number of properties a stream may put, so that a real stream passes it (state failed overflow);
 // CASTCADE_TEST_MUSIC=<file> calls the table's PlayMusic with that file 5 s into the session;
 // CASTCADE_TEST_OPTIONEVENT=1 fires the tweak menu's "table option changed" event once in every watch phase, after
-// the keyframe.
+// the keyframe; CASTCADE_TEST_HOLDKEYS=1 puts key events of F13 and F14 into the key queue around every watch phase
+// (one held while playing and let go after the watch command, one tapped every frame until the keyframe and three
+// times after it) and logs what the script was told of them.
 //
 // The engine hooks (src/core/player.cpp) each call one of the members below; with no session every hook is a
 // single null test, and the script call hook (CastcadeDispatch.h) a single bool test.

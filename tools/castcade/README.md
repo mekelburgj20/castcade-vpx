@@ -136,6 +136,14 @@ into the ini (VPX then loads every texture to the GPU before the game starts).
 event (`OptionEvent 1`) once in every watch phase, after the keyframe; the run fails unless each was kept from the
 script and fired at the return.
 
+`-HoldKeys` sets `CASTCADE_TEST_HOLDKEYS=1`: each match instance puts key events of its own into VPX's key queue
+(`PinInput::PushQueue`, where the keyboard read puts a real key; nothing is sent to the system): F13 is held while the
+table plays and let go in the first frame after a `watch` command, F14 is tapped once a frame until the keyframe (30
+times at most) and three times after it. After every watch phase the script must have been told the key-up of F13
+and nothing else, and no event of the two may reach it through the queue; that holds for a watch that never showed
+a table too (`-Scenario deadwatch -HoldKeys`: without the key read during the hold all of them reached the script
+after the return, 581 events in 20 dead watches, and the 32-entry queue lost the rest).
+
 `-Sidecar <table>.vbs` (and `-HookLib`, default the owner's `scripts\castcade.vbs`) runs a patched table, as match
 tables are: each instance gets its own copy `cchand-<x> <table>.vpx` in its run folder with the sidecar under the same
 name and the hook library beside it. The hook names its journal after the table id in the sidecar's `Castcade_Init`
