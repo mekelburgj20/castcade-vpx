@@ -81,6 +81,7 @@ enum KindClass : uint8_t
 };
 
 constexpr uint64_t RETRY_USEC = 2000000;
+constexpr uint64_t HOLD_MAX_USEC = 10000000; // match role: how long a watcher's connection is held while this table is not playing
 constexpr uint64_t STATS_USEC = 5000000;
 constexpr uint64_t TIMELINE_MAX_USEC = 2000000;
 constexpr int64_t CATCHUP_MIN_LAG_USEC = 20000; // a hold shorter than this resumes by jumping, as it always did
@@ -584,6 +585,8 @@ struct Peer
    bool wasConnected = false;
    bool helloOk = false; // the other end's HELLO was checked and accepted
    bool closing = false; // dropped by us (protocol error, mismatch, BYE)
+   bool held = false;    // play part of a match session: accepted while not playing, our HELLO not sent yet
+   uint64_t heldSince = 0;
    uint64_t sentCounted = 0;
    uint64_t recvCounted = 0;
 };
@@ -1813,11 +1816,22 @@ void SessionImpl::PlayFrame(const uint64_t now)
          Peer p;
          p.addr = t->RemoteAddress();
          p.tcp = std::move(t);
-         m_log.Info("connection from " + p.addr);
-         SendHello(p);
+         if (m_frozen)
+         {
+            // Match role, the hand-over: the watcher of this table's next turn arrives while this table still shows
+            // the other player's. Accepted and held: no HELLO, no keyframe, until this table plays again.
+            p.held = true;
+            p.heldSince = now;
+            m_log.Info("connection from " + p.addr + " held: this table is not playing yet");
+         }
+         else
+         {
+            m_log.Info("connection from " + p.addr);
+            SendHello(p);
+         }
          m_peers.push_back(std::move(p));
       }
-   if (m_configOk && m_wsa && !m_listen && now >= m_nextRetry
+   if (m_configOk && m_wsa && !m_listen && !m_frozen && now >= m_nextRetry
       && std::none_of(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.outgoing; }))
    {
       m_nextRetry = now + RETRY_USEC;
@@ -1840,7 +1854,30 @@ void SessionImpl::PlayFrame(const uint64_t now)
    }
 
    for (Peer& p : m_peers)
+   {
+      if (m_frozen && !p.helloOk)
+      {
+         // Not playing: a watcher that has not been given its keyframe yet gets none now (its HELLO, if it has sent
+         // one, stays unread). Held for 10 s at most.
+         if (p.heldSince == 0)
+            p.heldSince = now;
+         else if (now - p.heldSince >= HOLD_MAX_USEC)
+         {
+            m_log.Info(Fmt("connection from %s closed: held 10 s and this table is still not playing", p.addr.c_str()));
+            p.tcp->Close();
+            p.closing = true;
+         }
+         continue;
+      }
+      if (p.held)
+      {
+         p.held = false;
+         m_log.Info(Fmt("connection from %s served after %.0f ms on hold", p.addr.c_str(), (double)(now - p.heldSince) / 1000.));
+         SendHello(p);
+      }
+      p.heldSince = 0;
       PlayService(p);
+   }
    m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(), [](const Peer& p) { return p.closing; }), m_peers.end());
 
    // The recording gets what a watcher connected now would: a HELLO and a keyframe, then this frame and the next
@@ -2776,17 +2813,21 @@ void SessionImpl::LogStats(const uint64_t now)
 //   UnPaused event fires, and "state playing" goes out.
 //
 // Every way out of a watch phase is LeaveWatch: the "play" command, a refused stream, no stream within 4 s of a
-// "watch", a stream that stopped for 10 s, the player closing its table, a lost control connection, an unknown
-// command, this table closing.
+// "watch", a stream that was shown and then delivers no frame for 3 s (open: "stalled"; closed: "lost"), the player
+// closing its table, a lost control connection, an unknown command, this table closing.
 //
-// What the companion counts on (castcade repo, docs/design/state-stream-in-match.md and its control client): hello
-// and "state playing" are sent as soon as the connection exists, before anything is read; every "watch", a re-aim
-// included, is answered within 5 s by "state watching" or "state failed <reason>"; after a "state failed" this table
-// is back by itself and says "state playing"; a "play" while playing is answered "state playing"; a "watch" right
-// behind a "play" works; each token of a line is printable ASCII without spaces.
+// What the companion counts on (castcade repo, docs/design/state-stream-in-match.md §3, rules 1 to 12): hello and
+// "state playing" are sent as soon as the connection exists, before anything is read; hello's last field is the port
+// this table's stream listener is bound to; every "watch", a re-aim included, is answered within 5 s by "state
+// watching" or "state failed <reason>"; a "watch" while watching always drops the stream and connects again, even
+// to the same address, and no "state playing" is sent between the two; after a "state failed" this table is back by
+// itself and says "state playing"; a "play" while playing is answered "state playing"; a "watch" right behind a
+// "play" works; each token of a line is printable ASCII without spaces. And the hand-over: a watcher that
+// connects to this table's stream while this table is not playing is accepted and held, with nothing sent, until it
+// plays (10 s at most): the play part does that (SessionImpl::PlayFrame, m_frozen).
 
 constexpr uint64_t WATCH_FIRST_USEC = 4000000; // from a "watch" to its keyframe: the companion waits 5 s for the answer
-constexpr uint64_t WATCH_LOST_USEC = 10000000; // a stream that was shown and stopped: its 2 s retries get this long
+constexpr uint64_t WATCH_STALL_USEC = 3000000; // a stream that was shown: without a frame, or without a connection, this long
 
 // One token of a control line: printable ASCII, no space, at most 128 characters
 std::string Token(const std::string& s)
@@ -2953,6 +2994,7 @@ private:
    int m_upFrames = 0;
    std::string m_watchAddr;
    uint64_t m_watchSince = 0;
+   uint64_t m_watchAsked = 0; // the last "watch" command
    uint64_t m_noStreamSince = 0;
    uint64_t m_phases = 0;
    std::shared_ptr<const OwnPhysics> m_ownPhysics;
@@ -3098,8 +3140,11 @@ void MatchSession::ServiceControl(const uint64_t now)
    {
       m_ctlUp = true;
       m_log.Info(Fmt("control: connected to %s:%u", m_ctlHost.c_str(), m_ctlPort));
-      // hello <protocol> <build> <editables> <table hash>: the table identity is the stream's own (BuildHello)
-      Send(Fmt("hello 1 %s %u %016llx", Token(VP_VERSION_STRING_POINTS_FULL).c_str(), m_play.m_editCount, (unsigned long long)m_play.m_hash));
+      // hello <protocol> <build> <editables> <table hash> <stream port>: the table identity is the stream's own
+      // (BuildHello); the port is the one this table's stream listener is bound to (0: it has none), which is what
+      // the companion offers the other players
+      Send(Fmt("hello 1 %s %u %016llx %u", Token(VP_VERSION_STRING_POINTS_FULL).c_str(), m_play.m_editCount, (unsigned long long)m_play.m_hash,
+         m_play.m_listener ? (unsigned)m_play.m_listener->Port() : 0u));
       Send("state playing"); // true whenever a control connection begins: without one this table plays
    }
    // A line may end the connection's use (LeaveWatch sends on it), never the connection itself
@@ -3193,17 +3238,14 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    const std::string addr = host + ":" + std::to_string(port);
    if (m_watching)
    {
-      if (addr == m_watchAddr && m_watch && !m_watch->m_refused)
-      {
-         m_log.Info("already watching " + addr);
-         if (m_saidWatching)
-            Send("state watching");
-         return;
-      }
-      // The next player is up: the same watch phase, another stream. Its keyframe starts from the file state again.
+      // The next player is up: the same watch phase, another stream, whose keyframe starts from the file state
+      // again. The address may be the one before (the companion's tunnel has one listener for every player and
+      // re-aims behind it): the connection is dropped and made again all the same, and the new stream is announced
+      // with a "state watching" of its own. No "state playing" in between: this table stays away.
       m_log.Info("re-aiming the watch from " + m_watchAddr + " to " + addr);
       m_watch.reset();
       m_watchAddr = addr;
+      m_watchAsked = now;
       m_noStreamSince = now;
       StartInner(host, port);
       return;
@@ -3227,6 +3269,7 @@ void MatchSession::EnterWatch(const std::string& host, const uint16_t port, cons
    m_watching = true;
    m_disturbed = false;
    m_watchSince = now;
+   m_watchAsked = now;
    m_noStreamSince = now;
    m_watchAddr = addr;
    ++m_phases;
@@ -3258,13 +3301,25 @@ void MatchSession::CheckWatch(const uint64_t now)
          m_saidWatching = true;
          Send("state watching");
       }
+      // A stream that is open and silent: a player that plays, pauses or watches itself sends a frame with every
+      // frame it draws, so 3 s without one is a stream that hangs somewhere on the way. Better the companion's 2D
+      // picture than a table that stands still.
+      // (the watch session stamps an arrival with its own, later, reading of the clock: never subtract the other way)
+      if (w.m_lastAnyArrival && now > w.m_lastAnyArrival && now - w.m_lastAnyArrival >= WATCH_STALL_USEC)
+         LeaveWatch("the stream delivered no frame for 3 s", "stalled");
       return;
    }
    m_upFrames = 0;
    if (m_noStreamSince == 0)
       m_noStreamSince = now;
-   else if (now - m_noStreamSince >= (m_saidWatching ? WATCH_LOST_USEC : WATCH_FIRST_USEC))
-      LeaveWatch(m_saidWatching ? "the stream stopped for 10 s" : "no stream within 4 s of the watch command", m_saidWatching ? "lost" : "timeout");
+   if (!m_saidWatching)
+   {
+      // Not shown yet (never connected, not answered, held by a table that is not playing, no keyframe)
+      if (now - m_watchAsked >= WATCH_FIRST_USEC)
+         LeaveWatch("no stream within 4 s of the watch command", "timeout");
+   }
+   else if (now - m_noStreamSince >= WATCH_STALL_USEC)
+      LeaveWatch("the stream ended and did not come back within 3 s", "lost");
 }
 
 IDispatch* MatchSession::ResolveOwn(const uint32_t id) const

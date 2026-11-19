@@ -52,20 +52,31 @@ through.
 
 `-Scenario`:
 
-- `swap` (default): instances A and B both play their own scripted game; `-Swaps` times, alternately, one of them is
-  told to watch the other for `-WatchSeconds` and is then called back, with `-PlaySeconds` of play in between. Around
-  every watch phase the watcher's window is captured: twice 120 ms apart before it (the difference of those two is the
-  noise of a running game), in the middle of it (the watched player's window first, the watcher's 70 ms later, which
-  is the delay it shows the stream with), and right after `state playing`.
-- `contract`: what the companion's control client counts on: the first two lines of a connection (`hello`, `state
-  playing`, before anything is sent), the tokens of `hello` and one identity for one table file, a `play` while
-  playing, a `watch` of a port where nothing listens (`state failed timeout` within 5 s, then `state playing` by
-  itself), a `watch` right after `state playing`, `play` and `watch` in one write, the same `watch` twice, an unknown
-  command, a `watch` without an address, and the watched player closing its table (`state failed closed`).
+- `swap` (default): a match as the companion runs it. After `-WarmupSeconds` in which both instances start their
+  scripted game, A is up and B watches it; then, `-Swaps` times, the watcher is called back (`play`) while the player
+  is sent to watch it (`watch`), a turn lasting `-WatchSeconds`. The two commands leave the companion at the same
+  moment, so the test sends them in three orders by turns: the `watch` first and the `play` 150 ms later (the new
+  watcher then reaches a table that is still watching: its connection must be held and served once that table
+  plays), the `play` first and the `watch` 150 ms later, and both at once. Each game moves on only in its own turns.
+  Pictures: the table that is sent to watch, twice 120 ms apart just before (the difference of those two is the noise
+  of a running game; the second is kept); the table that is called back, right after its `state playing`, compared
+  with the picture kept from before its watch; and in the middle of the turn the player's window, then the watcher's
+  70 ms later (the delay it shows the stream with).
+- `visit`: the first form of the test: both instances play, and `-Swaps` times, alternately, one of them is told to
+  watch the other for `-WatchSeconds` and is called back, with `-PlaySeconds` of play in between.
+- `contract`: what the companion's control client counts on (the rules of §3 of `docs/design/state-stream-in-match.md`
+  in the castcade repo): the first two lines of a connection (`hello`, `state playing`, before anything is sent), the
+  five tokens of `hello`, its stream port, and one identity for one table file; a `play` while playing; a `watch` of a
+  port where nothing listens (`state failed timeout` within 5 s, then `state playing` by itself); a `watch` right
+  after `state playing`; `play` and `watch` in one write; the same `watch` again (a re-aim to the same address: a new
+  `state watching`, no `state playing` in between); a raw connection to the stream port of an instance that is
+  watching (not a byte until it plays, then its HELLO; and closed, still silent, after 10 s if it does not); an unknown
+  command; a `watch` without an address; and the watched player closing its table (`state failed closed`).
 - `nolistener`: one instance, told to watch a port where nothing listens. `streamlost`: B watches A and A is killed
-  (the script's own PID): `state failed lost` after 10 s. `controllost`: B watches A, the script cuts B's control
-  connection; B must be back on its own table by itself and connect again. `mismatch`: B loads `-OtherTable` and is
-  told to watch A: `state failed refused`, its table never touched.
+  (the script's own PID): `state failed lost` after 3 s. `stalled`: B watches A and A is suspended (its sockets stay
+  open and deliver nothing): `state failed stalled` after 3 s; A is resumed and watched again. `controllost`: B
+  watches A, the script cuts B's control connection; B must be back on its own table by itself and connect again.
+  `mismatch`: B loads `-OtherTable` and is told to watch A: `state failed refused`, its table never touched.
 - `reaim`: a third instance C watches A, is re-aimed at B with a second `watch` (which must be answered by a second
   `state watching`), then called back. `plainwatch`: W, in the plain watch role, watches A the whole time while A and B
   swap: the match role's stream is the play role's, and stands still while A watches.

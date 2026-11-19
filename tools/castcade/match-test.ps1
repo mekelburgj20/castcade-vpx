@@ -16,7 +16,7 @@ param(
     # contract: what the companion's control client counts on (order of the first lines, the tokens of hello, every
     #   watch answered within 5 s, play while playing, play and watch in one go, the same watch twice, an unknown command,
     #   the watched player closing its table).                      streamlost: B watches A and A is killed (this script's own PID).
-    [ValidateSet('swap', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost')][string]$Scenario = 'swap',
+    [ValidateSet('swap', 'visit', 'nolistener', 'controllost', 'mismatch', 'reaim', 'plainwatch', 'contract', 'streamlost', 'stalled')][string]$Scenario = 'swap',
     [string]$OtherTable,
     [string]$Exe = 'C:\code\repos\castcade-vpx-wt-handoff\build\Release\VPinballX_GL64.exe',
     # The instances run from a copy of the exe under this name, beside it: the installed Castcade companion takes any
@@ -80,6 +80,8 @@ public static class MatchWin {
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr process);
+    [DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr process);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     public class Win { public IntPtr H; public string Title; public string Cls; public bool Visible;
         public override string ToString() { return string.Format("0x{0:X} cls='{1}' title='{2}' visible={3}", H.ToInt64(), Cls, Title, Visible); } }
@@ -130,7 +132,7 @@ if (-not (Test-Path -LiteralPath $RunExe) -or (Get-FileHash -LiteralPath $RunExe
 
 # instances of this scenario: name, role, table
 $Names = @(switch ($Scenario) {
-    'swap' { 'a', 'b' } 'nolistener' { 'a' } 'controllost' { 'a', 'b' } 'mismatch' { 'a', 'b' } 'reaim' { 'a', 'b', 'c' } 'plainwatch' { 'a', 'b', 'w' }
+    'swap' { 'a', 'b' } 'visit' { 'a', 'b' } 'stalled' { 'a', 'b' } 'nolistener' { 'a' } 'controllost' { 'a', 'b' } 'mismatch' { 'a', 'b' } 'reaim' { 'a', 'b', 'c' } 'plainwatch' { 'a', 'b', 'w' }
     'contract' { 'a', 'b' } 'streamlost' { 'a', 'b' }
 })
 $I = [ordered]@{}
@@ -493,7 +495,8 @@ try {
     foreach ($n in $Names) {
         $x = $I[$n]; if ($x.Role -ne 'match') { continue }
         if (-not (Wait-Line $x '^state playing$' 20 0)) { throw "$n never said 'state playing' on its control connection" }
-        if ($x.Hello -notmatch '^hello 1 \S+ \d+ [0-9a-f]{16}$') { throw "${n}: unexpected hello line '$($x.Hello)'" }
+        # hello 1 <build> <editables> <table hash> <stream port>: the port must be the one its stream listener is bound to
+        if ($x.Hello -notmatch '^hello 1 \S+ \d+ [0-9a-f]{16} (\d+)$' -or [int]$Matches[1] -ne $x.Stream) { throw "${n}: unexpected hello line '$($x.Hello)' (the stream port is $($x.Stream))" }
         Log "${n}: $($x.Hello)"
     }
     Log "all instances up; warming up $WarmupSeconds s"
@@ -501,6 +504,56 @@ try {
 
     switch ($Scenario) {
         'swap' {
+            # A match as the companion runs it: one table is up, the other watches it, and at each grant the watcher is
+            # called back while the player is sent to watch it. The two commands go out at the same moment in a match, so
+            # here in the three orders by turns: 1 = the watch first and the play 150 ms later (the new watcher reaches a
+            # table that is still watching: it must be held, not refused, and get a keyframe of the restored table),
+            # 2 = the play first and the watch 150 ms later, 0 = both at once.
+            $up = $I.a; $wt = $I.b; $kept = @{}
+            $y0 = Shot $wt 'before0'; Pump 0.12; $y1 = Shot $wt 'before'
+            $x = Ask $wt "watch 127.0.0.1:$($up.Stream)" '^state (watching|failed .*)$' 8
+            if (-not $x -or $x.line -ne 'state watching') { throw "the first watch ($($wt.Name) of $($up.Name)) was answered '$($x.line)'" }
+            Drop @($y0); $kept[$wt.Name] = $y1
+            Pump $WatchSeconds
+            for ($s = 1; $s -le $Swaps; $s++) {
+                $X = $wt; $Y = $up; $mode = $s % 3   # X is called back, Y is sent to watch X
+                $row = [ordered]@{ swap = $s; watcher = $Y.Name; player = $X.Name; order = @('both at once', 'watch first', 'play first')[$mode]; result = ''; watching_ms = $null; playing_ms = $null;
+                    noise = $null; before_after = $null; before_mid = $null; mid_vs_player = $null; t_watch = $null; t_play = $null }
+                $y0 = Shot $Y 'before0'; Pump 0.12; $y1 = Shot $Y 'before'
+                $fromX = $X.Lines.Count; $fromY = $Y.Lines.Count
+                $row.t_watch = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'); $row.t_play = $row.t_watch
+                $watchCmd = "watch 127.0.0.1:$($X.Stream)"
+                if ($mode -eq 1) { $tw = $SW.Elapsed.TotalSeconds; Send-Control $Y $watchCmd; Pump 0.15; $tp = $SW.Elapsed.TotalSeconds; Send-Control $X 'play' }
+                elseif ($mode -eq 2) { $tp = $SW.Elapsed.TotalSeconds; Send-Control $X 'play'; Pump 0.15; $tw = $SW.Elapsed.TotalSeconds; Send-Control $Y $watchCmd }
+                else { $tp = $SW.Elapsed.TotalSeconds; $tw = $tp; Send-Control $Y $watchCmd; Send-Control $X 'play' }
+                $px = Wait-Line $X '^state (playing|failed .*)$' 5 $fromX
+                $xa = Shot $X 'after'
+                $wy = Wait-Line $Y '^state (watching|failed .*|playing)$' 8 $fromY
+                if ($px) { $row.playing_ms = [math]::Round(($px.t - $tp) * 1000) }
+                if ($wy) { $row.watching_ms = [math]::Round(($wy.t - $tw) * 1000) }
+                $row.result = if (-not $px -or $px.line -ne 'state playing') { "$($X.Name) called back: $(if ($px) { $px.line } else { 'no answer' })" }
+                              elseif (-not $wy -or $wy.line -ne 'state watching') { "$($Y.Name) sent to watch: $(if ($wy) { $wy.line } else { 'no answer' })" } else { 'ok' }
+                $mid = $null; $midP = $null
+                if ($row.result -eq 'ok') { Pump ($WatchSeconds / 2); $midP = Shot $X 'mid-player'; Pump (($DelayMs + 20) / 1000.0); $mid = Shot $Y 'mid'; Pump ($WatchSeconds / 2) }
+                $row.noise = D $y0 $y1; $row.before_after = D $kept[$X.Name] $xa; $row.before_mid = D $y1 $mid; $row.mid_vs_player = D $mid $midP
+                $r = [pscustomobject]$row; $rows.Add($r)
+                if ($r.result -ne 'ok') { Log ("swap {0} ({1}): {2}" -f $s, $r.order, $r.result) }
+                elseif ($s % 5 -eq 0 -or $s -le 3) { Log ("swap {0} ({1}): {2} playing after {3} ms, {4} watching it after {5} ms; {2}'s picture before its watch / after it {6} (noise {7}); {4} before/mid {8}, mid/player {9}" -f $s, $r.order, $X.Name, $r.playing_ms, $Y.Name, $r.watching_ms, $r.before_after, $r.noise, $r.before_mid, $r.mid_vs_player) }
+                if (($r.result -ne 'ok') -or ($r.before_after -gt $MaxPictureDiff) -or ($s % $SaveEvery) -eq 0 -or $s -le 3) {
+                    $kept[$X.Name].Tag = 'before'; Keep @($kept[$X.Name], $xa) ("s{0:000}-{1}" -f $s, $X.Name); Keep @($midP, $mid) ("s{0:000}-{1}" -f $s, $Y.Name) }
+                Drop @($y0, $mid, $midP, $xa, $kept[$X.Name]); $kept.Remove($X.Name); $kept[$Y.Name] = $y1
+                if ($r.result -ne 'ok') {
+                    # put the pair back into a known state: X plays, Y watches it
+                    [void](Ask $X 'play' '^state playing$' 3); $z = Ask $Y $watchCmd '^state (watching|failed .*)$' 8
+                    if (-not $z -or $z.line -ne 'state watching') { throw "could not get back to one playing and one watching after swap $s" }
+                    Pump $WatchSeconds
+                }
+                $up = $X; $wt = $Y
+            }
+            $z = Ask $wt 'play' '^state playing$' 3
+            if (-not $z) { $notes.Add("$($wt.Name) did not answer the last play") }
+        }
+        'visit' {
             for ($s = 1; $s -le $Swaps; $s++) {
                 $w = if ($s % 2) { $I.b } else { $I.a }; $p = if ($s % 2) { $I.a } else { $I.b }
                 $r = Watch-Phase $w $p.Stream $p $s 'play'
@@ -546,8 +599,10 @@ try {
                 $b0 = Shot $c 'before'
                 $g1 = Ask $c "watch 127.0.0.1:$($I.a.Stream)" '^state (watching|failed .*)$' 8
                 Pump ($WatchSeconds / 2); $m1 = Shot $c 'mid-a'; $pa = Shot $I.a 'mid-player-a'; Pump ($WatchSeconds / 2)
+                $fromRe = $c.Lines.Count
                 $g2 = Ask $c "watch 127.0.0.1:$($I.b.Stream)" '^state (watching|failed .*)$' 8   # the re-aim must be announced again
                 Pump ($WatchSeconds / 2); $m2 = Shot $c 'mid-b'; $pb = Shot $I.b 'mid-player-b'; Pump ($WatchSeconds / 2)
+                if (@($c.Lines | Select-Object -Skip $fromRe | Where-Object { $_.line -eq 'state playing' }).Count) { $notes.Add("re-aim ${s}: c said 'state playing' between the two players") }
                 $g3 = Ask $c 'play' '^state playing$' 5
                 $a1 = Shot $c 'after'
                 $ok = $g1 -and $g1.line -eq 'state watching' -and $g2 -and $g2.line -eq 'state watching' -and $g3
@@ -568,7 +623,7 @@ try {
             foreach ($n in $Names) {
                 $x = $I[$n]
                 if ($x.Lines.Count -lt 2 -or $x.Lines[0].line -notlike 'hello *' -or $x.Lines[1].line -ne 'state playing') { $notes.Add("contract: ${n}'s first lines are not hello, state playing") }
-                if ($x.Hello -cnotmatch '^hello 1 [\x21-\x7E]{1,128} [\x21-\x7E]{1,128} [\x21-\x7E]{1,128}$') { $notes.Add("contract: ${n}'s hello has a token that is not 1 to 128 printable ASCII characters: '$($x.Hello)'") }
+                if ($x.Hello -cnotmatch '^hello 1 [\x21-\x7E]{1,128} [\x21-\x7E]{1,128} [\x21-\x7E]{1,128} [\x21-\x7E]{1,128}$') { $notes.Add("contract: ${n}'s hello has a token that is not 1 to 128 printable ASCII characters: '$($x.Hello)'") }
             }
             if ((($I.a.Hello -split ' ')[3, 4] -join ' ') -cne (($I.b.Hello -split ' ')[3, 4] -join ' ')) { $notes.Add("contract: a and b report different identities for the same table file: '$($I.a.Hello)' / '$($I.b.Hello)'") }
             Log "contract: first lines and hello tokens checked; identity '$((($I.a.Hello -split ' ')[3, 4]) -join ' ')' on both"
@@ -594,8 +649,36 @@ try {
             & $say 'play and watch in one write: the play' $(if ($p1) { [pscustomobject]@{ line = $p1.line; ms = [math]::Round(($p1.t - $t0) * 1000) } }) '^state playing$' 2000
             & $say 'play and watch in one write: the watch' $(if ($w1) { [pscustomobject]@{ line = $w1.line; ms = [math]::Round(($w1.t - $t0) * 1000) } }) '^state watching$' 5000
             Pump 1.5
-            # 2: the same watch again is answered again
-            & $say 'the same watch again' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
+            # 2 and 11: the same watch again is a re-aim: the stream is dropped and connected again (the fork's log says so),
+            # a fresh state watching answers it, and no state playing comes in between
+            $from = $b.Lines.Count
+            & $say 'the same watch again (a re-aim to the same address)' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
+            if (@($b.Lines | Select-Object -Skip $from | Where-Object { $_.line -eq 'state playing' }).Count) { $notes.Add('contract: a re-aim to the same address was answered with a state playing in between') }
+            Pump 1
+            # 10: a watcher that reaches b's stream while b is watching is accepted and held: not a byte until b plays, then b's HELLO
+            $raw = [Net.Sockets.TcpClient]::new(); $raw.Connect('127.0.0.1', $b.Stream)
+            Pump 1.5
+            $early = $raw.Available
+            $ans = Ask $b 'play' '^state playing$' 3
+            $tPlay = $SW.Elapsed.TotalSeconds; while ($raw.Available -eq 0 -and ($SW.Elapsed.TotalSeconds - $tPlay) -lt 2) { Pump 0.01 }
+            $late = $raw.Available; $raw.Close()
+            Log "contract: a connection to b's stream while b watches: $early bytes in 1.5 s; after b's 'state playing': $late bytes within $([math]::Round(($SW.Elapsed.TotalSeconds - $tPlay) * 1000)) ms"
+            if ($early -ne 0) { $notes.Add("contract: b sent $early bytes to a watcher while it was watching (it must hold the connection silent)") }
+            if (-not $ans -or $late -le 0) { $notes.Add('contract: a held watcher was not served after b came back to playing') }
+            # 10: held 10 s at most, then closed, still without a byte
+            & $say 'watch a' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
+            $raw = [Net.Sockets.TcpClient]::new(); $raw.Connect('127.0.0.1', $b.Stream); $t0 = $SW.Elapsed.TotalSeconds; $closedAt = $null; $bytes = 0
+            while (($SW.Elapsed.TotalSeconds - $t0) -lt 13) {
+                Pump 0.05
+                if ($raw.Available -gt 0) { $bytes = $raw.Available; break }
+                if ($raw.Client.Poll(0, [Net.Sockets.SelectMode]::SelectRead) -and $raw.Available -eq 0) { $closedAt = $SW.Elapsed.TotalSeconds - $t0; break }
+            }
+            $raw.Close()
+            Log "contract: a connection held while b keeps watching: $bytes bytes received, closed by b after $(if ($null -ne $closedAt) { [math]::Round($closedAt, 1) } else { 'more than 13' }) s"
+            if ($bytes -ne 0 -or $null -eq $closedAt -or $closedAt -lt 9.5 -or $closedAt -gt 11.5) { $notes.Add('contract: a held connection was not closed, silent, after about 10 s') }
+            & $say 'play' (Ask $b 'play' '^state ' 3) '^state playing$' 2000
+            # back to watching for what follows
+            & $say 'watch a' (Ask $b "watch $aAddr" '^state ' 8) '^state watching$' 5000
             Pump 1
             # an unknown command brings the own table back
             & $say 'an unknown command while watching' (Ask $b 'dance' '^state ' 3) '^state playing$' 2000
@@ -625,13 +708,38 @@ try {
             $from = $b.Lines.Count; $t0 = $SW.Elapsed.TotalSeconds
             Log "killing a (PID $($I.a.Pid), started by this script): the stream ends without a goodbye"
             $I.a.Gone = $true; Stop-Process -Id $I.a.Pid -Force
-            $f1 = Wait-Line $b '^state failed .*$' 16 $from
+            $f1 = Wait-Line $b '^state failed .*$' 8 $from
             $p2 = if ($f1) { Wait-Line $b '^state playing$' 2 ($b.Lines.IndexOf($f1) + 1) }
-            Log ("stream lost: {0}; then {1}" -f $(if ($f1) { "'$($f1.line)' after $([math]::Round(($f1.t - $t0) * 1000)) ms" } else { 'no state failed within 16 s' }), $(if ($p2) { "'state playing' $([math]::Round(($p2.t - $f1.t) * 1000)) ms later" } else { 'NO state playing' }))
+            Log ("stream lost: {0}; then {1}" -f $(if ($f1) { "'$($f1.line)' after $([math]::Round(($f1.t - $t0) * 1000)) ms" } else { 'no state failed within 8 s' }), $(if ($p2) { "'state playing' $([math]::Round(($p2.t - $f1.t) * 1000)) ms later" } else { 'NO state playing' }))
             if (-not $f1 -or $f1.line -ne 'state failed lost') { $notes.Add("stream lost: expected 'state failed lost', got '$($f1.line)'") }
+            elseif (($f1.t - $t0) -lt 2.5 -or ($f1.t - $t0) -gt 4.5) { $notes.Add("stream lost: the failure came after $([math]::Round(($f1.t - $t0) * 1000)) ms, expected about 3000") }
             if (-not $p2) { $notes.Add('stream lost: no "state playing" after the failure') }
             Pump 3
             & { $y = Ask $b 'play' '^state ' 3; if (-not $y -or $y.line -ne 'state playing') { $notes.Add('stream lost: no answer to a play afterwards') } }
+        }
+        'stalled' {
+            # A stream that stays open and delivers nothing: A is suspended (every thread stopped, its sockets stay open)
+            $b = $I.b
+            $x = Ask $b "watch 127.0.0.1:$($I.a.Stream)" '^state ' 8
+            Log "stalled: watching: $(if ($x) { "'$($x.line)' after $($x.ms) ms" } else { 'no answer' })"
+            Pump 2
+            $from = $b.Lines.Count; $t0 = $SW.Elapsed.TotalSeconds
+            Log "suspending a (PID $($I.a.Pid), started by this script)"
+            [void][MatchWin]::NtSuspendProcess($I.a.Proc.Handle)
+            try {
+                $f1 = Wait-Line $b '^state failed .*$' 8 $from
+                $p2 = if ($f1) { Wait-Line $b '^state playing$' 2 ($b.Lines.IndexOf($f1) + 1) }
+            } finally { [void][MatchWin]::NtResumeProcess($I.a.Proc.Handle); Log 'a resumed' }
+            Log ("stalled: {0}; then {1}" -f $(if ($f1) { "'$($f1.line)' after $([math]::Round(($f1.t - $t0) * 1000)) ms" } else { 'no state failed within 8 s' }), $(if ($p2) { "'state playing' $([math]::Round(($p2.t - $f1.t) * 1000)) ms later" } else { 'NO state playing' }))
+            if (-not $f1 -or $f1.line -ne 'state failed stalled') { $notes.Add("stalled: expected 'state failed stalled', got '$($f1.line)'") }
+            elseif (($f1.t - $t0) -lt 2.5 -or ($f1.t - $t0) -gt 4.5) { $notes.Add("stalled: the failure came after $([math]::Round(($f1.t - $t0) * 1000)) ms, expected about 3000") }
+            if (-not $p2) { $notes.Add('stalled: no "state playing" after the failure') }
+            Pump 3
+            # A runs again: a new watch works
+            $r = Watch-Phase $b $I.a.Stream $I.a 2 'play'
+            $rows.Add($r); Log "after the stall: a new watch of a: $($r.result)"
+            if ($r.result -ne 'ok') { $notes.Add("stalled: the watch after the stall: $($r.result)") }
+            Pump 1
         }
         'plainwatch' {
             # W, a plain watch build, watches A the whole time. A and B swap; while A watches B, W must see A's own table, standing still.
@@ -801,7 +909,7 @@ if ($overPic.Count) { $problems.Add("$($overPic.Count) watch phases left a pictu
 # Over a run of swaps the picture after a watch must be as near the one before it as two pictures of the running game
 # 120 ms apart are: a table left with the other player's lamps passes the limit above on most swaps, not this one
 function Median($vals) { $v = @($vals | Where-Object { $null -ne $_ -and -not [double]::IsNaN([double]$_) } | ForEach-Object { [double]$_ } | Sort-Object); if ($v.Count) { $v[[int][math]::Floor(($v.Count - 1) * 0.5)] } else { [double]::NaN } }
-if ($Scenario -eq 'swap' -and $rows.Count -ge 6) {
+if (($Scenario -in 'swap', 'visit') -and $rows.Count -ge 6) {
     $mBA = Median ($rows | ForEach-Object before_after); $mN = Median ($rows | ForEach-Object noise); $lim = [math]::Round(1.25 * $mN + 0.1, 3)
     Log ("  median before/after {0} against 1.25 x the median noise + 0.1 = {1}" -f $mBA, $lim)
     if ($mBA -gt $lim) { $problems.Add("the pictures after the watch phases differ from those before them by a median of $mBA, more than the game's own noise allows ($lim)") }
@@ -811,7 +919,7 @@ if ($slow.Count) { $problems.Add("$($slow.Count) watch commands were answered af
 $slowPlay = @($rows | Where-Object { $null -ne $_.playing_ms -and [double]$_.playing_ms -ge 2000 -and $Scenario -ne 'controllost' })
 if ($slowPlay.Count) { $problems.Add("$($slowPlay.Count) play commands were answered after 2 s or more (the companion waits 2 s)") }
 switch ($Scenario) {
-    'swap' { if ($okRows.Count -ne $Swaps) { $problems.Add("$($okRows.Count) of $Swaps swaps completed") } }
+    { $_ -in 'swap', 'visit' } { if ($okRows.Count -ne $Swaps) { $problems.Add("$($okRows.Count) of $Swaps swaps completed") } }
     'controllost' { if ($okRows.Count -ne 2) { $problems.Add('the cut or the watch after it did not end in "state playing"') }; if (-not $Ana.b.reasons.ContainsKey('the control connection is lost')) { $problems.Add('b did not log a return for a lost control connection') } }
     'mismatch' { if ($Ana.b.never_touched -ne 1) { $problems.Add('b''s table was touched by a refused stream') } }
     'nolistener' { if ($Ana.a.never_touched -lt 1) { $problems.Add('a''s table was touched although nothing answered') } }

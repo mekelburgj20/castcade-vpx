@@ -16,13 +16,17 @@
 //                             given (the watch variables apply: delay, sound, smoothing), its own game is paused as
 //                             VPX pauses a game (the table's Paused and UnPaused events fire, so a ROM table pauses
 //                             VPinMAME; no physics, no timers, no key reaches the script) while frames go on being
-//                             drawn, and its own watchers see its table stand still. It shows no notifications.
+//                             drawn, and its own watchers see its table stand still. A watcher that connects to it
+//                             while it is not playing is accepted and held, with nothing sent, until it plays again
+//                             (10 s at most, then closed). It shows no notifications.
 //   CASTCADE_STREAM_CONTROL   match: connect:127.0.0.1:<port> (this PC only), retried every 2 s. Text lines, UTF-8,
 //                             each ended by \n. Without a connection the table plays.
 //                               this VPX sends:
-//                                 hello 1 <build> <editables> <table hash>   once per connection; 1 is this protocol's
-//                                                           version; build has no spaces; editables is decimal, the
-//                                                           hash 16 hex digits: the identity the stream's HELLO checks
+//                                 hello 1 <build> <editables> <table hash> <stream port>   once per connection; 1 is
+//                                                           this protocol's version; build has no spaces; editables
+//                                                           is decimal, the hash 16 hex digits: the identity the
+//                                                           stream's HELLO checks; the port is the one this table's
+//                                                           stream listener is bound to (0: it has none)
 //                                 state playing             own table shown and live; also right after hello, and the
 //                                                           answer to every command that leaves it playing
 //                                 state watching            the other player's table is on screen (its keyframe was
@@ -30,13 +34,16 @@
 //                                 state failed <reason>     a watch did not work or ended by itself; this VPX is back
 //                                                           on its own table without being told, and state playing
 //                                                           follows. Reasons: refused (another table file), timeout
-//                                                           (no stream within 4 s of the command), lost (a stream
-//                                                           that was shown stopped for 10 s), closed (the watched
-//                                                           player closed its table), badaddress
+//                                                           (no stream within 4 s of the command), stalled (a stream
+//                                                           that was shown delivered no frame for 3 s), lost (it
+//                                                           ended and did not come back within 3 s), closed (the
+//                                                           watched player closed its table), badaddress
 //                               this VPX reads:
-//                                 watch <host>:<port>       watch the stream at that address (it connects there); a
-//                                                           second watch with another address re-aims. Every watch
-//                                                           is answered within 5 s: state watching or state failed
+//                                 watch <host>:<port>       watch the stream at that address (it connects there). A
+//                                                           watch while watching re-aims: the stream is dropped and
+//                                                           the connection made again, also to the same address,
+//                                                           with no state playing in between. Every watch is
+//                                                           answered within 5 s: state watching or state failed
 //                                 play                      come back to the own table; always answered state playing
 //                               hello and the first state playing are sent as soon as the connection exists. Every
 //                               token is printable ASCII without spaces; no line is longer than 200 bytes.
