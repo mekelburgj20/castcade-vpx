@@ -220,8 +220,9 @@ $VpmFiles = @()
 if ($Rom.Count) {
     $g = Get-ItemProperty 'HKCU:\Software\Freeware\Visual PinMame\globals' -ErrorAction SilentlyContinue
     if (-not $g -or -not $g.nvram_directory) { Fail 'VPinMAME''s nvram folder is not in the registry; cannot save the files of -Rom' }
-    foreach ($r in $Rom) {
+    foreach ($r in @($Rom) + 'default') {   # cfg\default.cfg is rewritten by every ROM table that closes
         foreach ($f in @((Join-Path $g.nvram_directory "$r.nv"), (Join-Path $g.cfg_directory "$r.cfg"))) {
+            if ($r -eq 'default' -and $f -like '*.nv') { continue }
             $e = @{ Path = $f; Existed = (Test-Path -LiteralPath $f); Bak = (Join-Path "$Run\vpm" ((Split-Path -Leaf (Split-Path -Parent $f)) + '-' + (Split-Path -Leaf $f))) }
             if ($e.Existed) { Copy-Item -LiteralPath $f -Destination $e.Bak -Force; $e.Time = (Get-Item -LiteralPath $f).LastWriteTimeUtc; $e.Hash = (Get-FileHash -LiteralPath $f).Hash }
             $VpmFiles += , $e
