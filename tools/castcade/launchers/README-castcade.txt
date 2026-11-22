@@ -20,6 +20,14 @@ doubled. This build shows a nudge in the headset as the official 10.8.0 does. If
 tuned for Panasony's build and you want his movement back, add this line under [Player] in it:
     CastcadeVRNudgeShake = 1
 
+The DMD while you watch another player: if your VPX shows a DMD window in the headset
+(CaptureExternalDMD = 1 in VPinballX.ini, with a Virtual DMD or PinUP DMD window open), VPX 10.8.0 shows
+that window and drops every other DMD picture, so while you watched you saw the DMD of your own paused
+game. This build shows the other player's DMD while you watch, in one colour (the table's own DMD, as its
+script draws it), and your own DMD window again at your turn. If the other player's table sends no DMD,
+your own window stays. To keep your own window while watching, as before, add this line under [Player]:
+    CastcadeWatchDMD = 0
+
 Install
 -------
 Copy everything in this folder next to your existing VPinballX_GL64.exe (the Panasony 10.8.0 build).

@@ -1216,7 +1216,8 @@ void Flasher::Render(const unsigned int renderMask)
       return;
    
    // Don't render DMD if DMD connection not set
-   BaseTexture *texdmd = m_texdmd != nullptr ? m_texdmd : g_pplayer->m_texdmd;
+   // Castcade: the watched player's DMD comes before this PC's own or captured one (player.h)
+   BaseTexture *texdmd = m_texdmd != nullptr ? m_texdmd : (g_pplayer->m_castcadeWatchDmd != nullptr ? g_pplayer->m_castcadeWatchDmd : g_pplayer->m_texdmd);
    if (m_d.m_isDMD && !texdmd)
       return;
 
@@ -1315,7 +1316,7 @@ void Flasher::Render(const unsigned int renderMask)
       m_rd->DMDShader->SetVector(SHADER_vRes_Alpha_time, &r);
 
       // If we're capturing Freezy DMD switch to ext technique to avoid incorrect colorization
-      if (HasDMDCapture())
+      if (HasDMDCapture() && texdmd != g_pplayer->m_castcadeWatchDmd) // Castcade: the watched player's DMD is script pixels, not a captured window
          m_rd->DMDShader->SetTechnique(SHADER_TECHNIQUE_basic_DMD_world_ext);
 
       if (texdmd != nullptr)

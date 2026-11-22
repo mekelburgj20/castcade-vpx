@@ -425,7 +425,7 @@ void Textbox::Render(const unsigned int renderMask)
       || !m_d.m_visible
       || (m_backglass && isReflectionPass)
       || (!dmd && m_texture == nullptr)
-      || (dmd && g_pplayer->m_texdmd == nullptr))
+      || (dmd && g_pplayer->m_texdmd == nullptr && g_pplayer->m_castcadeWatchDmd == nullptr)) // Castcade: player.h
       return;
 
    constexpr float mult  = (float)(1.0 / EDITOR_BG_WIDTH);
@@ -443,7 +443,8 @@ void Textbox::Render(const unsigned int renderMask)
 
    if (dmd)
    {
-      const bool isExternalDMD = HasDMDCapture();
+      BaseTexture* const watchDmd = g_pplayer->m_castcadeWatchDmd; // Castcade: the watched player's DMD, script pixels (player.h)
+      const bool isExternalDMD = HasDMDCapture() && watchDmd == nullptr;
 
       m_rd->ResetRenderState();
       m_rd->SetRenderState(RenderState::ALPHABLENDENABLE, RenderState::RS_FALSE);
@@ -482,7 +483,7 @@ void Textbox::Render(const unsigned int renderMask)
       const vec4 r((float)g_pplayer->m_dmd.x, (float)g_pplayer->m_dmd.y, 1.f, (float)(g_pplayer->m_overall_frames % 2048));
       #endif
       m_rd->DMDShader->SetVector(SHADER_vRes_Alpha_time, &r);
-      m_rd->DMDShader->SetTexture(SHADER_tex_dmd, g_pplayer->m_texdmd, isExternalDMD ? SF_TRILINEAR : SF_NONE, SA_CLAMP, SA_CLAMP);
+      m_rd->DMDShader->SetTexture(SHADER_tex_dmd, watchDmd != nullptr ? watchDmd : g_pplayer->m_texdmd, isExternalDMD ? SF_TRILINEAR : SF_NONE, SA_CLAMP, SA_CLAMP);
       m_rd->DrawTexturedQuad(m_rd->DMDShader, vertices);
       m_rd->GetCurrentPass()->m_commands.back()->SetTransparent(true);
       m_rd->GetCurrentPass()->m_commands.back()->SetDepth(-10000.f);

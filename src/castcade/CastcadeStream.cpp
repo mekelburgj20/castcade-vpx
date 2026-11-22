@@ -1053,6 +1053,11 @@ SessionImpl::~SessionImpl()
    {
       if (m_epOpen)
          LogGap();
+      // The watched player's DMD in place of this PC's captured DMD window (player.h); the texture itself is dropped by
+      // whoever ends the watch on the frame's own thread (LeaveWatch, FinishFrame)
+      if (m_player->m_castcadeWatchDmdFrames > 0)
+         m_log.Info(Fmt("whole session: %u DMD frames of the watched player were shown in place of this PC's captured DMD window", m_player->m_castcadeWatchDmdFrames));
+      m_player->m_castcadeWatchDmdFrames = 0;
       m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; %llu frames of an older player stamped late were put back at their "
                      "physics time (%llu taken as sent after one: a re-based clock); ball steps per frame outside the gaps: %s",
          (unsigned long long)m_gapsTotal, (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, StepSummary().c_str()));
@@ -3913,6 +3918,8 @@ void MatchSession::LeaveWatch(const char* const why, const char* const failed)
 
    m_play.Unfreeze();
    m_watching = false;
+   m_player->CastcadeDropWatchDmd(); // this PC's own DMD again, the captured window included (player.h)
+   m_player->m_castcadeWatchDmdFrames = 0;
    m_player->RecomputePauseState();
    g_holdEvents = false;
    m_player->UnpauseMusic(); // UnPaused: a ROM table lets VPinMAME run again

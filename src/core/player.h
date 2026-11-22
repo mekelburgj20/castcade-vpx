@@ -783,6 +783,17 @@ public:
    bool m_capExtDMD;
    int2 m_dmd;
    BaseTexture* m_texdmd;
+   // Castcade: the DMD of the player this table watches, while this VPX captures a DMD window of its own
+   // (CaptureExternalDMD with a "Virtual DMD" or PuP DMD window open). Stock VPX drops every script DMD frame under
+   // a capture, the stream's too, so a watcher saw its own paused game's DMD. The capture thread writes into
+   // m_texdmd's memory, so the stream's frames get this texture of their own; the flasher and the textbox draw it
+   // while it is set. Null whenever this table shows its own DMD. [Player] CastcadeWatchDMD = 0: the stock rule
+   BaseTexture* m_castcadeWatchDmd = nullptr;
+   bool m_castcadeWatchDmdOn = true;
+   bool m_castcadeTestWatchDmd = false; // CASTCADE_TEST_WATCHDMD=1: a watch takes this path with no capture running (desktop tests)
+   unsigned int m_castcadeWatchDmdFrames = 0; // frames written to it since the count was last taken (the watch session's log)
+   BaseTexture** ScriptDmdTexture(); // where a script DMD frame goes now; null: it is dropped (the stock rule under a capture)
+   void CastcadeDropWatchDmd(); // back to this table's own DMD
 
    bool m_capPUP;
    BaseTexture *m_texPUP = nullptr;

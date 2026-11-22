@@ -176,6 +176,11 @@ Player::Player(PinTable *const editor_table, PinTable *const live_table, const i
 
    m_NudgeShake = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "NudgeStrength"s, 2e-2f);
    m_castcadeVRNudgeShake = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "CastcadeVRNudgeShake"s, false); // Castcade: player.h
+   m_castcadeWatchDmdOn = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "CastcadeWatchDMD"s, true); // Castcade: player.h
+   {
+      char testWatchDmd[8] = {};
+      m_castcadeTestWatchDmd = GetEnvironmentVariableA("CASTCADE_TEST_WATCHDMD", testWatchDmd, sizeof(testWatchDmd)) == 1 && testWatchDmd[0] == '1';
+   }
    m_sharpen = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "Sharpen"s, 0);
    m_FXAA = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "FXAA"s, (int)Disabled);
 #ifdef ENABLE_SDL
@@ -882,6 +887,7 @@ void Player::OnClose()
    m_vball.clear();
 
    m_dmd = int2(0,0);
+   CastcadeDropWatchDmd(); // Castcade: player.h
    if (m_texdmd)
    {
       m_pin3d.m_pd3dPrimaryDevice->DMDShader->SetTextureNull(SHADER_tex_dmd);
@@ -4386,6 +4392,28 @@ void Player::SubmitFrame()
    if (m_stereo3D == STEREO_VR)
       UpdateExtCaptures();
    #endif
+}
+
+// Castcade (player.h): the texture a script DMD frame is written to. Without a capture: the table's own, as stock.
+// Under a capture: the watched player's while this table watches, otherwise none (stock: the captured window wins)
+BaseTexture** Player::ScriptDmdTexture()
+{
+   const bool watching = m_castcade && m_castcade->IsWatcher();
+   if (m_castcadeTestWatchDmd && watching)
+      return &m_castcadeWatchDmd;
+   if (!HasDMDCapture())
+      return &m_texdmd;
+   return (m_castcadeWatchDmdOn && watching) ? &m_castcadeWatchDmd : nullptr;
+}
+
+void Player::CastcadeDropWatchDmd()
+{
+   if (!m_castcadeWatchDmd)
+      return;
+   m_pin3d.m_pd3dPrimaryDevice->DMDShader->SetTextureNull(SHADER_tex_dmd);
+   m_pin3d.m_pd3dPrimaryDevice->m_texMan.UnloadTexture(m_castcadeWatchDmd);
+   delete m_castcadeWatchDmd;
+   m_castcadeWatchDmd = nullptr;
 }
 
 bool Player::FinishFrame()

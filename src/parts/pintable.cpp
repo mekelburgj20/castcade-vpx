@@ -985,35 +985,39 @@ STDMETHODIMP ScriptGlobalTable::put_DMDHeight(int pVal)
 
 STDMETHODIMP ScriptGlobalTable::put_DMDPixels(VARIANT pVal) // assumes VT_UI1 as input //!! use 64bit instead of 8bit to reduce overhead??
 {
-   if (HasDMDCapture()) // If DMD capture is enabled check if external DMD exists
+   // Castcade: under a DMD capture the stock rule drops the frame; while this table watches, the stream's frame goes to a
+   // texture of its own (player.h)
+   BaseTexture** const ptexdmd = g_pplayer ? g_pplayer->ScriptDmdTexture() : nullptr;
+   if (!ptexdmd)
       return S_OK;
+   BaseTexture*& texdmd = *ptexdmd;
 
    SAFEARRAY *psa = V_ARRAY(&pVal);
 
    if (psa && g_pplayer && g_pplayer->m_dmd.x > 0 && g_pplayer->m_dmd.y > 0)
    {
       const int size = g_pplayer->m_dmd.x*g_pplayer->m_dmd.y;
-      if (!g_pplayer->m_texdmd
+      if (!texdmd
 #ifdef DMD_UPSCALE
-          || (g_pplayer->m_texdmd->width()*g_pplayer->m_texdmd->height() != size*(3*3)))
+          || (texdmd->width()*texdmd->height() != size*(3*3)))
 #else
-          || (g_pplayer->m_texdmd->width()*g_pplayer->m_texdmd->height() != size))
+          || (texdmd->width()*texdmd->height() != size))
 #endif
       {
-         if (g_pplayer->m_texdmd)
+         if (texdmd)
          {
             g_pplayer->m_pin3d.m_pd3dPrimaryDevice->DMDShader->SetTextureNull(SHADER_tex_dmd);
-            g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.UnloadTexture(g_pplayer->m_texdmd);
-            delete g_pplayer->m_texdmd;
+            g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.UnloadTexture(texdmd);
+            delete texdmd;
          }
 #ifdef DMD_UPSCALE
-         g_pplayer->m_texdmd = new BaseTexture(g_pplayer->m_dmd.x*3, g_pplayer->m_dmd.y*3, BaseTexture::RGBA);
+         texdmd = new BaseTexture(g_pplayer->m_dmd.x*3, g_pplayer->m_dmd.y*3, BaseTexture::RGBA);
 #else
-         g_pplayer->m_texdmd = new BaseTexture(g_pplayer->m_dmd.x, g_pplayer->m_dmd.y, BaseTexture::RGBA);
+         texdmd = new BaseTexture(g_pplayer->m_dmd.x, g_pplayer->m_dmd.y, BaseTexture::RGBA);
 #endif
       }
 
-      DWORD* const data = (DWORD*)g_pplayer->m_texdmd->data(); //!! assumes tex data to be always 32bit
+      DWORD* const data = (DWORD*)texdmd->data(); //!! assumes tex data to be always 32bit
 
       VARIANT *p;
       SafeArrayAccessData(psa,(void**)&p);
@@ -1024,7 +1028,9 @@ STDMETHODIMP ScriptGlobalTable::put_DMDPixels(VARIANT pVal) // assumes VT_UI1 as
       if (g_pplayer->m_scaleFX_DMD)
          upscale(data, g_pplayer->m_dmd, true);
 
-      g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.SetDirty(g_pplayer->m_texdmd);
+      g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.SetDirty(texdmd);
+      if (ptexdmd == &g_pplayer->m_castcadeWatchDmd)
+         ++g_pplayer->m_castcadeWatchDmdFrames; // Castcade
    }
 
    return S_OK;
@@ -1032,35 +1038,39 @@ STDMETHODIMP ScriptGlobalTable::put_DMDPixels(VARIANT pVal) // assumes VT_UI1 as
 
 STDMETHODIMP ScriptGlobalTable::put_DMDColoredPixels(VARIANT pVal) //!! assumes VT_UI4 as input //!! use 64bit instead of 32bit to reduce overhead??
 {
-   if (HasDMDCapture()) // If DMD capture is enabled check if external DMD exists
+   // Castcade: under a DMD capture the stock rule drops the frame; while this table watches, the stream's frame goes to a
+   // texture of its own (player.h)
+   BaseTexture** const ptexdmd = g_pplayer ? g_pplayer->ScriptDmdTexture() : nullptr;
+   if (!ptexdmd)
       return S_OK;
+   BaseTexture*& texdmd = *ptexdmd;
 
 	SAFEARRAY *psa = V_ARRAY(&pVal);
 
 	if (psa && g_pplayer && g_pplayer->m_dmd.x > 0 && g_pplayer->m_dmd.y > 0)
 	{
 		const int size = g_pplayer->m_dmd.x*g_pplayer->m_dmd.y;
-		if (!g_pplayer->m_texdmd
+		if (!texdmd
 #ifdef DMD_UPSCALE
-            || (g_pplayer->m_texdmd->width()*g_pplayer->m_texdmd->height() != size*(3*3)))
+            || (texdmd->width()*texdmd->height() != size*(3*3)))
 #else
-            || (g_pplayer->m_texdmd->width()*g_pplayer->m_texdmd->height() != size))
+            || (texdmd->width()*texdmd->height() != size))
 #endif
       {
-         if (g_pplayer->m_texdmd)
+         if (texdmd)
          {
             g_pplayer->m_pin3d.m_pd3dPrimaryDevice->DMDShader->SetTextureNull(SHADER_tex_dmd);
-            g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.UnloadTexture(g_pplayer->m_texdmd);
-            delete g_pplayer->m_texdmd;
+            g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.UnloadTexture(texdmd);
+            delete texdmd;
          }
 #ifdef DMD_UPSCALE
-         g_pplayer->m_texdmd = new BaseTexture(g_pplayer->m_dmd.x*3, g_pplayer->m_dmd.y*3, BaseTexture::RGBA);
+         texdmd = new BaseTexture(g_pplayer->m_dmd.x*3, g_pplayer->m_dmd.y*3, BaseTexture::RGBA);
 #else
-         g_pplayer->m_texdmd = new BaseTexture(g_pplayer->m_dmd.x, g_pplayer->m_dmd.y, BaseTexture::RGBA);
+         texdmd = new BaseTexture(g_pplayer->m_dmd.x, g_pplayer->m_dmd.y, BaseTexture::RGBA);
 #endif
       }
 
-		DWORD* const data = (DWORD*)g_pplayer->m_texdmd->data(); //!! assumes tex data to be always 32bit
+		DWORD* const data = (DWORD*)texdmd->data(); //!! assumes tex data to be always 32bit
 
 		VARIANT *p;
 		SafeArrayAccessData(psa, (void **)&p);
@@ -1071,7 +1081,9 @@ STDMETHODIMP ScriptGlobalTable::put_DMDColoredPixels(VARIANT pVal) //!! assumes 
 		if (g_pplayer->m_scaleFX_DMD)
 			upscale(data, g_pplayer->m_dmd, false);
 
-		g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.SetDirty(g_pplayer->m_texdmd);
+		g_pplayer->m_pin3d.m_pd3dPrimaryDevice->m_texMan.SetDirty(texdmd);
+      if (ptexdmd == &g_pplayer->m_castcadeWatchDmd)
+         ++g_pplayer->m_castcadeWatchDmdFrames; // Castcade
 	}
 
 	return S_OK;

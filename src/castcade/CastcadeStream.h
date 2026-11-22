@@ -95,6 +95,8 @@
 // CASTCADE_TEST_MATCHNOUNDO=1 leaves the properties and the runtime state of a watch phase in place on purpose, to
 // show that the check and the pictures see a table that did not come back; CASTCADE_TEST_UNDOLIMIT=<n> lowers the
 // number of properties a stream may put, so that a real stream passes it (state failed overflow);
+// CASTCADE_TEST_WATCHDMD=1 sends a watched player's DMD frames to the texture a watcher with a captured DMD window
+// uses for them (Player::ScriptDmdTexture), with no capture running: the desktop test of that path;
 // CASTCADE_TEST_MUSIC=<file> calls the table's PlayMusic with that file 5 s into the session;
 // CASTCADE_TEST_OPTIONEVENT=1 fires the tweak menu's "table option changed" event once in every watch phase, after
 // the keyframe; CASTCADE_TEST_HOLDKEYS=1 puts key events of F13 and F14 into the key queue around every watch phase
