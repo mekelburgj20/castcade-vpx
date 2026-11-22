@@ -175,6 +175,7 @@ Player::Player(PinTable *const editor_table, PinTable *const live_table, const i
    m_maxPrerenderedFrames = useVR ? 0 : m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "MaxPrerenderedFrames"s, 0);
 
    m_NudgeShake = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "NudgeStrength"s, 2e-2f);
+   m_castcadeVRNudgeShake = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "CastcadeVRNudgeShake"s, false); // Castcade: player.h
    m_sharpen = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "Sharpen"s, 0);
    m_FXAA = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "FXAA"s, (int)Disabled);
 #ifdef ENABLE_SDL
@@ -3126,7 +3127,7 @@ void Player::UpdatePhysics()
 #ifdef ENABLE_VR
           if (m_NudgeShake > 0.0f)
           {
-             if (m_stereo3D == STEREO_VR)
+             if (m_stereo3D == STEREO_VR && m_castcadeVRNudgeShake) // Castcade: player.h
              {
                 if (GetNudgeX() != 0 || GetNudgeY() != 0)
                 {
@@ -3149,7 +3150,7 @@ void Player::UpdatePhysics()
           {
               // NB: in table coordinates, +Y points down, but in screen coordinates, it points up,
               // so we have to flip the y component
-              if (m_stereo3D == STEREO_VR)
+              if (m_stereo3D == STEREO_VR && m_castcadeVRNudgeShake) // Castcade: player.h
               {
                  if (GetNudgeX() != 0 || GetNudgeY() != 0)
                  {

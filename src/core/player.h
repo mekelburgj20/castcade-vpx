@@ -526,6 +526,10 @@ private:
 #endif
 
    float m_NudgeShake; // whether to shake the screen during nudges and how much
+   // Castcade: Panasony's nudge shake for VR (the table moved in the room by updateTableMatrix every physics step).
+   // Off unless [Player] CastcadeVRNudgeShake = 1: off, a headset gets what the official 10.8.0 does (SetScreenOffset),
+   // so an ini made for the official build (NudgeStrength 0.02, gains 100) does not make the table swim
+   bool m_castcadeVRNudgeShake;
 
    HitPlane m_hitPlayfield; // HitPlanes cannot be part of octree (infinite size)
    HitPlane m_hitTopGlass;

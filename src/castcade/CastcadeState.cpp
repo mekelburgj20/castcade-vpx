@@ -528,7 +528,7 @@ struct StateAccess
       if (player->m_NudgeShake <= 0.0f)
          return;
 #ifdef ENABLE_VR
-      if (player->m_stereo3D == STEREO_VR)
+      if (player->m_stereo3D == STEREO_VR && player->m_castcadeVRNudgeShake)
       {
          RenderDevice* const rd = player->m_pin3d.m_pd3dPrimaryDevice;
          if (rd == nullptr)

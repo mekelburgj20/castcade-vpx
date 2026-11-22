@@ -13,6 +13,13 @@ behaves like that build, except for two crashes of 10.8.0 that it does not have:
 editor view (the "x" at the right of the menu bar) while its game runs is ignored, and a table script
 that sets MusicVolume before any music plays no longer ends VPX.
 
+One thing of Panasony's build is off here unless you turn it on: in the headset, his build moves the whole
+table in the room when you nudge (and, with an analog nudge device, all the time, by NudgeStrength times
+AnalogNudgeGainX / Y). With the settings of an official VPX install that makes the table swim and look
+doubled. This build shows a nudge in the headset as the official 10.8.0 does. If your VPinballX.ini is
+tuned for Panasony's build and you want his movement back, add this line under [Player] in it:
+    CastcadeVRNudgeShake = 1
+
 Install
 -------
 Copy everything in this folder next to your existing VPinballX_GL64.exe (the Panasony 10.8.0 build).
