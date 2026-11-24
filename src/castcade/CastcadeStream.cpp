@@ -3,6 +3,7 @@
 #include "stdafx.h"
 #include "CastcadeStream.h"
 #include "CastcadeState.h"
+#include "CastcadeTimeline.h"
 #include "CastcadeWire.h"
 #include "vpversion.h"
 
@@ -83,10 +84,7 @@ enum KindClass : uint8_t
 constexpr uint64_t RETRY_USEC = 2000000;
 constexpr uint64_t HOLD_MAX_USEC = 10000000; // match role: how long a watcher's connection is held while this table is not playing
 constexpr uint64_t STATS_USEC = 5000000;
-constexpr uint64_t TIMELINE_MAX_USEC = 2000000;
-constexpr int64_t CATCHUP_MIN_LAG_USEC = 20000; // a hold shorter than this resumes by jumping, as it always did
 constexpr uint64_t CONNECT_FAIL_LOG_USEC = 30000000;
-constexpr size_t OFFSET_WINDOW = 300;
 constexpr int MAX_LOGGED = 20;
 constexpr U32 NOTE_MS = 5000;
 constexpr U32 NOTE_LASTING_MS = 24u * 3600u * 1000u;
@@ -670,6 +668,7 @@ MatchSession* g_match = nullptr;
 class SessionImpl final : public Session
 {
    friend class MatchSession;
+   friend class WatchTimeline<RxFrame, SessionImpl>;
 
 public:
    // inner: the watch phase of a match session. matchPlay: the play part of one.
@@ -714,14 +713,16 @@ private:
    void WatchService(Peer& p, const uint64_t now);
    bool ParseFrame(const Message& m, RxFrame& f);
    void ApplyKeyframe(RxFrame& kf);
-   void StepTimeline(const uint64_t now);
-   void LogGap();
-   std::string StepSummary() const;
    void Replay(RxFrame& f);
    IDispatch* Resolve(const uint32_t id, KindClass& cls) const;
    void Refuse(const std::string& why);
    void StopAllSoundsHere(const char* const why); // watch: PinTable::StopAllSounds, counted before and after
-   void AddOffsetSample(const int64_t sample);
+   // Watch: what the timeline (CastcadeTimeline.h) asks of the session
+   void TimelineShow(RxFrame& a, RxFrame& b, const float t) { m_applier->Apply(*a.state, *b.state, t); }
+   void TimelineReplay(RxFrame& f) { Replay(f); }
+   float TimelineBallStep() const { return m_applier->LastMaxBallStep(); }
+   bool TimelineConnected() const { return !m_peers.empty() && m_peers.front().helloOk; }
+   void TimelineLog(const std::string& line) { m_log.Info(line); }
 
    // Both
    void BuildHello(ByteWriter& w) const;
@@ -860,37 +861,20 @@ private:
    std::vector<IDispatch*> m_editDisp;
    IDispatch* m_tableDisp = nullptr;
    IDispatch* m_globalDisp = nullptr;
-   std::deque<std::unique_ptr<RxFrame>> m_timeline;
-   std::deque<int64_t> m_offsetSamples;
-   int64_t m_offset = 0;
+   // The frames received and not shown yet, the clock offset, and what happens when the stream had a gap
+   // (CastcadeTimeline.h). CASTCADE_STREAM_SMOOTH=0: the shown time jumps to the target when frames come back, as
+   // before; 1 (default): it catches up over a short eased interval.
+   WatchTimeline<RxFrame, SessionImpl> m_timeline { *this };
+   bool m_smooth = true;
    bool m_refused = false;
    bool m_keyframeApplied = false;
    bool m_bye = false;
    int m_replayFailLogged = 0;
-   uint64_t m_iRecv = 0, m_iBeforeKeyframe = 0, m_iStarved = 0, m_iBuffering = 0, m_iJumps = 0;
+   uint64_t m_iRecv = 0, m_iBeforeKeyframe = 0;
    uint64_t m_iReplayed[KC_COUNT] = {}, m_iFailed = 0, m_iUnresolved = 0, m_iSoundSkipped = 0;
    uint32_t m_frameReplayed = 0, m_iReplayedMax = 0;
    uint64_t m_iReplayedSum = 0;
-
-   // Watch: what happens when the stream had a gap (StepTimeline). CASTCADE_STREAM_SMOOTH=0: the shown time jumps
-   // to the target when frames come back, as before; 1 (default): it catches up over a short eased interval.
-   bool m_smooth = true;
-   bool m_haveShown = false, m_held = false, m_catchup = false;
-   int64_t m_shown = 0;         // the stream time the last frame showed
-   uint64_t m_catchupStart = 0; // NowUsec
-   double m_catchupLag = 0., m_catchupLen = 0.;
-   // The gap being measured: how long the picture held, and the largest ball step until the catch-up is over
-   uint64_t m_heldSince = 0, m_epHeldSince = 0;
-   uint64_t m_lastAnyArrival = 0;     // when the last frame was received (any stamp)
-   uint64_t m_holdArrivalGapMax = 0;  // the longest time without a frame received while the picture held
    bool m_stopWhenDrained = false;    // the connection ended: stop every sound again once its last frames are shown
-   int64_t m_heldStamp = 0;
-   bool m_epOpen = false;
-   uint64_t m_epUntil = 0;
-   double m_epHeldMs = 0., m_epGapMs = 0., m_epLagMs = 0., m_epCatchupMs = 0., m_epFirstMoveMs = -1.;
-   float m_epMaxStep = 0.f;
-   uint64_t m_iGaps = 0, m_gapsTotal = 0;
-   float m_iMaxStep = 0.f;
    std::vector<double> m_testDrops;   // CASTCADE_TEST_DROP: seconds after the session began to cut the connection at
    bool m_physicsStamps = false;      // the player's HELLO says its frames carry its physics clock (HELLO_PHYSICS_STAMPS)
    bool m_lastRxCorrected = false;    // the last frame received was moved back to its physics time
@@ -899,9 +883,6 @@ private:
    uint64_t m_lastRxTime = 0;
    uint32_t m_lastRxPhys = 0;
    uint64_t m_iRestamped = 0;         // frames of an older player moved back to their physics time
-   std::vector<uint32_t> m_stepHist; // ball steps of the frames outside a gap, 0.5 VPU bins
-   uint64_t m_stepFrames = 0;
-   float m_stepMax = 0.f;
 
    // Both
    uint64_t m_statsStart = 0;
@@ -964,6 +945,7 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
       m_replaySound = sound.empty() || atoi(sound.c_str()) != 0;
       m_stopAudit = GetEnv("CASTCADE_STREAM_STOPAUDIT") == "1";
       m_smooth = GetEnv("CASTCADE_STREAM_SMOOTH") != "0";
+      m_timeline.Configure(m_delayUsec, m_smooth);
       const std::string drops = GetEnv("CASTCADE_TEST_DROP");
       for (size_t at = 0; at < drops.size();)
       {
@@ -1051,8 +1033,8 @@ SessionImpl::~SessionImpl()
                   : ""));
    if (m_watch)
    {
-      if (m_epOpen)
-         LogGap();
+      if (m_timeline.m_epOpen)
+         m_timeline.LogGap();
       // The watched player's DMD in place of this PC's captured DMD window (player.h); the texture itself is dropped by
       // whoever ends the watch on the frame's own thread (LeaveWatch, FinishFrame)
       if (m_player->m_castcadeWatchDmdFrames > 0)
@@ -1060,7 +1042,7 @@ SessionImpl::~SessionImpl()
       m_player->m_castcadeWatchDmdFrames = 0;
       m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; %llu frames of an older player stamped late were put back at their "
                      "physics time (%llu taken as sent after one: a re-based clock); ball steps per frame outside the gaps: %s",
-         (unsigned long long)m_gapsTotal, (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, StepSummary().c_str()));
+         (unsigned long long)m_timeline.m_gapsTotal, (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, m_timeline.StepSummary().c_str()));
    }
    else
       m_log.Info(Fmt("whole session: %llu catch-ups after a stall sent %llu frames of their own", (unsigned long long)m_catchupsTotal, (unsigned long long)m_catchupFramesTotal));
@@ -1087,7 +1069,7 @@ SessionImpl::~SessionImpl()
    }
    m_peers.clear();
    m_listener.reset();
-   m_timeline.clear();
+   m_timeline.m_frames.clear();
    if (m_applier)
    {
       m_applier->Reset();
@@ -2227,8 +2209,7 @@ void SessionImpl::Replay(RxFrame& f)
 void SessionImpl::ApplyKeyframe(RxFrame& kf)
 {
    m_applier->Reset();
-   m_timeline.clear();
-   m_haveShown = m_held = m_catchup = m_epOpen = false;
+   m_timeline.OnKeyframe(kf.time, kf.arrived);
    // Match role: a keyframe builds on the table as its file gives it, which a table that has played its own game
    // is not: the match session brings it there first (and hides the local balls)
    if (m_observer)
@@ -2242,14 +2223,6 @@ void SessionImpl::ApplyKeyframe(RxFrame& kf)
    m_keyframeApplied = true;
    m_log.Info(Fmt("keyframe applied: %zu bytes, state %zu bytes, %zu calls (%u replayed, %llu failed or unresolved)", kf.bytes, kf.stateBytes, kf.calls.size(),
       m_frameReplayed - replayedBefore, (unsigned long long)(m_iFailed + m_iUnresolved - failedBefore)));
-}
-
-void SessionImpl::AddOffsetSample(const int64_t sample)
-{
-   m_offsetSamples.push_back(sample);
-   if (m_offsetSamples.size() > OFFSET_WINDOW)
-      m_offsetSamples.pop_front();
-   m_offset = *std::min_element(m_offsetSamples.begin(), m_offsetSamples.end());
 }
 
 void SessionImpl::Refuse(const std::string& why)
@@ -2314,7 +2287,7 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          {
             p.helloOk = true;
             m_bye = false;
-            m_offsetSamples.clear();
+            m_timeline.OnHello();
             if (h.build != VP_VERSION_STRING_POINTS_FULL)
                m_log.Warn(Fmt("the player runs build %s, this is %s", h.build.c_str(), VP_VERSION_STRING_POINTS_FULL));
             m_physicsStamps = (h.features & HELLO_PHYSICS_STAMPS) != 0;
@@ -2354,9 +2327,7 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          // is a re-based clock, not a stall: its stamp is taken as sent and the next frames compare with it.
          // Part of smoothing: CASTCADE_STREAM_SMOOTH=0 shows an older stream exactly as the watcher always did.
          f->arrived = now;
-         if (m_held && m_lastAnyArrival)
-            m_holdArrivalGapMax = (std::max)(m_holdArrivalGapMax, now - m_lastAnyArrival);
-         m_lastAnyArrival = now;
+         m_timeline.OnArrival(now);
          const uint32_t phys = SnapshotPhysicsMsec(*f->state);
          bool corrected = false;
          if (m_smooth && !m_physicsStamps && m.type == MSG_FRAME && m_haveLastRx && phys >= m_lastRxPhys && f->time > m_lastRxTime)
@@ -2378,13 +2349,12 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          m_lastRxTime = f->time;
          m_lastRxPhys = phys;
          m_haveLastRx = true;
-         AddOffsetSample((int64_t)now - (int64_t)f->time);
          if (m.type == MSG_KEYFRAME)
             ApplyKeyframe(*f);
          else
          {
             ++m_iRecv;
-            m_timeline.push_back(std::move(f));
+            m_timeline.Push(std::move(f), now);
          }
       }
       else if (m.type == MSG_BYE)
@@ -2429,182 +2399,6 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
    p.tcp->Close();
    p.closing = true;
    m_keyframeApplied = false; // the next connection starts with a keyframe; the last picture stays meanwhile
-}
-
-// When the player stalls, its frames stop for the length of the stall and then come all at once (a catch-up sends
-// the states it simulated meanwhile, CastcadeStream OnPhysicsStep). The watcher shows a fixed delay behind the
-// newest frame, so it holds the last picture for the stall minus the delay whatever it does (a guess forward would be
-// wrong at the first thing the ball hits). What smoothing changes is the moment frames come back: without it the
-// shown time jumps to the target and the ball leaps over everything it did during the hold; with it the shown time
-// carries on from where it held and catches up with the target over 80 to 300 ms (half the lag), eased at both
-// ends, so the missed motion is played quickly instead of skipped. With no hold of more than CATCHUP_MIN_LAG_USEC the
-// shown time is the target, exactly as without smoothing; calls are replayed once each and in order either way.
-void SessionImpl::StepTimeline(const uint64_t now)
-{
-   if (m_timeline.empty())
-      return;
-   const int64_t target = (int64_t)now - m_offset - m_delayUsec;
-   int64_t render = target;
-
-   // A stalled watcher (or a stale clock offset) lets the timeline grow: jump to the newest minus the delay
-   const int64_t newest = (int64_t)m_timeline.back()->time;
-   bool jumped = false;
-   if (newest - (int64_t)m_timeline.front()->time > (int64_t)TIMELINE_MAX_USEC && newest - m_delayUsec > render)
-   {
-      render = newest - m_delayUsec;
-      jumped = true;
-      m_catchup = false;
-      if (m_iJumps++ < 3)
-         m_log.Info(Fmt("timeline over 2 s (%zu frames): jumping to the newest frame minus the delay", m_timeline.size()));
-   }
-
-   if (m_smooth && !jumped && m_haveShown)
-   {
-      if (!m_catchup && m_held && newest > m_shown && target - m_shown > CATCHUP_MIN_LAG_USEC)
-      {
-         m_catchup = true;
-         m_catchupStart = now;
-         m_catchupLag = (double)(target - m_shown);
-         // Half the lag: the shown time runs at up to 4 times the speed of play (smoothstep peaks at 1.5 times the
-         // mean); a third of the lag (6 times) gave single-frame ball steps of up to 2.5 times normal play's largest
-         m_catchupLen = std::clamp(0.5 * m_catchupLag, 80000., 300000.);
-         if (m_epOpen) // a hold too short to count as a gap of its own, inside one being measured
-         {
-            m_epUntil = (std::max)(m_epUntil, now + (uint64_t)m_catchupLen + 100000);
-            m_epCatchupMs = (std::max)(m_epCatchupMs, m_catchupLen / 1000.);
-         }
-      }
-      if (m_catchup)
-      {
-         const double u = (double)(now - m_catchupStart) / m_catchupLen;
-         if (u >= 1.)
-            m_catchup = false;
-         else
-            render = target - (int64_t)(m_catchupLag * (1. - u * u * (3. - 2. * u)));
-      }
-   }
-
-   // Nothing newer than the newest frame to show: hold it (also what happened before, with render past it)
-   const bool held = render > newest;
-   if (held)
-   {
-      render = newest;
-      m_catchup = false; // a new hold during a catch-up: it starts again from here when frames come back
-   }
-   if (held && !m_held)
-   {
-      m_heldSince = now;
-      m_heldStamp = newest;
-      m_holdArrivalGapMax = 0;
-   }
-   else if (!held && m_held && m_haveShown)
-   {
-      const double heldMs = (double)(now - m_heldSince) / 1000.;
-      // A gap is frames that stopped arriving: the longest time without one while the picture held (WatchService
-      // measures it). A picture held while frames keep coming is a paused player, whose stamps stand still: nothing
-      // to measure there
-      const double arrivalGapMs = (double)m_holdArrivalGapMax / 1000.;
-      if (heldMs >= 20. && arrivalGapMs >= 20.)
-      {
-         if (m_epOpen)
-            LogGap();
-         m_epOpen = true;
-         m_epHeldSince = m_heldSince;
-         m_epHeldMs = heldMs;
-         m_epGapMs = arrivalGapMs;
-         m_epLagMs = (double)(target - m_heldStamp) / 1000.;
-         m_epCatchupMs = m_catchup ? m_catchupLen / 1000. : 0.;
-         m_epUntil = now + (uint64_t)(m_epCatchupMs * 1000.) + 100000;
-         m_epMaxStep = 0.f;
-         m_epFirstMoveMs = -1.;
-      }
-   }
-   m_held = held;
-   m_shown = render;
-   m_haveShown = true;
-
-   // a: the newest frame at or before the render time; b: the one after it
-   size_t ia = SIZE_MAX;
-   for (size_t i = 0; i < m_timeline.size(); ++i)
-   {
-      if ((int64_t)m_timeline[i]->time <= render)
-         ia = i;
-      else
-         break;
-   }
-   if (ia == SIZE_MAX)
-   {
-      ++m_iBuffering; // the first frames after a keyframe are still younger than the delay
-      return;
-   }
-   RxFrame& a = *m_timeline[ia];
-   RxFrame* const b = ia + 1 < m_timeline.size() ? m_timeline[ia + 1].get() : nullptr;
-   if (b && b->time > a.time)
-   {
-      const float t = std::clamp((float)((double)(render - (int64_t)a.time) / (double)(b->time - a.time)), 0.f, 1.f);
-      m_applier->Apply(*a.state, *b->state, t);
-   }
-   else
-   {
-      m_applier->Apply(*a.state, *a.state, 0.f);
-      if (!b && !m_peers.empty() && m_peers.front().helloOk)
-         ++m_iStarved;
-   }
-   // How far the picture moved in this frame: the gap being measured, or the reference of normal play
-   const float step = m_applier->LastMaxBallStep();
-   m_iMaxStep = (std::max)(m_iMaxStep, step);
-   if (m_epOpen)
-   {
-      m_epMaxStep = (std::max)(m_epMaxStep, step);
-      if (m_epFirstMoveMs < 0. && step >= 1.f) // the first frame after the hold in which a ball visibly moves
-         m_epFirstMoveMs = (double)(now - m_epHeldSince) / 1000.;
-      if (now >= m_epUntil)
-         LogGap();
-   }
-   else if (!held)
-   {
-      if (m_stepHist.empty())
-         m_stepHist.assign(8001, 0);
-      ++m_stepHist[std::min<size_t>((size_t)(step * 2.f), m_stepHist.size() - 1)];
-      ++m_stepFrames;
-      m_stepMax = (std::max)(m_stepMax, step);
-   }
-   // Calls after the state, in arrival order: a ball put finds its ball, lights change in step with the balls
-   for (size_t i = 0; i <= ia; ++i)
-      if (!m_timeline[i]->replayed)
-         Replay(*m_timeline[i]);
-   for (size_t i = 0; i < ia; ++i)
-      m_timeline.pop_front();
-}
-
-void SessionImpl::LogGap()
-{
-   m_epOpen = false;
-   ++m_iGaps;
-   ++m_gapsTotal;
-   const std::string how = m_epCatchupMs > 0. ? Fmt("caught up in %.0f ms", m_epCatchupMs) : m_smooth ? std::string("no catch-up (lag under 20 ms)") : std::string("jumped (smoothing off)");
-   const std::string move = m_epFirstMoveMs >= 0. ? Fmt("a ball moved again %.0f ms after the hold began", m_epFirstMoveMs) : std::string("no ball moved");
-   m_log.Info(Fmt("stream gap: frames stopped arriving for %.0f ms, picture held %.0f ms, %.0f ms behind when frames came back, %s; %s; largest ball step %.1f VPU in one frame",
-      m_epGapMs, m_epHeldMs, m_epLagMs, how.c_str(), move.c_str(), m_epMaxStep));
-}
-
-std::string SessionImpl::StepSummary() const
-{
-   if (m_stepFrames == 0)
-      return "no ball moved";
-   const auto pct = [this](const double p)
-   {
-      const uint64_t want = (uint64_t)(p * (double)m_stepFrames);
-      uint64_t sum = 0;
-      for (size_t i = 0; i < m_stepHist.size(); ++i)
-      {
-         sum += m_stepHist[i];
-         if (sum > want)
-            return (double)i * 0.5;
-      }
-      return (double)(m_stepHist.size() - 1) * 0.5;
-   };
-   return Fmt("frames %llu, median %.1f, p99 %.1f, p99.9 %.1f, max %.1f VPU", (unsigned long long)m_stepFrames, pct(0.5), pct(0.99), pct(0.999), m_stepMax);
 }
 
 void SessionImpl::WatchFrame(const uint64_t now)
@@ -2677,10 +2471,9 @@ void SessionImpl::WatchFrame(const uint64_t now)
    }
 
    m_frameReplayed = 0;
-   StepTimeline(now);
+   m_timeline.Step(now);
    // Once the frames received before the connection ended have all been shown, whatever they started stops too
-   if (m_stopWhenDrained && (m_peers.empty() || !m_peers.front().helloOk)
-      && std::none_of(m_timeline.begin(), m_timeline.end(), [](const std::unique_ptr<RxFrame>& f) { return !f->replayed; }))
+   if (m_stopWhenDrained && (m_peers.empty() || !m_peers.front().helloOk) && m_timeline.Drained())
    {
       m_stopWhenDrained = false;
       StopAllSoundsHere("the frames received before the connection ended have been shown");
@@ -2764,24 +2557,23 @@ void SessionImpl::LogStats(const uint64_t now)
    else
    {
       const bool connected = !m_peers.empty() && m_peers.front().helloOk;
-      const double span = m_timeline.size() > 1 ? (double)(m_timeline.back()->time - m_timeline.front()->time) / 1000. : 0.;
+      const double span = m_timeline.SpanMs();
       m_log.Info(Fmt("stats %.1fs: %s, frames %llu, received %llu (%.1f/s), in %.0f B/s, out %.0f B/s; timeline %zu frames (%.0f ms), starved %llu, buffering %llu, "
                      "jumps %llu; replayed calls %llu (editable %llu table %llu global %llu ball %llu), per frame avg %.2f max %u, failed %llu, unresolved %llu, "
                      "sound skipped %llu, stops skipped %llu%s; frames before keyframe %llu; clock offset %lld us, delay %lld ms; gaps %llu, largest ball step %.1f VPU; "
                      "frames restamped so far %llu, re-based %llu",
          secs, m_refused ? "refused" : (connected ? "connected" : "not connected"), (unsigned long long)m_iFrames, (unsigned long long)m_iRecv,
-         (double)m_iRecv / secs, (double)m_iBytesIn / secs, (double)m_iBytesOut / secs, m_timeline.size(), span, (unsigned long long)m_iStarved,
-         (unsigned long long)m_iBuffering, (unsigned long long)m_iJumps,
+         (double)m_iRecv / secs, (double)m_iBytesIn / secs, (double)m_iBytesOut / secs, m_timeline.m_frames.size(), span, (unsigned long long)m_timeline.m_iStarved,
+         (unsigned long long)m_timeline.m_iBuffering, (unsigned long long)m_timeline.m_iJumps,
          (unsigned long long)(m_iReplayed[KC_EDITABLE] + m_iReplayed[KC_TABLE] + m_iReplayed[KC_GLOBAL] + m_iReplayed[KC_BALL]),
          (unsigned long long)m_iReplayed[KC_EDITABLE], (unsigned long long)m_iReplayed[KC_TABLE], (unsigned long long)m_iReplayed[KC_GLOBAL],
          (unsigned long long)m_iReplayed[KC_BALL], (double)m_iReplayedSum / frames, m_iReplayedMax, (unsigned long long)m_iFailed,
          (unsigned long long)m_iUnresolved, (unsigned long long)m_iSoundSkipped, (unsigned long long)m_iStopDropped,
          m_stopAudit ? Fmt(" (audit: %llu would have stopped a playing sound, %llu would not)", (unsigned long long)m_iAuditEffective, (unsigned long long)m_iAuditNoEffect).c_str() : "",
-         (unsigned long long)m_iBeforeKeyframe, (long long)m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_iGaps, m_iMaxStep,
+         (unsigned long long)m_iBeforeKeyframe, (long long)m_timeline.m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_timeline.m_iGaps, m_timeline.m_iMaxStep,
          (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased));
-      m_iGaps = 0;
-      m_iMaxStep = 0.f;
-      m_iRecv = m_iBeforeKeyframe = m_iStarved = m_iBuffering = m_iJumps = 0;
+      m_timeline.ResetInterval();
+      m_iRecv = m_iBeforeKeyframe = 0;
       m_iFailed = m_iUnresolved = m_iSoundSkipped = m_iStopDropped = m_iAuditEffective = m_iAuditNoEffect = 0;
       m_iReplayedSum = 0;
       m_iReplayedMax = 0;
@@ -3552,7 +3344,7 @@ void MatchSession::CheckWatch(const uint64_t now)
       // frame it draws, so 3 s without one is a stream that hangs somewhere on the way. Better the companion's 2D
       // picture than a table that stands still.
       // (the watch session stamps an arrival with its own, later, reading of the clock: never subtract the other way)
-      if (w.m_lastAnyArrival && now > w.m_lastAnyArrival && now - w.m_lastAnyArrival >= WATCH_STALL_USEC)
+      if (w.m_timeline.m_lastAnyArrival && now > w.m_timeline.m_lastAnyArrival && now - w.m_timeline.m_lastAnyArrival >= WATCH_STALL_USEC)
          LeaveWatch("the stream delivered no frame for 3 s", "stalled");
       return;
    }
