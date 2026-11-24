@@ -700,7 +700,7 @@ private:
    void BuildKeyframe(ByteWriter& w);
    void BuildFrame(ByteWriter& w, const uint64_t time);
    void EmitFrame(const uint64_t stamp); // the calls since the last frame and the physics state now, to the watchers and the recording
-   uint64_t PhysicsStamp() const;      // the physics clock on the NowUsec clock: what a frame's time field holds
+   uint64_t PhysicsStamp();            // the physics clock on the NowUsec clock: what a frame's time field holds
 
    // Play: the recording (CASTCADE_STREAM_RECORD)
    void OpenRecording(const std::wstring& spec);
@@ -846,6 +846,13 @@ private:
    uint64_t m_iCatchupFrames = 0, m_iCatchups = 0, m_catchupFramesTotal = 0, m_catchupsTotal = 0;
    uint64_t m_iCatchupTicks = 0;
 
+   // Play: the stamp of each frame (CastcadeTimeline.h). I11.4.17 (2026-11-24): while this table's game is paused its
+   // stamp runs on with the wall clock; CASTCADE_STREAM_PAUSECLOCK=0 lets it stand as before (tests of a watcher).
+   PlayStamp m_stamp;
+   bool m_pauseClock = true;
+   bool m_gameStands = false; // the physics clock has stood for a second: logged once, and once when it moves again
+   uint64_t m_gameStoodSince = 0;
+
    // Play: per frame and per interval counters
    uint32_t m_frameSeen = 0, m_frameQueued = 0;
    uint64_t m_frameTicks = 0;
@@ -863,9 +870,11 @@ private:
    IDispatch* m_globalDisp = nullptr;
    // The frames received and not shown yet, the clock offset, and what happens when the stream had a gap
    // (CastcadeTimeline.h). CASTCADE_STREAM_SMOOTH=0: the shown time jumps to the target when frames come back, as
-   // before; 1 (default): it catches up over a short eased interval.
+   // before; 1 (default): it catches up over a short eased interval. CASTCADE_STREAM_RESYNC=0: frames are held as
+   // stamped and the clock is never started again, as before 2026-11-24 (I11.4.17; tests).
    WatchTimeline<RxFrame, SessionImpl> m_timeline { *this };
    bool m_smooth = true;
+   bool m_resync = true;
    bool m_refused = false;
    bool m_keyframeApplied = false;
    bool m_bye = false;
@@ -945,7 +954,8 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
       m_replaySound = sound.empty() || atoi(sound.c_str()) != 0;
       m_stopAudit = GetEnv("CASTCADE_STREAM_STOPAUDIT") == "1";
       m_smooth = GetEnv("CASTCADE_STREAM_SMOOTH") != "0";
-      m_timeline.Configure(m_delayUsec, m_smooth);
+      m_resync = GetEnv("CASTCADE_STREAM_RESYNC") != "0";
+      m_timeline.Configure(m_delayUsec, m_smooth, m_resync);
       const std::string drops = GetEnv("CASTCADE_TEST_DROP");
       for (size_t at = 0; at < drops.size();)
       {
@@ -958,7 +968,10 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
       std::sort(m_testDrops.begin(), m_testDrops.end());
    }
    else
+   {
       m_catchupFrames = GetEnv("CASTCADE_STREAM_CATCHUP") != "0";
+      m_pauseClock = GetEnv("CASTCADE_STREAM_PAUSECLOCK") != "0";
+   }
    m_stopFilterOn = GetEnv("CASTCADE_STREAM_STOPFILTER") != "0";
    {
       std::vector<std::wstring> reels;
@@ -980,8 +993,12 @@ SessionImpl::SessionImpl(Player* const player, const bool watch, const InnerWatc
       m_replaySound ? "on" : "off", m_neverPauses ? "yes" : "no", m_tableFile.c_str(), m_editCount, (unsigned long long)m_hash, VP_VERSION_STRING_POINTS_FULL));
    m_log.Info(Fmt("StopSound filter %s (DispReel sounds %zu, repeated-stop rule %s)%s", m_stopFilterOn ? "on" : "off (CASTCADE_STREAM_STOPFILTER=0)",
       m_stopFilter.ReelSounds(), m_stopFilter.RepeatRule() ? "on" : "off", m_stopAudit ? "; AUDIT: every stop is replayed, the ones the filter would drop are checked" : ""));
-   m_log.Info(watch ? Fmt("after a gap in the stream: %s", m_smooth ? "catch up over 80-300 ms (CASTCADE_STREAM_SMOOTH=0 jumps instead)" : "jump to the target (CASTCADE_STREAM_SMOOTH=0)")
-                    : Fmt("frames stamped with the physics clock; catch-up frames after a stall %s", m_catchupFrames ? "on" : "off (CASTCADE_STREAM_CATCHUP=0)"));
+   m_log.Info(watch ? Fmt("after a gap in the stream: %s; a player's clock that stands, runs back or leaves a frame waiting: %s",
+                         m_smooth ? "catch up over 80-300 ms (CASTCADE_STREAM_SMOOTH=0 jumps instead)" : "jump to the target (CASTCADE_STREAM_SMOOTH=0)",
+                         m_resync ? "frames kept in order, the timeline resynchronised" : "nothing is done, as before 2026-11-24 (CASTCADE_STREAM_RESYNC=0)")
+                    : Fmt("frames stamped with the physics clock, %s; catch-up frames after a stall %s",
+                         m_pauseClock ? "which runs on with the wall clock while the game is paused" : "which stands while the game is paused (CASTCADE_STREAM_PAUSECLOCK=0)",
+                         m_catchupFrames ? "on" : "off (CASTCADE_STREAM_CATCHUP=0)"));
    if (m_stopAudit && !m_player->m_PlaySound)
       m_log.Warn("the StopSound audit needs PlaySound=1 in the watcher's settings: without it no sound plays and every check passes");
 
@@ -1043,6 +1060,8 @@ SessionImpl::~SessionImpl()
       m_log.Info(Fmt("whole session: %llu gaps in the stream held the picture 20 ms or more; %llu frames of an older player stamped late were put back at their "
                      "physics time (%llu taken as sent after one: a re-based clock); ball steps per frame outside the gaps: %s",
          (unsigned long long)m_timeline.m_gapsTotal, (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, m_timeline.StepSummary().c_str()));
+      m_log.Info(Fmt("whole session: the player's clock stood still %llu times (a paused game), the timeline was resynchronised %llu times, %llu stamps were put in order",
+         (unsigned long long)m_timeline.m_standsTotal, (unsigned long long)m_timeline.m_resyncsTotal, (unsigned long long)m_timeline.m_orderedTotal));
    }
    else
       m_log.Info(Fmt("whole session: %llu catch-ups after a stall sent %llu frames of their own", (unsigned long long)m_catchupsTotal, (unsigned long long)m_catchupFramesTotal));
@@ -1450,6 +1469,9 @@ void SessionImpl::Unfreeze()
    m_frozen = false;
    g_recordCalls = true;
    g_baselinePuts = m_matchPlay;
+   // The watch phase was not a pause of this game to report (PlayFrame): one that lasts is reported from here on
+   m_stamp.Touch(NowUsec());
+   m_gameStands = false;
 }
 
 // The hot path: one lookup for the object, one for the policy, encode into a reusable buffer, one lookup in
@@ -1883,15 +1905,39 @@ void SessionImpl::PlayFrame(const uint64_t now)
    m_inCatchup = false;
 
    EmitFrame(PhysicsStamp());
+
+   // I11.4.17 (2026-11-24). A game whose physics clock stands is paused: VPX pauses a table whose window is not the
+   // active one (Player::RecomputePauseState), and in a match that is the player who clicked in another window and
+   // has not clicked in this one since. Its frames go on (the frame timers run: lamps, the DMD), nothing else does.
+   // Said once when it has stood a second and once when it moves again, so that a log shows what a watcher of this
+   // table was sent while nothing moved. (Not while this table shows another player's: m_frozen.)
+   if (!m_frozen)
+   {
+      const uint64_t stood = m_stamp.StoodUsec(now);
+      if (!m_gameStands && stood >= CLOCK_STANDS_USEC)
+      {
+         m_gameStands = true;
+         m_gameStoodSince = now - stood;
+         m_log.Info(Fmt("this table's game stands still (window %s, %s): its physics clock has not moved for %.1f s; frames go on, %s",
+            m_player->m_gameWindowActive ? "active" : "not active", m_player->m_pause ? "paused by VPX" : "not paused", (double)stood / 1e6,
+            m_pauseClock ? "stamped with the wall clock" : "under a stamp that stands (CASTCADE_STREAM_PAUSECLOCK=0)"));
+      }
+      else if (m_gameStands && stood < CLOCK_STANDS_USEC)
+      {
+         m_gameStands = false;
+         m_log.Info(Fmt("this table's game runs again after standing still for %.1f s", (double)(now - m_gameStoodSince) / 1e6));
+      }
+   }
 }
 
-uint64_t SessionImpl::PhysicsStamp() const
+uint64_t SessionImpl::PhysicsStamp()
 {
    if (m_frozen) // match role, another player's table is shown here: this game stands still, and so does its stamp
       return m_frozenStamp;
-   // usec() and NowUsec() both count QueryPerformanceCounter, from different origins
-   const int64_t behind = (int64_t)usec() - (int64_t)PhysicsClockUsec(m_player);
-   return (uint64_t)((int64_t)NowUsec() - behind);
+   // usec() and NowUsec() both count QueryPerformanceCounter, from different origins. PlayStamp (CastcadeTimeline.h)
+   // makes the stamp of them: the physics clock while it moves, the wall clock at the same distance while it stands.
+   const uint64_t vpxNow = usec();
+   return m_stamp.Stamp(NowUsec(), vpxNow, PhysicsClockUsec(m_player), m_pauseClock);
 }
 
 void SessionImpl::EmitFrame(const uint64_t stamp)
@@ -2321,10 +2367,11 @@ void SessionImpl::WatchService(Peer& p, const uint64_t now)
          // interval. Such a frame is moved back to where its physics time puts it. Frames of a current player, and
          // every frame without a stall, are stamped within a few ms of their physics time and are never moved.
          // A current player says so in its HELLO (HELLO_PHYSICS_STAMPS) and its frames are never looked at: its stamp
-         // legitimately jumps ahead of the snapshot's physics time when it resumes from a pause (Player::m_noTimeCorrect
-         // moves the physics clock and its start together). For an older stream, a frame that needs moving right after
-         // a moved frame while its own physics time advanced by a normal frame interval only (nothing was caught up)
-         // is a re-based clock, not a stall: its stamp is taken as sent and the next frames compare with it.
+         // legitimately gets ahead of the snapshot's physics time over a pause (Player::m_noTimeCorrect moves the
+         // physics clock and its start together when the game goes on: a jump then, from a player before 2026-11-24;
+         // since then the stamp runs on through the pause, PlayStamp). For an older stream, a frame that needs moving
+         // right after a moved frame while its own physics time advanced by a normal frame interval only (nothing was
+         // caught up) is a re-based clock, not a stall: its stamp is taken as sent and the next frames compare with it.
          // Part of smoothing: CASTCADE_STREAM_SMOOTH=0 shows an older stream exactly as the watcher always did.
          f->arrived = now;
          m_timeline.OnArrival(now);
@@ -2561,7 +2608,8 @@ void SessionImpl::LogStats(const uint64_t now)
       m_log.Info(Fmt("stats %.1fs: %s, frames %llu, received %llu (%.1f/s), in %.0f B/s, out %.0f B/s; timeline %zu frames (%.0f ms), starved %llu, buffering %llu, "
                      "jumps %llu; replayed calls %llu (editable %llu table %llu global %llu ball %llu), per frame avg %.2f max %u, failed %llu, unresolved %llu, "
                      "sound skipped %llu, stops skipped %llu%s; frames before keyframe %llu; clock offset %lld us, delay %lld ms; gaps %llu, largest ball step %.1f VPU; "
-                     "frames restamped so far %llu, re-based %llu",
+                     "frames restamped so far %llu, re-based %llu; stamps put in order %llu (the furthest back by %lld us), timeline resynchronised %llu, "
+                     "the player's clock %s",
          secs, m_refused ? "refused" : (connected ? "connected" : "not connected"), (unsigned long long)m_iFrames, (unsigned long long)m_iRecv,
          (double)m_iRecv / secs, (double)m_iBytesIn / secs, (double)m_iBytesOut / secs, m_timeline.m_frames.size(), span, (unsigned long long)m_timeline.m_iStarved,
          (unsigned long long)m_timeline.m_iBuffering, (unsigned long long)m_timeline.m_iJumps,
@@ -2571,7 +2619,8 @@ void SessionImpl::LogStats(const uint64_t now)
          (unsigned long long)m_iUnresolved, (unsigned long long)m_iSoundSkipped, (unsigned long long)m_iStopDropped,
          m_stopAudit ? Fmt(" (audit: %llu would have stopped a playing sound, %llu would not)", (unsigned long long)m_iAuditEffective, (unsigned long long)m_iAuditNoEffect).c_str() : "",
          (unsigned long long)m_iBeforeKeyframe, (long long)m_timeline.m_offset, (long long)(m_delayUsec / 1000), (unsigned long long)m_timeline.m_iGaps, m_timeline.m_iMaxStep,
-         (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased));
+         (unsigned long long)m_iRestamped, (unsigned long long)m_iRebased, (unsigned long long)m_timeline.m_iOrdered, (long long)m_timeline.m_iBackMax,
+         (unsigned long long)m_timeline.m_iResyncs, m_timeline.m_clockStands ? "stands still" : "runs"));
       m_timeline.ResetInterval();
       m_iRecv = m_iBeforeKeyframe = 0;
       m_iFailed = m_iUnresolved = m_iSoundSkipped = m_iStopDropped = m_iAuditEffective = m_iAuditNoEffect = 0;

@@ -2,12 +2,27 @@
 
 #pragma once
 
-// Castcade state stream, watch role: the timeline. The frames received and not shown yet, and the clock that picks
-// what the next picture shows (snapshot interpolation: a fixed delay behind the newest frame, on the player's clock).
-// It knows nothing of VPX, so that it can be run alone: the session (CastcadeStream.cpp) gives it the frames and is
-// called back to show a state and to replay a frame's script calls; tests/timeline_test.cpp feeds it frame times
-// shaped like a log's and prints the stats lines a watcher would have written (I11.4.17, 2026-11-24: the code was
-// SessionImpl::StepTimeline until then).
+// Castcade state stream: the two ends of the stream's clock. PlayStamp is the stamp a player gives each frame.
+// WatchTimeline is the watcher's side: the frames received and not shown yet, and the clock that picks what the next
+// picture shows (snapshot interpolation: a fixed delay behind the newest frame, on the player's clock).
+// Neither knows anything of VPX, so that both can be run alone: the session (CastcadeStream.cpp) gives the timeline
+// its frames and is called back to show a state and to replay a frame's script calls; tests/timeline_test.cpp feeds
+// it frame times shaped like a log's and prints the stats lines a watcher would have written (I11.4.17, 2026-11-24:
+// the code was SessionImpl::StepTimeline and SessionImpl::PhysicsStamp until then).
+//
+// I11.4.17, what happened on 2026-11-23: a player whose VPX is paused (its window is not the active one) runs no
+// physics, so its physics clock stands, and goes on sending a frame with every frame it draws. Its stamps were the
+// physics clock read through two counters (NowUsec() - (usec() - physics clock)): one number for minutes, give or
+// take the microsecond between the two readings, and more whenever the thread was interrupted between them. The
+// timeline passes frames in the order they came and only up to the first one whose stamp is past the shown time, and
+// the shown time never passes the newest stamp: one frame stamped later than those behind it held every frame after
+// it, with nothing replayed and the timeline growing by 120 frames a second, until the player's game went on and its
+// stamps jumped ahead by the length of the pause (35 to 40 s into the first ball of two matches). The rule that jumps
+// when the timeline is over 2 s never saw it: it measures the timeline in stamps, and those stood.
+// Since then: a paused player's stamp runs on with the wall clock and never goes back (PlayStamp); and whatever a
+// player sends, the watcher keeps its frames in stamp order, treats a stamp that stands as a paused player, and
+// starts its clock again (a "timeline resynchronised" line) when the player's clock ran back, when it runs again
+// after standing, or when a frame was not shown within 2 s of the delay it was due after.
 //
 // Frame: uint64_t time (the player's stamp, on the player's clock), uint64_t arrived (NowUsec here), bool replayed
 // (set by the host when it replays the frame).
@@ -32,6 +47,16 @@ namespace castcade
 constexpr uint64_t TIMELINE_MAX_USEC = 2000000;
 constexpr int64_t CATCHUP_MIN_LAG_USEC = 20000; // a hold shorter than this resumes by jumping, as it always did
 constexpr size_t OFFSET_WINDOW = 300;
+// I11.4.17 (2026-11-24), the watcher's rules for a player's clock that does not run as the wall clock does.
+// The physics clock moves in whole steps of 1000 us: a stamp less than half a step past the one before has not moved
+// (the microsecond between the player's two counter readings, or a few hundred when its thread was interrupted).
+constexpr int64_t STAMP_STEP_MIN_USEC = 500;
+// A stamp before the last one by less than this is that stamp read late, and is put in order; by this much or more
+// it is another clock (no thread is held 100 ms between two instructions without the whole frame being that late)
+constexpr int64_t STAMP_BACK_MAX_USEC = 100000;
+// Frames that keep coming under one stamp for this long: the player's game is paused
+constexpr uint64_t CLOCK_STANDS_USEC = 1000000;
+constexpr int MAX_RESYNCS_LOGGED = 20;
 
 inline std::string TimelineFmt(const char* const fmt, ...)
 {
@@ -43,6 +68,50 @@ inline std::string TimelineFmt(const char* const fmt, ...)
    return n < 0 ? std::string() : std::string(buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
 }
 
+// Play role: the stamp of a frame, on the NowUsec clock. It is the time the physics state was simulated up to: after
+// a stall of the render thread that is the time before the stall, not the moment the frame is sent (the watcher
+// places the frame by it). While the physics clock stands (the game is paused: Player::m_pause, no UpdatePhysics) the
+// stamp runs on with the wall clock, at the distance it had when the physics clock last moved: the frames of a paused
+// player carry what its frame timers still do (lamps, the DMD), a watcher shows them at the pace they happened, and
+// when the game goes on (Player::m_noTimeCorrect moves the physics clock to now) the stamp is where the physics clock
+// lands, with no jump. No stamp is before the one sent last. (I11.4.17, 2026-11-24: before, a paused player's stamp
+// stood still and wobbled by the microsecond between the two counters, more when the thread was interrupted there.)
+class PlayStamp final
+{
+public:
+   // wall: NowUsec(). vpxNow: VPX's usec(), read just before it. physics: the physics clock (Player::m_curPhysicsFrameTime,
+   // on the usec() clock). runOn false: the stamp of before 2026-11-24, for tests of a watcher against an older player
+   // (CASTCADE_STREAM_PAUSECLOCK=0).
+   uint64_t Stamp(const uint64_t wall, const uint64_t vpxNow, const uint64_t physics, const bool runOn = true)
+   {
+      const int64_t behind = (int64_t)vpxNow - (int64_t)physics;
+      if (!m_have || physics != m_physics)
+      {
+         m_physics = physics;
+         m_behind = behind;
+         m_movedAt = wall;
+      }
+      uint64_t stamp = (uint64_t)((int64_t)wall - (runOn ? m_behind : behind));
+      if (runOn && m_have && stamp < m_last)
+         stamp = m_last;
+      m_last = stamp;
+      m_have = true;
+      return stamp;
+   }
+
+   // How long the physics clock has stood, as of the last stamp (a few ms at most while the game runs)
+   uint64_t StoodUsec(const uint64_t wall) const { return m_have && wall > m_movedAt ? wall - m_movedAt : 0; }
+   // Match role: the game comes back from a watch phase, which is not a pause to report
+   void Touch(const uint64_t wall) { m_movedAt = wall; }
+
+private:
+   bool m_have = false;
+   uint64_t m_physics = 0; // the physics clock at the last stamp
+   int64_t m_behind = 0;   // usec() minus the physics clock when the physics clock last moved
+   uint64_t m_movedAt = 0; // NowUsec then
+   uint64_t m_last = 0;    // the last stamp given
+};
+
 template <class Frame, class Host> class WatchTimeline final
 {
 public:
@@ -51,15 +120,21 @@ public:
    {
    }
 
-   // Session start: CASTCADE_STREAM_DELAY_MS and CASTCADE_STREAM_SMOOTH
-   void Configure(const int64_t delayUsec, const bool smooth)
+   // Session start: CASTCADE_STREAM_DELAY_MS, CASTCADE_STREAM_SMOOTH and CASTCADE_STREAM_RESYNC (0: the rules of before
+   // 2026-11-24, I11.4.17, for tests: frames as stamped, no resynchronisation)
+   void Configure(const int64_t delayUsec, const bool smooth, const bool resync = true)
    {
       m_delayUsec = delayUsec;
       m_smooth = smooth;
+      m_resync = resync;
    }
 
    // A new player's HELLO: its clock is another one
-   void OnHello() { m_offsetSamples.clear(); }
+   void OnHello()
+   {
+      m_offsetSamples.clear();
+      m_haveStamp = m_clockStands = false;
+   }
 
    // A frame or a keyframe was received
    void OnArrival(const uint64_t now)
@@ -75,12 +150,75 @@ public:
       AddOffsetSample((int64_t)now - (int64_t)stamp);
       m_frames.clear();
       m_haveShown = m_held = m_catchup = m_epOpen = false;
+      // The frames that follow are measured against it
+      m_haveStamp = true;
+      m_lastStamp = m_standStamp = stamp;
+      m_standSince = now;
+      m_standFrames = 0;
+      m_clockStands = false;
    }
 
-   // A frame, received now
+   // A frame, received now. The clock offset is measured with the stamp as the player sent it; the timeline holds
+   // the frame under a stamp that is never before the one that came before it.
    void Push(std::unique_ptr<Frame> f, const uint64_t now)
    {
-      AddOffsetSample((int64_t)now - (int64_t)f->time);
+      const uint64_t stamp = f->time;
+      if (m_resync && m_haveStamp)
+      {
+         const int64_t back = (int64_t)m_lastStamp - (int64_t)stamp;
+         const int64_t moved = (int64_t)stamp - (int64_t)m_standStamp;
+         if (back >= STAMP_BACK_MAX_USEC)
+            // Another time base, earlier than the one the held frames are stamped with: they would hold every frame
+            // from here on until the new clock reached their stamps
+            Resync(now, TimelineFmt("the player's clock ran back by %.1f ms", (double)back / 1000.));
+         else
+         {
+            if (back > 0)
+            {
+               // This stamp read late, or the one before it: in the order they came, which is the order the player
+               // made them in (one TCP connection)
+               f->time = m_lastStamp;
+               ++m_iOrdered;
+               ++m_orderedTotal;
+               m_iBackMax = (std::max)(m_iBackMax, back);
+            }
+            // A clock that stands goes on by the length of the pause (a second at least) or, if it ever just carried
+            // on, by more every frame: a single stamp ahead by less than what is put in order is one read late
+            if (moved >= (m_clockStands ? STAMP_BACK_MAX_USEC : STAMP_STEP_MIN_USEC))
+            {
+               if (m_clockStands)
+                  // The game goes on: its stamps are a pause ahead of where they stood. What is held is the paused
+                  // table, and the clock offset measured while the stamps stood is of no use any more
+                  Resync(now, TimelineFmt("the player's clock runs again after standing for %.1f s, %.1f s ahead of where it stood",
+                                 (double)(now - m_standSince) / 1e6, (double)moved / 1e6));
+               m_standStamp = stamp;
+               m_standSince = now;
+               m_standFrames = 0;
+            }
+            else
+            {
+               ++m_standFrames;
+               if (!m_clockStands && now - m_standSince >= CLOCK_STANDS_USEC)
+               {
+                  m_clockStands = true;
+                  ++m_standsTotal;
+                  if (m_standsTotal <= MAX_RESYNCS_LOGGED)
+                     m_host.TimelineLog(TimelineFmt("the player's clock stands still: the %llu frames of the last %.1f s carry one stamp (its game is paused); "
+                                                    "they are shown as they arrive",
+                        (unsigned long long)m_standFrames, (double)(now - m_standSince) / 1e6));
+               }
+            }
+         }
+      }
+      if (!m_haveStamp) // the first frame of a clock: after a resynchronisation, or (m_resync off) never measured
+      {
+         m_standStamp = stamp;
+         m_standSince = now;
+         m_standFrames = 0;
+      }
+      AddOffsetSample((int64_t)now - (int64_t)stamp);
+      m_lastStamp = f->time;
+      m_haveStamp = true;
       m_frames.push_back(std::move(f));
    }
 
@@ -90,14 +228,51 @@ public:
       return std::none_of(m_frames.begin(), m_frames.end(), [](const std::unique_ptr<Frame>& f) { return !f->replayed; });
    }
 
-   // The stats line: newest stamp minus oldest, of the frames held
-   double SpanMs() const { return m_frames.size() > 1 ? (double)(m_frames.back()->time - m_frames.front()->time) / 1000. : 0.; }
+   // The stats line: newest stamp minus oldest, of the frames held. Signed: below zero when a frame is held behind
+   // one with a later stamp (CASTCADE_STREAM_RESYNC=0 only; until 2026-11-24 that printed as 18446744073709552 ms)
+   double SpanMs() const { return m_frames.size() > 1 ? (double)((int64_t)m_frames.back()->time - (int64_t)m_frames.front()->time) / 1000. : 0.; }
 
    void ResetInterval()
    {
       m_iGaps = 0;
       m_iMaxStep = 0.f;
       m_iStarved = m_iBuffering = m_iJumps = 0;
+      m_iOrdered = m_iResyncs = 0;
+      m_iBackMax = 0;
+   }
+
+   // I11.4.17 (2026-11-24). The stamps of what is held are of no use for showing it: all of it is shown now (the
+   // newest state, and every call in the order the player made them), and the clock starts again with the next frame,
+   // as after a keyframe: the offset is measured anew and the picture is the delay behind once more.
+   void Resync(const uint64_t now, const std::string& why)
+   {
+      const size_t held = m_frames.size();
+      size_t waiting = 0;
+      uint64_t oldest = now;
+      if (!m_frames.empty())
+      {
+         Frame& last = *m_frames.back();
+         m_host.TimelineShow(last, last, 0.f);
+         for (const std::unique_ptr<Frame>& f : m_frames)
+            if (!f->replayed)
+            {
+               ++waiting;
+               oldest = (std::min)(oldest, f->arrived);
+               m_host.TimelineReplay(*f);
+            }
+         m_frames.clear();
+      }
+      if (m_epOpen)
+         LogGap();
+      m_offsetSamples.clear();
+      m_haveShown = m_held = m_catchup = false;
+      m_haveStamp = m_clockStands = false;
+      ++m_iResyncs;
+      ++m_resyncsTotal;
+      if (m_resyncsTotal <= MAX_RESYNCS_LOGGED)
+         m_host.TimelineLog(TimelineFmt("timeline resynchronised: %s; %zu frames held, %zu of them not shown yet%s, are shown now and the clock offset is measured again%s",
+            why.c_str(), held, waiting, waiting ? TimelineFmt(" (the oldest received %.0f ms ago)", (double)(now - oldest) / 1000.).c_str() : "",
+            m_resyncsTotal == MAX_RESYNCS_LOGGED ? " (further ones are only counted)" : ""));
    }
 
    // When the player stalls, its frames stop for the length of the stall and then come all at once (a catch-up sends
@@ -112,6 +287,22 @@ public:
    {
       if (m_frames.empty())
          return;
+      // I11.4.17 (2026-11-24). A frame is due the delay after it arrived, give or take what the connection does. One
+      // that is still not shown 2 s past that waits for a time the shown time is not going to reach in any way this
+      // code knows of (the rule below measures the timeline in stamps, and is blind when the stamps are what is
+      // wrong): never wait on, whatever the cause.
+      if (m_resync)
+         for (const std::unique_ptr<Frame>& f : m_frames)
+            if (!f->replayed)
+            {
+               if (now > f->arrived && now - f->arrived > (uint64_t)m_delayUsec + TIMELINE_MAX_USEC)
+               {
+                  Resync(now, TimelineFmt("a frame received %.1f s ago was not due yet (its stamp is %.1f s ahead of the time shown)", (double)(now - f->arrived) / 1e6,
+                                 m_haveShown ? (double)((int64_t)f->time - m_shown) / 1e6 : 0.));
+                  return;
+               }
+               break; // frames are replayed in the order they came: the first one waiting is the oldest
+            }
       const int64_t target = (int64_t)now - m_offset - m_delayUsec;
       int64_t render = target;
 
@@ -129,7 +320,10 @@ public:
 
       if (m_smooth && !jumped && m_haveShown)
       {
-         if (!m_catchup && m_held && newest > m_shown && target - m_shown > CATCHUP_MIN_LAG_USEC)
+         // Frames have come back when the newest stamp has moved on: by a physics step at least. A stamp that stands
+         // and wobbles is a paused player (I11.4.17, 2026-11-24: its every wobble upwards began a catch-up, which showed
+         // the stamp before it for one more frame and logged a "stream gap" that was none)
+         if (!m_catchup && m_held && newest - m_shown >= (m_resync ? STAMP_STEP_MIN_USEC : 1) && target - m_shown > CATCHUP_MIN_LAG_USEC)
          {
             m_catchup = true;
             m_catchupStart = now;
@@ -286,6 +480,11 @@ public:
    uint64_t m_iStarved = 0, m_iBuffering = 0, m_iJumps = 0; // per stats interval
    uint64_t m_iGaps = 0, m_gapsTotal = 0;
    float m_iMaxStep = 0.f;
+   // I11.4.17: stamps that came before the one ahead of them and were put in order (and the furthest back of them, us);
+   // times the clock was started again; times the player's clock stood for CLOCK_STANDS_USEC
+   uint64_t m_iOrdered = 0, m_orderedTotal = 0, m_iResyncs = 0, m_resyncsTotal = 0, m_standsTotal = 0;
+   int64_t m_iBackMax = 0;
+   bool m_clockStands = false;        // the player's stamps have stood for CLOCK_STANDS_USEC and still do
 
 private:
    void AddOffsetSample(const int64_t sample)
@@ -301,7 +500,14 @@ private:
    // What happens when the stream had a gap (Step). CASTCADE_STREAM_SMOOTH=0: the shown time jumps to the target when
    // frames come back, as before; 1 (default): it catches up over a short eased interval.
    bool m_smooth = true;
+   bool m_resync = true;
    std::deque<int64_t> m_offsetSamples;
+   // The player's clock as the frames show it (Push)
+   bool m_haveStamp = false;   // a frame or keyframe of this clock has been seen
+   uint64_t m_lastStamp = 0;   // the stamp the last frame is held under
+   uint64_t m_standStamp = 0;  // the last stamp that had moved on from the one before, as the player sent it
+   uint64_t m_standSince = 0;  // when it arrived
+   uint64_t m_standFrames = 0; // frames since, none of which has moved on from it
    bool m_haveShown = false, m_held = false, m_catchup = false;
    int64_t m_shown = 0;         // the stream time the last frame showed
    uint64_t m_catchupStart = 0; // NowUsec

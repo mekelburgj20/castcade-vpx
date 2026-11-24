@@ -233,8 +233,49 @@ Test switches the fork reads (with or without a stream session): `CASTCADE_TEST_
 `CASTCADE_TEST_STALL=<ms>,<every s>[,<first s>]` (stalls the render thread on purpose, after the physics),
 `CASTCADE_FRAMELOG`, `CASTCADE_FRAMELOG_MS`; on a session: `CASTCADE_STREAM_STOPFILTER=0`,
 `CASTCADE_STREAM_CATCHUP=0` (player), `CASTCADE_STREAM_SMOOTH=0`, `CASTCADE_STREAM_STOPAUDIT=1` (watcher).
+`CASTCADE_STREAM_PAUSECLOCK=0` (player) and `CASTCADE_STREAM_RESYNC=0` (watcher) give back what each end did before
+2026-11-24 (I11.4.17, below): a paused player's stamp stands still, and a watcher holds its frames as stamped and
+never starts its clock again.
 `CASTCADE_TEST_PAUSE=<at s>,<for s>[,<every s>]` pauses a player as losing the window's focus does and resumes it
 as getting it back does; `CASTCADE_TEST_DROP=<s>[,<s>...]` cuts a watcher's connection that many seconds after its
 session began (it reconnects as usual); `CASTCADE_TEST_EXITWARN=<n>` writes n warnings as a session ends, while
 its log's thread mirrors them into the VPX log. `hitch-test.ps1 -NoStreamLog` leaves CASTCADE_STREAM_LOG unset, so
 every session line goes to the VPX log.
+
+# src/castcade/tests/timeline_test: the stream's clock without VPX (I11.4.17)
+
+`src/castcade/CastcadeTimeline.h` holds the two ends of the stream's clock with nothing of VPX in them: `PlayStamp`
+(the stamp a player gives a frame) and `WatchTimeline` (the frames a watcher holds, and which of them the next
+picture shows). `timeline_test` runs them on a simulated clock: a player that stamps as the fork does, a connection
+(37 ms and a frame 25 ms late now and then), a watcher at 90 frames a second with a delay of 100 ms. It starts no
+VPX, opens no socket and writes no file. Build and run it (a second or two):
+
+    cmake -G "Visual Studio 17 2022" -A x64 -S src\castcade\tests -B <a build folder outside the repository>
+    cmake --build <that folder> --config Release --target timeline_test
+    <that folder>\Release\timeline_test.exe        (-v: every stats line of every run)
+
+Scenarios: `steady` and `gap` (a stream whose clock runs: both ends must show it exactly as before 2026-11-24, and
+the test compares every count), `pause` (the first Congo match of 2026-11-23: the player's VPX has been paused for
+122 s when the watcher connects and plays 39 s later), `pause, exact`, `pause while watched`, `frozen` (the match
+role's one stamp while the watched table itself watches) and `back` (stamps set back by 10 s). Each runs four times:
+the watcher's rules and the player's stamps of before that date (`BEFORE`, where `pause` must fail as the watcher did
+that night: intervals with frames received and `replayed calls 0`, a timeline of thousands of frames, a span below
+zero, "2389 ms behind when frames came back"), a new watcher against an older player, an older watcher against a new
+player, and both new. Then the rule of last resort alone (frames nothing will ever make due are shown within 2.1 s)
+and the player's stamps through a pause. Exit code 0 only when every check passes.
+
+The same on two VPX instances, with one build (the watcher's log is `<run>\watchA\castcade.log`, the player's
+`<run>\play\castcade.log`; copy `build\Release\VPinballX_GL64.exe` to a name that does not start with `VPinballX`
+first, and delete the copy afterwards):
+
+    pwsh -NoProfile -Command "& tools\castcade\replay-test.ps1 -Mode record -WithWatcher -Seconds 80 -Exe <copy> -Table '<table.vpx>' -PlayEnv @{ CASTCADE_TEST_PAUSE = '15,40'; CASTCADE_TEST_NOPAUSE = '0'; CASTCADE_STREAM_PAUSECLOCK = '0' }"
+
+That is a new watcher against a player that stamps as before, paused from 15 s after its first frame for 40 s: a
+second into the pause the watcher logs `the player's clock stands still`, every stats line of the pause has `timeline
+1 frames` and `the player's clock stands still`, and when the pause ends `timeline resynchronised: the player's clock
+runs again after standing for 40.0 s, 40.0 s ahead of where it stood`.
+Add `-WatchEnv @{ CASTCADE_STREAM_RESYNC = '0' }` for the fault itself (once a frame of the pause is stamped late,
+which is chance: stats lines with a timeline that grows by the frames received, and no call replayed if the table's
+frame timers make any); leave `CASTCADE_STREAM_PAUSECLOCK` out for a new player (its log says `this table's game
+stands still (window not active, paused by VPX)` and `runs again after standing still for 40.0 s`; the watcher's
+timeline stays at its usual 15 frames or so and nothing is resynchronised, with or without `CASTCADE_STREAM_RESYNC=0`).

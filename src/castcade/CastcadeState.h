@@ -37,7 +37,7 @@ int CountPlayingSounds(Player* player);
 
 // Play role. The physics clock: the time, on VPX's usec() clock, that the physics state has been simulated up to
 // (Player::m_curPhysicsFrameTime). A frame is stamped with it, not with the moment it is sent: after a stall the two
-// differ by the stall.
+// differ by the stall. It stands while the game is paused; the stamp then runs on (PlayStamp, CastcadeTimeline.h).
 uint64_t PhysicsClockUsec(Player* player);
 
 // Play role. Appends the current physics-driven state of the table to w. ballIds gives the network id of
