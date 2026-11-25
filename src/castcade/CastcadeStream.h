@@ -51,6 +51,11 @@
 //                                                           with no state playing in between. Every watch is
 //                                                           answered within 5 s: state watching or state failed
 //                                 play                      come back to the own table; answered state playing
+//                                 quit                      close this table and VPX with it, as the held exit
+//                                                           button does (the table's Exit event fires, a ROM
+//                                                           table's NVRAM is written; nothing is forced). Not
+//                                                           answered: the connection ends with the table. Acted
+//                                                           on wherever it stands among the commands of one read
 //                               hello and the first state playing are sent as soon as the connection exists. Every
 //                               token is printable ASCII without spaces; no line is longer than 200 bytes.
 //                               Of several commands read in one go only the last is acted on and answered (the others

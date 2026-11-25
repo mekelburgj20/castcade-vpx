@@ -3116,9 +3116,12 @@ void MatchSession::ServiceControl(const uint64_t now)
    const std::vector<std::string> lines = std::move(m_lines);
    m_lines.clear();
    size_t last = SIZE_MAX;
+   bool quit = false; // "quit" is acted on wherever it stands in the read: nothing after it can call a closed table back
    for (size_t i = 0; i < lines.size(); ++i)
    {
-      if (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0)
+      if (lines[i] == "quit")
+         quit = true;
+      else if (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0)
          last = i;
       else
       {
@@ -3132,9 +3135,11 @@ void MatchSession::ServiceControl(const uint64_t now)
       }
    }
    for (size_t i = 0; i < lines.size(); ++i)
-      if (i != last && (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0))
-         m_log.Info("control < " + Token(lines[i].substr(0, 80)) + "   (superseded by a later command in the same read: not acted on, not answered)");
-   if (last != SIZE_MAX)
+      if ((i != last || quit) && (lines[i] == "play" || lines[i].rfind("watch ", 0) == 0))
+         m_log.Info("control < " + Token(lines[i].substr(0, 80)) + (quit ? "   (a quit came in the same read: not acted on, not answered)" : "   (superseded by a later command in the same read: not acted on, not answered)"));
+   if (quit)
+      Command("quit", now);
+   else if (last != SIZE_MAX)
       Command(lines[last], now);
    if (alive)
       return;
@@ -3155,6 +3160,17 @@ void MatchSession::ServiceControl(const uint64_t now)
 void MatchSession::Command(const std::string& line, const uint64_t now)
 {
    m_log.Info("control < " + line);
+   if (line == "quit")
+   {
+      // quit: this table closes, and VPX with it, as when the exit button is held down (PinInput::ButtonExit asks
+      // for the same close state). The player closes in its own frame loop (Player::OnClose: this session ends
+      // first and leaves a watch, the table's Exit event fires, a ROM table's VPinMAME stops and writes its NVRAM),
+      // then the application. Nothing is forced and nothing is answered: the control connection ends with the
+      // session.
+      m_log.Info("control: quit: this table closes and VPX exits, as the held exit button does");
+      m_player->SetCloseState(Player::CS_CLOSE_APP);
+      return;
+   }
    if (line == "play")
    {
       if (m_watching)
